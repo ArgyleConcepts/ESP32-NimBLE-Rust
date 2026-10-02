@@ -46,6 +46,46 @@ function(argyle_nimble_export_build_context)
             "Unsupported ESP-IDF target/architecture: this crate supports ESP32-C3/riscv and ESP32-S3/xtensa")
     endif()
 
+    # A compile launcher may rewrite or skip the probe invocation. Preserve
+    # the consumer's selected compiler argv by requiring an unwrapped probe.
+    set(_argyle_has_custom_compile_launcher FALSE)
+    get_property(_argyle_global_rule_launch_set GLOBAL PROPERTY RULE_LAUNCH_COMPILE SET)
+    if(_argyle_global_rule_launch_set)
+        get_property(_argyle_global_rule_launch GLOBAL PROPERTY RULE_LAUNCH_COMPILE)
+        if(NOT "${_argyle_global_rule_launch}" STREQUAL "")
+            set(_argyle_has_custom_compile_launcher TRUE)
+        endif()
+    endif()
+    get_property(_argyle_directory_rule_launch_set DIRECTORY PROPERTY RULE_LAUNCH_COMPILE SET)
+    if(_argyle_directory_rule_launch_set)
+        get_property(_argyle_directory_rule_launch DIRECTORY PROPERTY RULE_LAUNCH_COMPILE)
+        if(NOT "${_argyle_directory_rule_launch}" STREQUAL "")
+            set(_argyle_has_custom_compile_launcher TRUE)
+        endif()
+    endif()
+    get_property(_argyle_consumer_rule_launch_set TARGET "${ARG_CONSUMER_TARGET}"
+        PROPERTY RULE_LAUNCH_COMPILE SET)
+    if(_argyle_consumer_rule_launch_set)
+        get_target_property(_argyle_consumer_rule_launch "${ARG_CONSUMER_TARGET}"
+            RULE_LAUNCH_COMPILE)
+        if(NOT "${_argyle_consumer_rule_launch}" STREQUAL "")
+            set(_argyle_has_custom_compile_launcher TRUE)
+        endif()
+    endif()
+    get_property(_argyle_consumer_compiler_launcher_set TARGET "${ARG_CONSUMER_TARGET}"
+        PROPERTY C_COMPILER_LAUNCHER SET)
+    if(_argyle_consumer_compiler_launcher_set)
+        get_target_property(_argyle_consumer_compiler_launcher "${ARG_CONSUMER_TARGET}"
+            C_COMPILER_LAUNCHER)
+        if(NOT "${_argyle_consumer_compiler_launcher}" STREQUAL "")
+            set(_argyle_has_custom_compile_launcher TRUE)
+        endif()
+    endif()
+    if(_argyle_has_custom_compile_launcher)
+        message(FATAL_ERROR
+            "Build-context export cannot preserve custom CMake compile launchers; disable RULE_LAUNCH_COMPILE at global, directory, and target scope and clear the consumer target's C_COMPILER_LAUNCHER")
+    endif()
+
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     find_package(Git REQUIRED)
     set(_argyle_unset_git_redirects
@@ -68,12 +108,15 @@ function(argyle_nimble_export_build_context)
         ERROR_QUIET
         OUTPUT_STRIP_TRAILING_WHITESPACE
     )
+    if(NOT _argyle_toplevel_status EQUAL 0)
+        message(FATAL_ERROR
+            "Could not query the configured ESP-IDF Git checkout root; check IDF_PATH, SDK read/traverse permissions and ownership, and Git query setup for the CMake user")
+    endif()
     get_filename_component(_argyle_expected_sdk_root "${_argyle_idf_path}" REALPATH)
     get_filename_component(_argyle_actual_sdk_root "${_argyle_sdk_toplevel}" REALPATH)
-    if(NOT _argyle_toplevel_status EQUAL 0
-        OR NOT "${_argyle_actual_sdk_root}" STREQUAL "${_argyle_expected_sdk_root}")
+    if(NOT "${_argyle_actual_sdk_root}" STREQUAL "${_argyle_expected_sdk_root}")
         message(FATAL_ERROR
-            "Configured IDF_PATH is not the ESP-IDF Git checkout root; use the configured SDK checkout and rerun CMake")
+            "Configured IDF_PATH does not point to the ESP-IDF Git checkout root; set IDF_PATH to the SDK repository root and rerun CMake")
     endif()
 
     execute_process(
@@ -86,7 +129,7 @@ function(argyle_nimble_export_build_context)
     )
     if(NOT _argyle_revision_status EQUAL 0 OR NOT _argyle_sdk_revision MATCHES "^[0-9a-fA-F][0-9a-fA-F]+$")
         message(FATAL_ERROR
-            "Could not determine the configured ESP-IDF checkout revision; use a complete SDK checkout and rerun CMake")
+            "Could not query the configured ESP-IDF Git revision; check SDK checkout permissions and ownership and Git query setup for the CMake user")
     endif()
     string(LENGTH "${_argyle_sdk_revision}" _argyle_revision_length)
     if(NOT _argyle_revision_length EQUAL 40)
@@ -117,6 +160,17 @@ function(argyle_nimble_export_build_context)
 
     add_library("${_argyle_probe_target}" OBJECT "${_argyle_probe_source}")
     set_target_properties("${_argyle_probe_target}" PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+    get_property(_argyle_probe_rule_launch_set TARGET "${_argyle_probe_target}"
+        PROPERTY RULE_LAUNCH_COMPILE SET)
+    if(_argyle_probe_rule_launch_set)
+        get_target_property(_argyle_probe_rule_launch "${_argyle_probe_target}"
+            RULE_LAUNCH_COMPILE)
+        if(NOT "${_argyle_probe_rule_launch}" STREQUAL "")
+            message(FATAL_ERROR
+                "Build-context probe inherited RULE_LAUNCH_COMPILE; disable CMake compile launchers for context export")
+        endif()
+    endif()
 
     # Copy the consumer's private compile properties. CMake's corresponding
     # TARGET_PROPERTY expressions include transitive usage requirements. Do

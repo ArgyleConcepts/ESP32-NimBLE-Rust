@@ -57,6 +57,8 @@ missing executables, diagnostic retention, report encoding, unexpected
 exceptions/interrupts, inherited configuration, exact-case tracked-file links,
 and invalid package contracts. Genuine C3/S3 binding generation and target
 configuration checks are later matrix work; no hardware verification is claimed.
+These runs do not configure a real ESP-IDF CMake consumer project; C3/S3 CMake
+exporter fixtures and compile-launcher rejection coverage are pending NIMBLERS-24.
 
 ## Reports, artifacts, and isolation
 
@@ -137,3 +139,12 @@ described in the maintainer guide. Promotion is a trust decision, not a sandbox.
   read back. The probe PR was closed without merging and its branch deleted.
 
 These results cover the bootstrap commit; changes require fresh Azure validation.
+
+## NIMBLERS-21 validation evidence
+
+- [Run 7627](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build/results?buildId=7627)
+  passed the reviewed PR head `07ee71e9f48f946634732ed014239e7593658934`: 32
+  Python tests, 13 Rust integration tests, and the Clippy, host build, docs,
+  and package checks.
+- This evidence applies only to that exact head. Later commits require a fresh
+  Azure run before their validation can be reported.

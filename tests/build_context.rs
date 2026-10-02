@@ -221,7 +221,7 @@ fn esp_target_without_context_and_host_override_fail_without_fallback() {
     let error = context::resolve("riscv32imc-esp-espidf", host, None, None).unwrap_err();
     assert!(error
         .to_string()
-        .contains("ESP generation requires ARGYLE_NIMBLE_CONTEXT"));
+        .contains("ESP generation requires context_path"));
     let error = context::resolve("xtensa-esp32s3-espidf", host, Some("host"), None).unwrap_err();
     assert!(error
         .to_string()

@@ -85,6 +85,12 @@ impl std::error::Error for ContextError {}
 
 /// Resolve a Cargo target and native host target into a validated context.
 ///
+/// `cargo_target` and `cargo_host` are Cargo's `TARGET` and `HOST` metadata.
+/// `requested_mode` is `None`, `Some("host")`, or `Some("esp")`;
+/// `context_path` is the path to the JSON file exported by the configured
+/// CMake target and is required for ESP mode. This function does not read
+/// environment variables to select a mode or locate that file.
+///
 /// An implicit host mode is selected only when Cargo's TARGET equals HOST.
 /// The only accepted cross targets are ESP-IDF's C3 and S3 triples; an explicit
 /// `esp` request is also allowed from a native-host fixture/generator driver.
@@ -140,7 +146,7 @@ pub fn resolve(
         Mode::Esp => {
             let path = context_path.ok_or_else(|| {
                 ContextError(
-                    "ESP generation requires ARGYLE_NIMBLE_CONTEXT from the configured CMake exporter; host mode is not a fallback".into(),
+                    "ESP generation requires context_path to name the JSON file exported by the configured CMake build-context target; host mode is not a fallback".into(),
                 )
             })?;
             let context = parse_context_file(path)?;

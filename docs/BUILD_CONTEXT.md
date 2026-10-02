@@ -20,15 +20,21 @@ argyle_nimble_export_build_context(CONSUMER_TARGET "${COMPONENT_LIB}")
 ```
 
 The function checks ESP-IDF's active build properties, target and architecture,
-and the SDK checkout revision. It creates the `argyle_nimble_export_context`
-build target. Building that target compiles one small C probe with the selected
-compiler and exports the context to
+and the SDK checkout revision. Git must resolve the configured `IDF_PATH` to
+the ESP-IDF repository root before its commit is recorded. It creates the
+`argyle_nimble_export_context` build target. Building that target compiles one
+small C probe with the selected compiler and exports the context to
 `<BUILD_DIR>/argyle-nimble/build-context-v1.json`. The probe captures compiler
 arguments as an argv array and records its working directory only after the
 compiler succeeds. A failed invocation clears any previous capture. The exporter
 rejects compiler response files because their contents are not an argv array.
 It does not parse `compile_commands.json`, split command strings, inspect a
 global SDK installation, or inspect inherited environment values.
+
+For reliable capture, the exporter rejects nonempty `RULE_LAUNCH_COMPILE`
+settings at global, caller-directory, probe, or consumer-target scope, and a
+custom `C_COMPILER_LAUNCHER` on the consumer target. Disable those launchers for
+context export; the exporter does not replace or reinterpret their behavior.
 
 The emitted contract preserves these values:
 
@@ -67,6 +73,12 @@ define options.
 ## Host and ESP selection
 
 The private `build_support/context.rs` resolver uses Cargo target metadata:
+
+`resolve(TARGET, HOST, mode, context_path)` receives the exact Cargo `TARGET`
+and `HOST` strings, an optional `mode` (`None`, `host`, or `esp`), and the path
+to the configured CMake export JSON. The path is required in ESP mode and
+rejected in host-only mode. The resolver does not read environment variables
+or discover the export file; Cargo build-script wiring belongs to NIMBLERS-23.
 
 - An ordinary native host target with no explicit mode resolves to host-only
   context and does not require ESP-IDF, headers, or a toolchain.
