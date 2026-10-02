@@ -1,12 +1,10 @@
-//! A Rust framework for ESP-IDF NimBLE, currently at the crate skeleton stage.
-//!
-//! There are no public BLE APIs yet. This library has no dependencies and does
-//! not require ESP-IDF or generated bindings for host compilation. Host scaffold
-//! validation has passed through Azure; target verification awaits integration.
-//!
-//! Planned APIs describe services, characteristics, and descriptors using
-//! application-owned structs and traits registered with one BLE controller.
-//! ESP-IDF integration and generated bindings will remain private.
+//! A Rust framework for ESP-IDF NimBLE with no public BLE API or runtime
+//! behavior yet. Private tooling validates consumer build context and generates
+//! bindings from the selected ESP-IDF configuration; generated declarations
+//! and C shims remain private. Generic host fixtures do not establish ESP ABI
+//! compatibility. Genuine C3/S3 header-generation checks and full firmware
+//! compile/link integration remain pending. See the build-context and
+//! binding-generation contracts for the current evidence and limitations.
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]

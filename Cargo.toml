@@ -2,7 +2,7 @@
 name = "argyle-nimble"
 version = "0.1.0-dev.0"
 edition = "2021"
-description = "A Rust framework for ESP-IDF NimBLE; currently an initial crate skeleton"
+description = "ESP-IDF NimBLE framework with private build-context and binding-generation tooling"
 license = "MIT"
 repository = "https://github.com/ArgyleConcepts/ESP32-Nimble-Rust"
 readme = "README.md"
@@ -23,5 +23,14 @@ include = [
     "/docs/**",
 ]
 
-[dev-dependencies]
+[build-dependencies]
+bindgen = { version = "=0.72.1", default-features = false, features = ["runtime"] }
+clang-sys = { version = "=1.8.1", default-features = false, features = ["runtime"] }
 serde_json = "1.0"
+syn = { version = "=2.0.119", features = ["full"] }
+
+[dev-dependencies]
+bindgen = { version = "=0.72.1", default-features = false, features = ["runtime"] }
+clang-sys = { version = "=1.8.1", default-features = false, features = ["runtime"] }
+serde_json = "1.0"
+syn = { version = "=2.0.119", features = ["full"] }

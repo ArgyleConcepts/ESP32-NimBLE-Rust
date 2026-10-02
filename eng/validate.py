@@ -27,10 +27,13 @@ def check_metadata(metadata):
 def check_package_listing(listing):
     required = {
         "Cargo.toml", "LICENSE", "README.md", "src/lib.rs",
-        "build_support/context.rs", "cmake/ArgyleNimbleBuildContext.cmake",
+        "build_support/context.rs", "build_support/bindings.rs",
+        "src/backend/nimble_shim.h", "src/backend/nimble_shim.c",
+        "cmake/ArgyleNimbleBuildContext.cmake",
         "cmake/capture_compiler.py", "cmake/export_build_context.py",
         "CONTRIBUTING.md", "SECURITY.md", "CODE_OF_CONDUCT.md",
         "docs/MAINTAINING.md", "docs/BUILD_CONTEXT.md",
+        "docs/BINDING_GENERATION.md",
     }
     missing = required - set(listing.splitlines())
     if missing:
