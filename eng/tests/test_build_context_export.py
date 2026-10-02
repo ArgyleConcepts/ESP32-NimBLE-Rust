@@ -124,7 +124,7 @@ class CompilerExportTests(unittest.TestCase):
                 mock.patch.object(capture_compiler.sys, "argv", ["capture_compiler.py", str(capture), *compiler_argv]),
                 mock.patch.object(capture_compiler.subprocess, "run", return_value=mock.Mock(returncode=3)),
             ):
-            self.assertEqual(capture_compiler.main(), 3)
+                self.assertEqual(capture_compiler.main(), 3)
             self.assertFalse(capture.exists())
 
     def test_failed_response_file_capture_removes_stale_success(self):

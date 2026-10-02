@@ -586,7 +586,7 @@ fn validate_argument_events(
             ("-idirafter", IncludeKind::After),
             ("-I", IncludeKind::Normal),
         ];
-        if let Some((option, kind)) = include_options
+        if let Some((_, kind)) = include_options
             .iter()
             .find(|(option, _)| argument.as_str() == *option)
         {
@@ -701,7 +701,7 @@ fn argument_matches_path(
     if argument == option {
         arguments
             .get(index + 1)
-            .is_some_and(|value| value == path.as_os_str())
+            .is_some_and(|value| Path::new(value.as_str()) == path)
     } else {
         argument
             .strip_prefix(option)
