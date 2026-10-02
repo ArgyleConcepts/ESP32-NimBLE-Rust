@@ -54,9 +54,10 @@ reviews external changes, including executable build inputs, and promotes them
 to a trusted repository branch for validation. See the
 [maintainer guide](docs/MAINTAINING.md).
 
-The pipeline and pinned toolchains are not available yet. Describe checks
-actually performed and mark host/target builds/tests as pending until Azure
-evidence exists. File inspection or an empty test harness is not BLE behavior
+The [host pipeline and pinned tools](docs/CI.md) are available. Describe checks
+actually performed. Maintainers link the Azure run for the promoted commit and
+relay failures to external contributors, who need no Azure access. Target builds
+are pending ESP-IDF integration. File inspection or an empty test harness is not BLE behavior
 or target verification. Each behavior change needs appropriate positive,
 negative, and failure-path tests as part of its implementation.
 
@@ -65,7 +66,7 @@ identify breaking changes, and include Azure run links when available. Update
 docs/examples for API changes. Draft PRs are welcome.
 
 Once protections are configured, merging requires an up-to-date branch,
-successful mandatory Azure validation, resolved review conversations, and
+the `argyle-nimble PR Validation` Azure check, resolved review conversations, and
 designated code-owner approval, subject to the documented review-only exception.
 [CODEOWNERS](https://github.com/ArgyleConcepts/ESP32-Nimble-Rust/blob/HEAD/.github/CODEOWNERS)
 assigns all files to `@david-cyman-argyle`.

@@ -1,0 +1,100 @@
+name: validation-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+pr:
+  # Mirrored only: Azure's server-side trigger override is authoritative.
+  # Update both configurations when removing bootstrap main (docs/CI.md).
+  autoCancel: true
+  branches:
+    include:
+      - main
+      - develop
+      - master
+
+pool:
+  name: macOS
+  demands:
+    - Agent.OS -equals Darwin
+
+variables:
+  toolsDirectory: $(Agent.TempDirectory)/argyle-nimble/$(Build.BuildId)
+  RUSTUP_HOME: $(toolsDirectory)/rustup
+  CARGO_HOME: $(toolsDirectory)/cargo
+  CARGO_TARGET_DIR: $(toolsDirectory)/target/host-debug
+  UV_CACHE_DIR: $(toolsDirectory)/uv-cache
+  UV_PYTHON_INSTALL_DIR: $(toolsDirectory)/python
+  UV_PYTHON_BIN_DIR: $(toolsDirectory)/python-bin
+  UV_NO_CONFIG: '1'
+  nimblePython: ''
+
+jobs:
+  - job: HostValidation
+    displayName: Host validation
+    timeoutInMinutes: 30
+    workspace:
+      clean: all
+    steps:
+      - checkout: self
+        clean: true
+        fetchDepth: 0
+        fetchTags: false
+        persistCredentials: false
+        submodules: false
+        lfs: false
+
+      - bash: |
+          set -euo pipefail
+          mkdir -p "$VALIDATION_REPORTS"
+          bash eng/bootstrap-ci.sh 2>&1 | tee "$VALIDATION_REPORTS/tool-setup.log"
+        displayName: Install pinned isolated host tools
+        target:
+          settableVariables:
+            - nimblePython
+        env:
+          NIMBLE_TOOLS_DIRECTORY: $(toolsDirectory)
+          VALIDATION_REPORTS: $(Build.ArtifactStagingDirectory)/validation
+
+      - bash: |
+          set -euo pipefail
+          export PATH="$NIMBLE_CARGO_BIN:$PATH"
+          "$NIMBLE_PYTHON" eng/validate.py --reports "$VALIDATION_REPORTS"
+        displayName: Validate host crate and contribution structure
+        target:
+          settableVariables: none
+        env:
+          NIMBLE_PYTHON: $(nimblePython)
+          NIMBLE_CARGO_BIN: $(CARGO_HOME)/bin
+          VALIDATION_REPORTS: $(Build.ArtifactStagingDirectory)/validation
+          PYTHONDONTWRITEBYTECODE: '1'
+          CARGO_TERM_COLOR: never
+          RUSTDOCFLAGS: -D warnings
+
+      - task: PublishTestResults@2
+        displayName: Publish validation command results
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: $(Build.ArtifactStagingDirectory)/validation/validation.xml
+          testRunTitle: Host validation commands (not framework test counts)
+          failTaskOnFailedTests: true
+          failTaskOnMissingResultsFile: false
+
+      - task: PublishPipelineArtifact@1
+        displayName: Retain validation diagnostics
+        condition: always()
+        inputs:
+          targetPath: $(Build.ArtifactStagingDirectory)/validation
+          artifact: host-validation
+
+      - bash: |
+          set -euo pipefail
+          expected="$AGENT_TEMPDIRECTORY/argyle-nimble/$BUILD_BUILDID"
+          if [[ "$NIMBLE_TOOLS_DIRECTORY" != "$expected" || -z "$BUILD_BUILDID" ]]; then
+            printf 'Refusing unexpected cleanup path\n' >&2
+            exit 1
+          fi
+          rm -rf -- "$NIMBLE_TOOLS_DIRECTORY"
+        displayName: Remove this run's tools and build state
+        condition: always()
+        env:
+          NIMBLE_TOOLS_DIRECTORY: $(toolsDirectory)
