@@ -23,9 +23,11 @@ function(argyle_nimble_export_build_context)
     idf_build_get_property(_argyle_idf_target_arch IDF_TARGET_ARCH)
     idf_build_get_property(_argyle_idf_version IDF_VER)
     idf_build_get_property(_argyle_sdkconfig SDKCONFIG)
+    idf_build_get_property(_argyle_sdkconfig_header SDKCONFIG_HEADER)
     idf_build_get_property(_argyle_build_dir BUILD_DIR)
     if(NOT _argyle_idf_path OR NOT _argyle_idf_target OR NOT _argyle_idf_target_arch
-        OR NOT _argyle_idf_version OR NOT _argyle_sdkconfig OR NOT _argyle_build_dir)
+        OR NOT _argyle_idf_version OR NOT _argyle_sdkconfig OR NOT _argyle_sdkconfig_header
+        OR NOT _argyle_build_dir)
         message(FATAL_ERROR
             "ESP-IDF build properties are incomplete; run this exporter after the consumer project is configured")
     endif()
@@ -46,8 +48,37 @@ function(argyle_nimble_export_build_context)
 
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     find_package(Git REQUIRED)
+    set(_argyle_unset_git_redirects
+        --unset=GIT_DIR
+        --unset=GIT_WORK_TREE
+        --unset=GIT_INDEX_FILE
+        --unset=GIT_OBJECT_DIRECTORY
+        --unset=GIT_ALTERNATE_OBJECT_DIRECTORIES
+        --unset=GIT_COMMON_DIR
+        --unset=GIT_NAMESPACE
+        --unset=GIT_CEILING_DIRECTORIES
+        --unset=GIT_DISCOVERY_ACROSS_FILESYSTEM
+        --unset=GIT_SHALLOW_FILE
+        --unset=GIT_QUARANTINE_PATH)
     execute_process(
-        COMMAND "${GIT_EXECUTABLE}" -C "${_argyle_idf_path}" rev-parse HEAD
+        COMMAND "${CMAKE_COMMAND}" -E env ${_argyle_unset_git_redirects}
+            "${GIT_EXECUTABLE}" -C "${_argyle_idf_path}" rev-parse --show-toplevel
+        RESULT_VARIABLE _argyle_toplevel_status
+        OUTPUT_VARIABLE _argyle_sdk_toplevel
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    get_filename_component(_argyle_expected_sdk_root "${_argyle_idf_path}" REALPATH)
+    get_filename_component(_argyle_actual_sdk_root "${_argyle_sdk_toplevel}" REALPATH)
+    if(NOT _argyle_toplevel_status EQUAL 0
+        OR NOT "${_argyle_actual_sdk_root}" STREQUAL "${_argyle_expected_sdk_root}")
+        message(FATAL_ERROR
+            "Configured IDF_PATH is not the ESP-IDF Git checkout root; use the configured SDK checkout and rerun CMake")
+    endif()
+
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E env ${_argyle_unset_git_redirects}
+            "${GIT_EXECUTABLE}" -C "${_argyle_idf_path}" rev-parse HEAD
         RESULT_VARIABLE _argyle_revision_status
         OUTPUT_VARIABLE _argyle_sdk_revision
         ERROR_QUIET
@@ -142,11 +173,11 @@ function(argyle_nimble_export_build_context)
             --chip "${_argyle_idf_target}"
             --idf-arch "${_argyle_idf_target_arch}"
             --sdkconfig "${_argyle_sdkconfig}"
-            --sdkconfig-header "${_argyle_build_dir}/config/sdkconfig.h"
+            --sdkconfig-header "${_argyle_sdkconfig_header}"
             --version-header "${_argyle_idf_path}/components/esp_common/include/esp_idf_version.h"
             --compiler-capture "${_argyle_capture}"
             --output "${_argyle_output}"
-            --build-configuration "$<CONFIG>"
+            --build-configuration=$<CONFIG>
             ${_argyle_implicit_include_args}
         BYPRODUCTS "${_argyle_output}"
         VERBATIM

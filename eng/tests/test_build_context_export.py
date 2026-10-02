@@ -58,6 +58,10 @@ class CompilerExportTests(unittest.TestCase):
             with self.subTest(arguments=arguments), self.assertRaisesRegex(ValueError, message):
                 export_build_context.compile_events(arguments, "/tmp")
 
+    def test_sysroot_rejects_empty_joined_value(self):
+        with self.assertRaisesRegex(ValueError, "--sysroot= has an empty sysroot value"):
+            export_build_context.query_sysroot("/compiler", ["--sysroot="], "/tmp")
+
     def test_sysroot_relative_to_captured_compiler_working_directory(self):
         with tempfile.TemporaryDirectory(prefix="argyle consumer build ") as temporary:
             working_directory = Path(temporary)
@@ -88,6 +92,82 @@ class CompilerExportTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "major, minor, and patch"):
                 export_build_context.sdk_version_from_header(str(header))
 
+            header.write_bytes(b"\xff")
+            with self.assertRaisesRegex(ValueError, "must be readable UTF-8 text"):
+                export_build_context.sdk_version_from_header(str(header))
+
+            header.unlink()
+            with self.assertRaisesRegex(ValueError, "could not read the configured"):
+                export_build_context.sdk_version_from_header(str(header))
+
+    def test_configuration_text_files_report_field_specific_utf8_errors(self):
+        with tempfile.TemporaryDirectory(prefix="argyle config text ") as temporary:
+            sdkconfig = Path(temporary) / "sdkconfig"
+            generated_header = Path(temporary) / "sdkconfig.h"
+            for path, field in [
+                (sdkconfig, "configuration.sdkconfig"),
+                (generated_header, "configuration.generated_headers[0]"),
+            ]:
+                path.write_bytes(b"\xff")
+                with self.subTest(field=field):
+                    with self.assertRaises(ValueError) as error:
+                        export_build_context.readable_text_file(str(path), field)
+                    self.assertIn(field, str(error.exception))
+
+    def test_main_preserves_empty_single_config_value_as_one_argument(self):
+        with tempfile.TemporaryDirectory(prefix="argyle context export ") as temporary:
+            root = Path(temporary)
+            sdk = root / "ESP IDF SDK"
+            build = root / "consumer build"
+            working_directory = build / "compiler working directory"
+            sysroot = working_directory / "toolchain sysroot"
+            for directory in (sdk, build, working_directory, sysroot):
+                directory.mkdir(parents=True, exist_ok=True)
+
+            version_header = sdk / "esp_idf_version.h"
+            version_header.write_text(
+                "#define ESP_IDF_VERSION_MAJOR 6\n"
+                "#define ESP_IDF_VERSION_MINOR 1\n"
+                "#define ESP_IDF_VERSION_PATCH 0\n",
+                encoding="utf-8",
+            )
+            sdkconfig = root / "consumer sdkconfig"
+            sdkconfig.write_text("CONFIG_IDF_TARGET=\"esp32c3\"\n", encoding="utf-8")
+            sdkconfig_header = build / "generated sdkconfig.h"
+            sdkconfig_header.write_text("#define CONFIG_IDF_TARGET \"esp32c3\"\n", encoding="utf-8")
+            compiler = root / "selected compiler"
+            compiler.write_text("compiler fixture\n", encoding="utf-8")
+            capture = root / "compiler capture.json"
+            capture.write_text(json.dumps({
+                "compiler": str(compiler),
+                "arguments": ["-c", "context_probe.c", "--sysroot", "toolchain sysroot"],
+                "working_directory": str(working_directory),
+                "status": 0,
+            }), encoding="utf-8")
+            output = root / "exported build context.json"
+            sys_argv = [
+                "export_build_context.py",
+                "--sdk-revision", "0123456789abcdef0123456789abcdef01234567",
+                "--idf-version", "v6.1",
+                "--sdk-root", str(sdk),
+                "--build-root", str(build),
+                "--chip", "esp32c3",
+                "--idf-arch", "riscv",
+                "--sdkconfig", str(sdkconfig),
+                "--sdkconfig-header", str(sdkconfig_header),
+                "--version-header", str(version_header),
+                "--compiler-capture", str(capture),
+                "--output", str(output),
+                "--build-configuration=",
+            ]
+
+            with mock.patch.object(export_build_context.sys, "argv", sys_argv):
+                self.assertEqual(export_build_context.main(), 0)
+
+            context = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(context["compiler"]["build_configuration"], "")
+            self.assertEqual(context["compiler"]["sysroot"], str(sysroot))
+
     def test_capture_requires_a_successful_object_with_argv_and_working_directory(self):
         with tempfile.TemporaryDirectory(prefix="argyle capture ") as temporary:
             capture = Path(temporary) / "capture.json"
@@ -100,6 +180,18 @@ class CompilerExportTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "working_directory"):
+                export_build_context.read_capture(str(capture))
+
+            capture.write_text(
+                json.dumps({
+                    "compiler": "/compiler",
+                    "arguments": [],
+                    "working_directory": temporary,
+                    "status": False,
+                }),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "did not complete successfully"):
                 export_build_context.read_capture(str(capture))
 
     def test_capture_forwards_exact_argv_and_only_writes_after_success(self):

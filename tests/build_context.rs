@@ -87,6 +87,8 @@ impl Fixture {
             "-UCONFIG_BT_BLUEDROID_ENABLED".to_owned(),
             "-c".to_owned(),
             "probe source.c".to_owned(),
+            "--sysroot".to_owned(),
+            "../toolchain sysroot".to_owned(),
         ];
         let value = json!({
             "schema_version": 1,
@@ -155,16 +157,23 @@ impl Drop for Fixture {
 fn c3_and_s3_contexts_preserve_argument_boundaries_and_order() {
     for (chip, target) in [
         ("esp32c3", "riscv32imc-esp-espidf"),
-        ("esp32s3", "xtensa-esp32s3-none-elf"),
+        ("esp32s3", "xtensa-esp32s3-espidf"),
     ] {
         let fixture = Fixture::new(chip);
-        let resolved = context::resolve(target, None, Some(&fixture.contract)).unwrap();
+        let resolved = context::resolve(
+            target,
+            "aarch64-apple-darwin",
+            None,
+            Some(&fixture.contract),
+        )
+        .unwrap();
         let BuildContext::Esp(parsed) = resolved else {
             panic!("ESP target must not resolve to host-only mode");
         };
         assert_eq!(parsed.chip, chip);
         assert_eq!(parsed.compiler_arguments, fixture.compiler_args);
         assert_eq!(parsed.working_directory, fixture.path("consumer build"));
+        assert_eq!(parsed.sysroot, fixture.path("toolchain sysroot"));
         assert_eq!(parsed.build_configuration, "Debug");
         assert_eq!(parsed.includes[0].kind, IncludeKind::Normal);
         assert_eq!(parsed.includes[0].path, fixture.include_paths[0]);
@@ -178,15 +187,19 @@ fn c3_and_s3_contexts_preserve_argument_boundaries_and_order() {
 
 #[test]
 fn ordinary_host_targets_are_sdk_free_and_esp_generation_is_explicit() {
+    let host = "aarch64-apple-darwin";
     assert_eq!(
-        context::resolve("aarch64-apple-darwin", None, None).unwrap(),
+        context::resolve(host, host, None, None).unwrap(),
         BuildContext::HostOnly
     );
-    assert!(context::resolve("aarch64-apple-darwin", Some("host"), None).is_ok());
+    assert!(context::resolve(host, host, Some("host"), None).is_ok());
     let fixture = Fixture::new("esp32c3");
-    assert!(context::resolve("aarch64-apple-darwin", Some("esp"), Some(&fixture.contract)).is_ok());
-    let error =
-        context::resolve("aarch64-apple-darwin", None, Some(&fixture.contract)).unwrap_err();
+    assert!(context::resolve(host, host, Some("esp"), Some(&fixture.contract)).is_ok());
+    let error = context::resolve(host, host, None, Some(&fixture.contract)).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("does not accept an ESP build-context file"));
+    let error = context::resolve(host, host, Some("host"), Some(&fixture.contract)).unwrap_err();
     assert!(error
         .to_string()
         .contains("does not accept an ESP build-context file"));
@@ -204,11 +217,23 @@ fn an_unnamed_single_config_cmake_build_is_preserved_as_empty() {
 
 #[test]
 fn esp_target_without_context_and_host_override_fail_without_fallback() {
-    let error = context::resolve("riscv32imc-esp-espidf", None, None).unwrap_err();
+    let host = "aarch64-apple-darwin";
+    let error = context::resolve("riscv32imc-esp-espidf", host, None, None).unwrap_err();
     assert!(error
         .to_string()
         .contains("ESP generation requires ARGYLE_NIMBLE_CONTEXT"));
-    let error = context::resolve("xtensa-esp32s3-none-elf", Some("host"), None).unwrap_err();
+    let error = context::resolve("xtensa-esp32s3-espidf", host, Some("host"), None).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("host-only mode cannot be selected"));
+
+    let error = context::resolve(
+        "riscv32imc-esp-espidf",
+        "riscv32imc-esp-espidf",
+        Some("host"),
+        None,
+    )
+    .unwrap_err();
     assert!(error
         .to_string()
         .contains("host-only mode cannot be selected"));
@@ -229,6 +254,15 @@ fn malformed_or_unknown_contract_versions_have_stable_diagnostics() {
     fs::write(&fixture.contract, "{broken").unwrap();
     let error = context::parse_context_file(&fixture.contract).unwrap_err();
     assert!(error.to_string().contains("malformed JSON"));
+
+    let malformed_type = Fixture::new("esp32c3");
+    let mut value = malformed_type.read();
+    value["schema_version"] = json!("1");
+    malformed_type.write(&value);
+    assert!(context::parse_context_file(&malformed_type.contract)
+        .unwrap_err()
+        .to_string()
+        .contains("schema_version` is required and must be an unsigned integer"));
 }
 
 #[test]
@@ -277,15 +311,48 @@ fn unsupported_sdk_chip_architecture_and_mismatched_cargo_target_fail() {
     {
         let fixture = Fixture::new("esp32c3");
         let error = context::resolve(
-            "xtensa-esp32s3-none-elf",
+            "xtensa-esp32s3-espidf",
+            "aarch64-apple-darwin",
             Some("esp"),
             Some(&fixture.contract),
         )
         .unwrap_err();
         assert!(error
             .to_string()
-            .contains("does not match the configured ESP firmware Cargo target"));
+            .contains("does not match ESP-IDF Cargo target"));
     }
+}
+
+#[test]
+fn only_exact_supported_espidf_targets_select_esp_mode() {
+    let host = "aarch64-apple-darwin";
+    for unsupported in [
+        "riscv32imac-esp-espidf",      // ESP32-C6
+        "riscv32imafc-esp-espidf",     // ESP32-P4
+        "riscv32imc-unknown-none-elf", // bare-metal target
+        "xtensa-esp32s3-none-elf",     // ESP bare-metal target
+        "unknown-vendor-none-elf",
+    ] {
+        let error = context::resolve(unsupported, host, None, None).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported non-native Cargo target"));
+    }
+
+    let fixture = Fixture::new("esp32c3");
+    let error = context::resolve(
+        "xtensa-esp32s3-espidf",
+        host,
+        Some("esp"),
+        Some(&fixture.contract),
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("does not match ESP-IDF Cargo target"));
+
+    let error = context::resolve(host, host, Some("auto"), None).unwrap_err();
+    assert!(error.to_string().contains("choose `host` or `esp`"));
 }
 
 #[test]
@@ -366,11 +433,84 @@ fn missing_files_and_malformed_compiler_arguments_fail_with_field_guidance() {
             .to_string()
             .contains("define option without its macro operand"));
     }
+    {
+        let fixture = Fixture::new("esp32c3");
+        let mut value = fixture.read();
+        let mut arguments = fixture.compiler_args.clone();
+        arguments.truncate(arguments.len() - 1);
+        value["compiler"]["arguments"] = json!(arguments);
+        fixture.write(&value);
+        assert!(context::parse_context_file(&fixture.contract)
+            .unwrap_err()
+            .to_string()
+            .contains("--sysroot is missing its sysroot operand"));
+    }
+    {
+        let fixture = Fixture::new("esp32c3");
+        let mut value = fixture.read();
+        let mut arguments = fixture.compiler_args.clone();
+        *arguments.last_mut().unwrap() = String::new();
+        value["compiler"]["arguments"] = json!(arguments);
+        fixture.write(&value);
+        assert!(context::parse_context_file(&fixture.contract)
+            .unwrap_err()
+            .to_string()
+            .contains("--sysroot is missing its sysroot operand"));
+    }
+}
+
+#[test]
+fn declared_sysroot_must_match_the_explicit_argument() {
+    let fixture = Fixture::new("esp32c3");
+    let mut value = fixture.read();
+    value["compiler"]["sysroot"] = json!(fixture.path("consumer build"));
+    fixture.write(&value);
+    assert!(context::parse_context_file(&fixture.contract)
+        .unwrap_err()
+        .to_string()
+        .contains("does not match the explicit sysroot argument"));
+
+    let mut value = fixture.read();
+    let mut arguments = fixture.compiler_args.clone();
+    *arguments.last_mut().unwrap() = "--sysroot=".to_owned();
+    value["compiler"]["arguments"] = json!(arguments);
+    fixture.write(&value);
+    assert!(context::parse_context_file(&fixture.contract)
+        .unwrap_err()
+        .to_string()
+        .contains("--sysroot= has an empty sysroot value"));
+
+    let fixture = Fixture::new("esp32c3");
+    let mut value = fixture.read();
+    let mut arguments = fixture.compiler_args.clone();
+    arguments.extend([
+        "-isysroot".to_owned(),
+        fixture
+            .path("consumer build")
+            .to_string_lossy()
+            .into_owned(),
+    ]);
+    value["compiler"]["arguments"] = json!(arguments);
+    fixture.write(&value);
+    assert!(context::parse_context_file(&fixture.contract)
+        .unwrap_err()
+        .to_string()
+        .contains("does not match the explicit sysroot argument"));
 }
 
 #[test]
 fn disabled_bluetooth_or_nimble_and_mismatched_generated_config_fail() {
     let fixture = Fixture::new("esp32s3");
+    fs::write(
+        fixture.path("consumer config/sdkconfig"),
+        "CONFIG_IDF_TARGET=\"esp32s3\"\nCONFIG_IDF_TARGET_ESP32S3=y\n# CONFIG_BT_ENABLED is not set\nCONFIG_BT_NIMBLE_ENABLED=y\n",
+    )
+    .unwrap();
+    assert!(context::parse_context_file(&fixture.contract)
+        .unwrap_err()
+        .to_string()
+        .contains("disables CONFIG_BT_ENABLED"));
+
     fs::write(
         fixture.path("consumer config/sdkconfig"),
         "CONFIG_IDF_TARGET=\"esp32s3\"\nCONFIG_IDF_TARGET_ESP32S3=y\nCONFIG_BT_ENABLED=y\n# CONFIG_BT_NIMBLE_ENABLED is not set\n",
@@ -444,4 +584,21 @@ fn sdk_version_header_must_match_and_unreadable_context_has_recovery_guidance() 
         error.to_string(),
         "ESP build-context file is unreadable; rerun the CMake exporter after configuring ESP-IDF"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn existing_unreadable_sdkconfig_is_rejected() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new("esp32c3");
+    fs::set_permissions(
+        fixture.path("consumer config/sdkconfig"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    assert!(context::parse_context_file(&fixture.contract)
+        .unwrap_err()
+        .to_string()
+        .contains("configuration.sdkconfig` must be readable"));
 }

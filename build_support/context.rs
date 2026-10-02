@@ -13,7 +13,7 @@ const CONTRACT_VERSION: u64 = 1;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BuildContext {
     HostOnly,
-    Esp(EspBuildContext),
+    Esp(Box<EspBuildContext>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,28 +83,36 @@ impl fmt::Display for ContextError {
 
 impl std::error::Error for ContextError {}
 
-/// Resolve a Cargo target and optional explicit mode into a validated context.
+/// Resolve a Cargo target and native host target into a validated context.
 ///
-/// `None` selects the native host path for ordinary host targets, and requires
-/// an ESP context for supported ESP-IDF targets. An explicit `esp` request is
-/// also allowed on a host target for private generator/fixture drivers.
+/// An implicit host mode is selected only when Cargo's TARGET equals HOST.
+/// The only accepted cross targets are ESP-IDF's C3 and S3 triples; an explicit
+/// `esp` request is also allowed from a native-host fixture/generator driver.
 pub fn resolve(
     cargo_target: &str,
+    cargo_host: &str,
     requested_mode: Option<&str>,
     context_path: Option<&Path>,
 ) -> Result<BuildContext, ContextError> {
-    if cargo_target.trim().is_empty() {
+    if cargo_target.is_empty() || cargo_host.is_empty() {
         return Err(ContextError(
-            "Cargo target metadata is missing; build context cannot be selected".into(),
+            "Cargo TARGET/HOST metadata is missing; build context cannot be selected".into(),
         ));
     }
 
-    let is_esp_target = is_esp_firmware_target(cargo_target);
+    let target_is_host = cargo_target == cargo_host;
+    let firmware_chip = supported_esp_target(cargo_target);
+    if !target_is_host && firmware_chip.is_none() {
+        return Err(ContextError(format!(
+            "unsupported non-native Cargo target `{cargo_target}`; this contract supports only ESP32-C3 and ESP32-S3 ESP-IDF targets"
+        )));
+    }
+
     let mode = match requested_mode {
         Some("host") => {
-            if is_esp_target {
+            if !target_is_host || firmware_chip.is_some() {
                 return Err(ContextError(format!(
-                    "host-only mode cannot be selected for ESP firmware target `{cargo_target}`"
+                    "host-only mode cannot be selected for ESP firmware target `{cargo_target}` or when Cargo TARGET differs from HOST `{cargo_host}`"
                 )));
             }
             Mode::Host
@@ -115,8 +123,9 @@ pub fn resolve(
                 "unsupported build mode `{other}`; choose `host` or `esp`"
             )))
         }
-        None if is_esp_target => Mode::Esp,
-        None => Mode::Host,
+        None if firmware_chip.is_some() => Mode::Esp,
+        None if target_is_host => Mode::Host,
+        None => unreachable!("non-native target was rejected above"),
     };
 
     match mode {
@@ -135,10 +144,10 @@ pub fn resolve(
                 )
             })?;
             let context = parse_context_file(path)?;
-            if is_esp_target {
-                validate_target_match(cargo_target, &context)?;
+            if let Some(chip) = firmware_chip {
+                validate_target_match(cargo_target, chip, &context)?;
             }
-            Ok(BuildContext::Esp(context))
+            Ok(BuildContext::Esp(Box::new(context)))
         }
     }
 }
@@ -242,6 +251,7 @@ fn validate_context(value: &Value) -> Result<EspBuildContext, ContextError> {
     }
     let defines = parse_defines(compiler_object, &compiler_arguments)?;
     validate_argument_events(&compiler_arguments, &includes, &defines, &working_directory)?;
+    validate_explicit_sysroot(&compiler_arguments, &sysroot, &working_directory)?;
 
     let configuration = required_object(object, "configuration", "contract")?;
     let sdkconfig = required_path(configuration, "sdkconfig", "configuration")?;
@@ -290,23 +300,23 @@ fn validate_context(value: &Value) -> Result<EspBuildContext, ContextError> {
     })
 }
 
-fn is_esp_firmware_target(target: &str) -> bool {
-    let normalized = target.to_ascii_lowercase();
-    normalized.contains("-espidf")
-        || (normalized.starts_with("xtensa-esp32") && normalized.ends_with("-none-elf"))
+fn supported_esp_target(target: &str) -> Option<&'static str> {
+    match target {
+        "riscv32imc-esp-espidf" => Some("esp32c3"),
+        "xtensa-esp32s3-espidf" => Some("esp32s3"),
+        _ => None,
+    }
 }
 
-fn validate_target_match(target: &str, context: &EspBuildContext) -> Result<(), ContextError> {
-    let normalized = target.to_ascii_lowercase();
-    let expected = match context.chip.as_str() {
-        "esp32c3" => normalized.starts_with("riscv32"),
-        "esp32s3" => normalized.starts_with("xtensa-esp32s3"),
-        _ => false,
-    };
-    if !expected {
+fn validate_target_match(
+    target: &str,
+    expected_chip: &str,
+    context: &EspBuildContext,
+) -> Result<(), ContextError> {
+    if context.chip != expected_chip {
         return Err(field_error(
             "target.chip",
-            "does not match the configured ESP firmware Cargo target",
+            &format!("does not match ESP-IDF Cargo target `{target}`"),
         ));
     }
     Ok(())
@@ -679,6 +689,73 @@ fn validate_argument_events(
             working_directory.join(&include.path)
         };
         require_directory(&effective_path, "compiler.includes")?;
+    }
+    Ok(())
+}
+
+fn validate_explicit_sysroot(
+    arguments: &[String],
+    configured_sysroot: &Path,
+    working_directory: &Path,
+) -> Result<(), ContextError> {
+    let mut explicit_sysroots = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = arguments[index].as_str();
+        if argument == "--sysroot" || argument == "-isysroot" {
+            let value = arguments
+                .get(index + 1)
+                .filter(|value| !value.is_empty())
+                .map(String::as_str)
+                .ok_or_else(|| {
+                    field_error(
+                        "compiler.arguments",
+                        &format!("{argument} is missing its sysroot operand"),
+                    )
+                })?;
+            explicit_sysroots.push(value);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--sysroot=") {
+            if value.is_empty() {
+                return Err(field_error(
+                    "compiler.arguments",
+                    "--sysroot= has an empty sysroot value",
+                ));
+            }
+            explicit_sysroots.push(value);
+        }
+        index += 1;
+    }
+
+    if !explicit_sysroots.is_empty() {
+        let captured = configured_sysroot.canonicalize().map_err(|_| {
+            field_error(
+                "compiler.sysroot",
+                "must name a readable selected compiler sysroot",
+            )
+        })?;
+        for value in explicit_sysroots {
+            let operand = Path::new(value);
+            let operand = if operand.is_absolute() {
+                operand.to_path_buf()
+            } else {
+                working_directory.join(operand)
+            };
+            let expected = operand.canonicalize().map_err(|_| {
+                field_error(
+                    "compiler.arguments",
+                    "references a sysroot directory that is not available from the compiler working directory",
+                )
+            })?;
+            if expected != captured {
+                return Err(field_error(
+                    "compiler.sysroot",
+                    "does not match the explicit sysroot argument after resolving it from compiler.working_directory",
+                ));
+            }
+        }
     }
     Ok(())
 }

@@ -35,8 +35,23 @@ def absolute_file(value: str, field: str) -> str:
     return str(path)
 
 
+def readable_text_file(value: str, field: str) -> tuple[str, str]:
+    path = Path(value)
+    if not path.is_absolute():
+        fail(field, "must be an absolute file path")
+    if not path.is_file() or not os.access(path, os.R_OK):
+        fail(field, "could not read the configured regular file")
+    try:
+        contents = path.read_text(encoding="utf-8")
+    except UnicodeError:
+        fail(field, "must be readable UTF-8 text")
+    except OSError:
+        fail(field, "could not read the configured file")
+    return str(path), contents
+
+
 def sdk_version_from_header(path: str) -> str:
-    contents = Path(path).read_text(encoding="utf-8")
+    _, contents = readable_text_file(path, "configuration.version_header")
     found = {}
     for name, value in re.findall(
         r"^\s*#define\s+ESP_IDF_VERSION_(MAJOR|MINOR|PATCH)\s+([0-9]+)\b",
@@ -127,6 +142,8 @@ def query_sysroot(compiler: str, arguments: list[str], working_directory: str) -
             selected = arguments[index]
         elif argument.startswith("--sysroot="):
             selected = argument.split("=", 1)[1]
+            if not selected:
+                fail("compiler.arguments", "--sysroot= has an empty sysroot value")
         index += 1
 
     if selected is not None:
@@ -172,7 +189,7 @@ def read_capture(path: str) -> tuple[str, list[str], str]:
         fail("compiler.arguments", "the C compiler capture does not contain a compiler and an argument array")
     if not isinstance(working_directory, str):
         fail("compiler.working_directory", "is missing from the successful compiler capture")
-    if captured.get("status") != 0:
+    if type(captured.get("status")) is not int or captured["status"] != 0:
         fail("compiler.arguments", "the compiler probe did not complete successfully")
     return compiler, arguments, absolute_directory(working_directory, "compiler.working_directory")
 
@@ -190,9 +207,12 @@ def main() -> int:
 
     sdk_root = absolute_directory(args.sdk_root, "roots.sdk")
     build_root = absolute_directory(args.build_root, "roots.build")
-    sdkconfig = absolute_file(args.sdkconfig, "configuration.sdkconfig")
-    sdkconfig_header = absolute_file(args.sdkconfig_header, "configuration.generated_headers[0]")
-    version_header = absolute_file(args.version_header, "configuration.version_header")
+    sdkconfig, _ = readable_text_file(args.sdkconfig, "configuration.sdkconfig")
+    sdkconfig_header, _ = readable_text_file(
+        args.sdkconfig_header,
+        "configuration.generated_headers[0]",
+    )
+    version_header = args.version_header
     sdk_version = sdk_version_from_header(version_header)
     implicit_includes = [
         absolute_directory(path, f"compiler.implicit_includes[{index}]")
