@@ -1,7 +1,6 @@
 """Regression tests for validation failures, diagnostics, and package contracts."""
 
 import importlib.util
-import json
 from pathlib import Path
 import subprocess
 import sys

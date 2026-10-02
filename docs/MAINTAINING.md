@@ -2,13 +2,13 @@
 
 ## Setup status
 
-The repository uses `main`. The `develop`/`master` branches, Azure pipeline,
-remote protections, and private vulnerability reporting are pending setup. This
+The repository uses `main`. The `develop`/`master` branches, remote protections,
+and private vulnerability reporting are pending setup. This
 guide specifies intended policy, adapted from FSharp.MinimalApi. Update this
 notice and README, CONTRIBUTING, and SECURITY as each setting is verified.
 
-The crate skeleton remains pending build/test verification until Azure is
-available. File/metadata inspection does not substitute for build evidence.
+The crate skeleton's host compilation and empty test harness have passed through
+Azure; see [CI.md](CI.md) for evidence. It has no BLE behavior tests yet.
 Its version is an unpublished development identifier, and `publish = false` is
 an intentional guard.
 
@@ -35,10 +35,12 @@ is merged and no open PR depends on them.
 
 ## Azure and external contributions
 
-All builds/tests use Azure DevOps's self-hosted `macOS` pool. The pipeline setup
-must pin tooling, collect reports/artifacts, and cover PRs targeting `develop`
-and `master`. Record the verified pipeline URL and exact required status-check
-identity here when available; do not require a guessed check name.
+All builds/tests use Azure DevOps's self-hosted `macOS` pool through
+[pipeline 35, argyle-nimble PR Validation](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build?definitionId=35).
+The verified GitHub check is `argyle-nimble PR Validation`, emitted by the
+Azure Pipelines GitHub App (app ID `9426`). The upcoming protection setup should
+require that exact name/App pair on `develop` and `master`; see [CI.md](CI.md)
+for tooling, diagnostics, and server-side trigger configuration.
 
 Disable direct fork builds through Azure controls outside contributor-editable
 YAML. Check centralized organization/project settings and pipeline settings.
@@ -65,11 +67,10 @@ accepting external contribution builds.
 
 ## Validation evidence
 
-Initial Azure validation must compile/test the host skeleton without ESP-IDF,
-inspect metadata/package contents, and verify license inclusion and docs links.
+Azure validation compiles/tests the host skeleton without ESP-IDF, inspects
+metadata/package contents, and verifies license inclusion and relative docs links.
 There are no behavior tests yet; zero tests do not establish BLE correctness or
-target compatibility. Keep the bootstrap work pending verification until its
-Azure evidence exists.
+target compatibility. Follow the CI guide when extending or rerunning checks.
 
 Each later implementation includes its own tests. The final Phase 1 matrix
 integrates compile-pass/fail, unit/property, lifecycle, concurrency,

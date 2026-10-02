@@ -6,13 +6,13 @@ A public MIT-licensed Rust framework for ESP-IDF's NimBLE stack.
 
 This is an initial library crate and contribution structure. It has **no public
 BLE API, implemented BLE behavior, or published package**. The dependency-free
-skeleton is intended to compile on a host without ESP-IDF; Azure build/test
-verification is pending. There are no behavior tests yet. `publish = false`
+skeleton compiles and runs its empty host test harness without ESP-IDF through
+[Azure validation](docs/CI.md). There are no behavior tests yet. `publish = false`
 prevents accidental Cargo publication during development.
 
 Repository setup is also in progress: the default branch is currently `main`.
-The intended `develop`/`master` workflow, branch protections, Azure validation,
-and GitHub private vulnerability reporting still require configuration. These
+The intended `develop`/`master` workflow, branch protections, and GitHub private
+vulnerability reporting still require configuration. These
 documents specify policy; they do not establish remote settings.
 
 ## Planned Phase 1
@@ -35,7 +35,8 @@ documents specify policy; they do not establish remote settings.
 
 These are goals, not current safety or compatibility guarantees. Public APIs
 will arrive with their implementation, tests, and rustdoc. There is no validated
-minimum supported Rust version or target toolchain yet.
+minimum supported Rust version or target toolchain yet. Host validation pins
+Rust 1.90.0; this does not establish the embedded target toolchain or an MSRV.
 
 Phase 1 acceptance requires host tests and C3/S3 compile/link results through
 Azure DevOps's self-hosted `macOS` pool. It does not establish hardware
@@ -62,7 +63,7 @@ bugs, questions, and features. Follow [SECURITY.md](SECURITY.md) for private
 reporting, including its temporary setup limitation, and the
 [Code of Conduct](CODE_OF_CONDUCT.md) in all project spaces.
 
-All project builds/tests run through Azure's self-hosted `macOS` pool. Until the
-pipeline exists, report validation as pending. External contributions require
+All project builds/tests run through Azure's self-hosted `macOS` pool. The
+[CI guide](docs/CI.md) describes the current checks and evidence. External contributions require
 maintainer review and promotion before validation; see the maintainer guide.
 Contributions use the existing [MIT license](LICENSE), copyright Argyle Concepts.
