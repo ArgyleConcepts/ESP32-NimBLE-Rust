@@ -12,6 +12,7 @@ categories = ["embedded", "hardware-support"]
 publish = false
 include = [
     "/Cargo.toml",
+    "/build.rs",
     "/build_support/**",
     "/cmake/**",
     "/src/**",
@@ -28,9 +29,11 @@ bindgen = { version = "=0.72.1", default-features = false, features = ["runtime"
 clang-sys = { version = "=1.8.1", default-features = false, features = ["runtime"] }
 serde_json = "1.0"
 syn = { version = "=2.0.119", features = ["full"] }
+sha2 = "=0.10.9"
 
 [dev-dependencies]
 bindgen = { version = "=0.72.1", default-features = false, features = ["runtime"] }
 clang-sys = { version = "=1.8.1", default-features = false, features = ["runtime"] }
 serde_json = "1.0"
 syn = { version = "=2.0.119", features = ["full"] }
+sha2 = "=0.10.9"

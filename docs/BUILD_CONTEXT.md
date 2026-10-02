@@ -94,7 +94,8 @@ The private `build_support/context.rs` resolver uses Cargo target metadata:
 and `HOST` strings, an optional `mode` (`None`, `host`, or `esp`), and the path
 to the configured CMake export JSON. The path is required in ESP mode and
 rejected in host-only mode. The resolver does not read environment variables
-or discover the export file; Cargo build-script wiring belongs to NIMBLERS-23.
+or discover the export file. Cargo's private `build.rs` passes
+`ARGYLE_NIMBLE_BUILD_MODE` and `ARGYLE_NIMBLE_BUILD_CONTEXT` to this contract.
 
 - An ordinary native host target with no explicit mode resolves to host-only
   context and does not require ESP-IDF, headers, or a toolchain.
@@ -108,10 +109,13 @@ or discover the export file; Cargo build-script wiring belongs to NIMBLERS-23.
 - An explicit ESP request is allowed from a host target for a private generator
   or fixture driver, but it still requires the full validated context.
 
-The normal Cargo build-script integration is a later task. This resolver is
-already callable by private tooling and is exercised with generic C3/S3 fixture
-contexts in Azure. Fixture tests validate the contract and diagnostics only;
-they do not compile real ESP-IDF headers or establish target ABI compatibility.
+The Cargo build script calls this resolver before selecting any generator
+tools. Native host builds and rustdoc resolve to host-only mode without an SDK
+or context file. Either supported ESP target requires a context file; an
+invalid, missing, or mismatched context fails the build and never falls back to
+host mode. An explicit `host` request also rejects any supplied context path.
+The fixture tests validate the contract and diagnostics only; they do not
+compile real ESP-IDF headers or establish target ABI compatibility.
 
 The probe copies target-level consumer include, define, compile-option and
 compile-feature properties, plus language standard/extensions, position-

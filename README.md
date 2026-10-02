@@ -62,6 +62,8 @@ milestones.
 ## Project layout and contribution
 
 - `Cargo.toml`: package identity and explicit package-file inclusion.
+- `build.rs` and `build_support/lifecycle.rs`: private Cargo mode selection,
+  input tracking, and transactional `OUT_DIR` binding publication.
 - `src/lib.rs`: library entry point and crate documentation.
 - `build_support/context.rs` and `cmake/`: private build-context validation and
   CMake export contract.

@@ -6,7 +6,63 @@ the validated [consumer context](BUILD_CONTEXT.md). Its inputs are an
 `OutputLocation` whose caller-authorized root is normally Cargo's `OUT_DIR`.
 It does not discover an SDK or compiler through `PATH`, infer configuration
 from a global installation, or expose generated declarations as public BLE
-APIs. Cargo build-script environment selection is owned by NIMBLERS-23.
+APIs. The package's private `build.rs` calls this generator for ESP targets and
+includes the result only inside `src/backend`.
+
+## Cargo selection and invalidation
+
+Cargo selects build mode from `TARGET` and `HOST`, with the optional
+`ARGYLE_NIMBLE_BUILD_MODE` override (`host` or `esp`). Native host builds and
+rustdoc default to host-only mode and do not require ESP-IDF, a context export,
+or Espressif Clang. The supported C3 and S3 ESP-IDF targets require
+`ARGYLE_NIMBLE_BUILD_CONTEXT` to name the configured CMake JSON export. A
+missing, malformed, stale, or target-mismatched context fails the build; the
+resolver never falls back to host mode. Explicit `host` mode is rejected for
+ESP targets, and host mode rejects a supplied context path.
+
+ESP generation requires `ARGYLE_NIMBLE_ESP_CLANG` to name the pinned
+Espressif Clang executable and `LIBCLANG_PATH` to name its matching library.
+`ARGYLE_NIMBLE_ESP_CLANG_RELEASE` may select the package release but defaults
+to the one pinned in `bindings.rs`; another release fails closed. The Cargo
+build script tracks these selectors, `PATH` for the SDK Git query,
+`LIBCLANG_PATH` and dynamic-library loader selectors, the active Cargo target
+configuration, include-path environment selectors, and bindgen's generic and
+known target-specific extra-argument variables. Nonempty ambient include or
+bindgen overrides remain errors. The manifest also captures compiler search
+and Clang configuration selectors (`GCC_EXEC_PREFIX`, `COMPILER_PATH`,
+`GCC_SPECS`, `LIBRARY_PATH`, `SDKROOT`, and `CLANG_CONFIG_FILE*`) so a changed
+inherited selector changes output identity and reruns validation.
+
+Rerun inputs include the raw context JSON, sdkconfig and generated headers,
+shim sources, selected compiler/tool files, SDK Git metadata and submodule
+revisions, all resolved transitive headers reported by bindgen, and the
+ordered include/sysroot/resource-directory search roots. Cargo recursively
+observes a watched directory, so ordinary include roots detect both edits and
+newly added shadow headers. Selected path aliases and their canonical
+resolutions are recorded in the private manifest. The parent directories of
+symlinked path components are watched so retargeting an include, context, SDK,
+or tool path invalidates generation even if the new tree is older. The
+standard macOS `/var` and `/tmp` aliases are treated as immutable OS layout and
+not watched from `/`.
+
+When any watched directory contains or is inside `OUT_DIR`, the build script
+omits that recursive directory watch and watches a deliberately absent path
+under `OUT_DIR` instead. Cargo treats a watched path that does not exist as
+dirty on each invocation; this keeps header resolution complete without
+scanning generated bindings recursively. The cost is that Cargo reruns the ESP
+build script on each build invocation for an overlapping layout. See the
+[Cargo build-script change-detection contract](https://doc.rust-lang.org/cargo/reference/build-scripts.html#cargo-rerun-if-changedpath).
+
+The SDK `HEAD` must match the revision captured by the CMake exporter. The
+manifest also records initialized submodule revisions. Git `HEAD`, refs,
+packed refs, configuration, and index paths are watched so an SDK revision
+change triggers validation before generation. A changed SDK checkout requires
+re-exporting the context. Directory watches that overlap `OUT_DIR` use the
+same absent-path strategy as overlapping include roots. Cargo also treats a
+directly watched SDK Git metadata path that is absent (such as `packed-refs` in
+a loose-ref checkout or the pointer for an uninitialized submodule) as dirty
+on each invocation until it appears. Those layouts rerun the build script
+repeatedly; the watch avoids recursively scanning the SDK's Git object database.
 
 ## Toolchain and compiler inputs
 
@@ -101,20 +157,42 @@ behavior tests; broad `BLE_*` or `ble_*` patterns are not used as roots.
 
 ## Output and evidence
 
-The caller must designate an existing output directory inside an explicit
-authorized root. The generator's entire source tree outside `target/`, SDK,
-sysroot, generated configuration, and supplied Cargo-registry roots are
-protected, even when a caller supplies a different crate-root label. A Cargo
-output directory may be under the
-ESP-IDF build tree or under a crate `target/` directory, including when that
-directory is also an include root. The generator writes only
-`nimble_bindings.rs`, through a same-directory temporary file and atomic
-rename; a symlink or non-file at that destination is rejected. Parsing,
-required-root validation, tool selection, and shim syntax checking complete
-before publication, so a failed run does not publish partial bindings.
+The Cargo build script validates the ESP context and `OUT_DIR` against crate
+sources, the SDK, sysroot, context/configuration files, selected toolchain
+files, and Cargo registry/Git package-cache roots before cleanup. The real Cargo
+`OUT_DIR` is the output authority, so a configured custom target-dir does not
+need to be under the crate's default `target/`; the build script still rejects source, SDK,
+configuration, tool, registry, and symlinked output paths. It removes only its
+fixed binding, manifest, temporary-manifest, and staging names. Generation
+writes first into a staging directory under `OUT_DIR`; the existing generator
+syntax-checks the C shim and validates the required private roots before
+creating its candidate. The build script then atomically moves the candidate to `OUT_DIR/nimble_bindings.rs`,
+publishes `nimble_bindings.manifest.json`, and verifies both output and input
+fingerprints before emitting the private `argyle_nimble_esp` cfg. The backend
+includes generated declarations through `OUT_DIR` only when that cfg is set.
 
-Azure host tests include generic C fixtures parsed with an explicitly selected
-host libclang and a synthetic C-shim harness compiled with a host compiler.
+If input validation or tool selection fails before cleanup, the build fails and
+does not emit the private cfg; any prior output is therefore unusable for that
+invocation. If binding generation, manifest writing, or verification fails
+after cleanup, the build fails and removes staged or published candidates.
+Interrupted staging state is cleared by the next authorized build-script run.
+
+The sidecar input manifest uses SHA-256 and records the context bytes, Cargo
+target/host and selectors, SDK revision/submodules, ordered compiler arguments
+and search paths, configuration/header contents, compiler and Espressif Clang
+versions, tool file metadata and content digests, the package manifest and
+generator source files, and the generated binding digest. It intentionally
+does not bind to a workspace `Cargo.lock`: a library consumer resolves that
+lockfile in its own workspace, while Cargo rebuilds the build script when its
+resolved build dependencies change. The manifest fingerprint is verified after
+publication; it is an output identity record, not a cross-context binding
+cache. The package include list contains the build script and private source
+tooling, while Cargo output remains under `OUT_DIR` and outside packaged source
+files.
+
+Azure host tests include SDK-free Cargo lifecycle and output-identity fixtures,
+generic C fixtures parsed with an explicitly selected host libclang, and a
+synthetic C-shim harness compiled with a host compiler.
 They exercise bindgen invocation, exact root filtering, required-symbol and
 missing-header failure paths, argv preservation, output protection, and shim
 wrapper behavior against controlled stubs.

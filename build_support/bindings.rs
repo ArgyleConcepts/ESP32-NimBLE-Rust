@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const ESP_CLANG_RELEASE: &str = "21.1.3_20260408";
+pub(crate) const ESP_CLANG_RELEASE: &str = "21.1.3_20260408";
 const ESP_CLANG_VERSION: &str = "21.1.3";
 const GENERATED_FILE: &str = "nimble_bindings.rs";
 const SHIM_HEADER: &str = "src/backend/nimble_shim.h";
@@ -171,6 +171,39 @@ pub fn generate(
     toolchain: &EspClangToolchain,
     output: &OutputLocation,
 ) -> Result<PathBuf, BindingError> {
+    generate_with_dependencies(context, toolchain, output).map(|(path, _)| path)
+}
+
+/// Generate bindings and return the canonical files parsed by bindgen.
+///
+/// Cargo's build script uses this list together with the ordered include search
+/// directories to invalidate bindings when a transitive header changes or a
+/// higher-priority header starts resolving from a different directory.
+pub(crate) fn generate_with_dependencies(
+    context: &EspBuildContext,
+    toolchain: &EspClangToolchain,
+    output: &OutputLocation,
+) -> Result<(PathBuf, Vec<PathBuf>), BindingError> {
+    generate_with_dependencies_inner(context, toolchain, output, false)
+}
+
+/// Generate under the Cargo build script's previously validated `OUT_DIR`
+/// authority. This keeps custom Cargo target-dir layouts working while direct
+/// generator callers retain the stricter source-root boundary.
+pub(crate) fn generate_cargo_with_dependencies(
+    context: &EspBuildContext,
+    toolchain: &EspClangToolchain,
+    output: &OutputLocation,
+) -> Result<(PathBuf, Vec<PathBuf>), BindingError> {
+    generate_with_dependencies_inner(context, toolchain, output, true)
+}
+
+fn generate_with_dependencies_inner(
+    context: &EspBuildContext,
+    toolchain: &EspClangToolchain,
+    output: &OutputLocation,
+    cargo_managed_output: bool,
+) -> Result<(PathBuf, Vec<PathBuf>), BindingError> {
     reject_bindgen_environment_overrides()?;
     validate_toolchain(toolchain)?;
     let clang_resource_dir = query_clang_resource_dir(&toolchain.clang)?;
@@ -182,10 +215,10 @@ pub fn generate(
             "private binding shim header is missing; restore src/backend/nimble_shim.h",
         ));
     }
-    let output_file = validate_output(context, output, &header)?;
+    let output_file = validate_output_inner(context, output, &header, cargo_managed_output)?;
     validate_shim_with_consumer_compiler(context)?;
 
-    let source = generate_source(
+    let (source, dependencies) = generate_source_with_dependencies(
         &header,
         &clang_args,
         &NIMBLE_ALLOWLIST,
@@ -194,7 +227,7 @@ pub fn generate(
         REQUIRED_VARIABLES,
     )?;
     atomic_write(&output_file, source.as_bytes())?;
-    Ok(output_file)
+    Ok((output_file, dependencies))
 }
 
 #[derive(Clone, Copy)]
@@ -222,15 +255,38 @@ pub(crate) fn generate_source(
     required_types: &[&str],
     required_variables: &[&str],
 ) -> Result<String, BindingError> {
+    generate_source_with_dependencies(
+        header,
+        clang_args,
+        allowlist,
+        required_functions,
+        required_types,
+        required_variables,
+    )
+    .map(|(source, _)| source)
+}
+
+pub(crate) fn generate_source_with_dependencies(
+    header: &Path,
+    clang_args: &[String],
+    allowlist: &Allowlist,
+    required_functions: &[&str],
+    required_types: &[&str],
+    required_variables: &[&str],
+) -> Result<(String, Vec<PathBuf>), BindingError> {
     if !header.is_file() {
         return Err(error(
             "private binding shim header is missing; restore src/backend/nimble_shim.h",
         ));
     }
     reject_bindgen_environment_overrides()?;
+    let dependencies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut builder = bindgen::Builder::default()
         .header(header.to_string_lossy())
         .clang_args(clang_args)
+        .parse_callbacks(Box::new(IncludeFileCollector(std::sync::Arc::clone(
+            &dependencies,
+        ))))
         .detect_include_paths(false)
         .allowlist_recursively(true)
         .generate_comments(false)
@@ -268,7 +324,27 @@ pub(crate) fn generate_source(
         required_types,
         required_variables,
     )?;
-    Ok(source)
+    let mut dependencies = dependencies
+        .lock()
+        .map_err(|_| error("could not read bindgen's resolved header list"))?
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<PathBuf>>();
+    dependencies.push(header.to_path_buf());
+    dependencies.sort();
+    dependencies.dedup();
+    Ok((source, dependencies))
+}
+
+#[derive(Debug)]
+struct IncludeFileCollector(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl bindgen::callbacks::ParseCallbacks for IncludeFileCollector {
+    fn include_file(&self, filename: &str) {
+        if let Ok(mut files) = self.0.lock() {
+            files.push(filename.to_owned());
+        }
+    }
 }
 
 pub(crate) fn validate_required_items(
@@ -929,6 +1005,27 @@ pub(crate) fn validate_output(
     output: &OutputLocation,
     header: &Path,
 ) -> Result<PathBuf, BindingError> {
+    validate_output_inner(context, output, header, false)
+}
+
+/// Validate an output inside the real Cargo `OUT_DIR` already authorized by
+/// `build.rs`. Unlike direct generator calls, Cargo may place its target dir
+/// anywhere; explicit source, SDK, configuration, tool, and registry roots
+/// remain protected below.
+pub(crate) fn validate_cargo_output(
+    context: &EspBuildContext,
+    output: &OutputLocation,
+    header: &Path,
+) -> Result<PathBuf, BindingError> {
+    validate_output_inner(context, output, header, true)
+}
+
+fn validate_output_inner(
+    context: &EspBuildContext,
+    output: &OutputLocation,
+    header: &Path,
+    cargo_managed_output: bool,
+) -> Result<PathBuf, BindingError> {
     let directory = output
         .directory
         .canonicalize()
@@ -941,7 +1038,10 @@ pub(crate) fn validate_output(
         .canonicalize()
         .map_err(|_| error("crate source root is not readable"))?;
     let cargo_target = claimed_crate_root.join("target");
-    if directory.starts_with(&claimed_crate_root) && !directory.starts_with(&cargo_target) {
+    if !cargo_managed_output
+        && directory.starts_with(&claimed_crate_root)
+        && !directory.starts_with(&cargo_target)
+    {
         return Err(error(
             "binding output directory overlaps crate sources; choose a Cargo build-output directory",
         ));
@@ -950,7 +1050,10 @@ pub(crate) fn validate_output(
         .canonicalize()
         .map_err(|_| error("generator crate source root is not readable"))?;
     let actual_cargo_target = actual_crate_root.join("target");
-    if directory.starts_with(&actual_crate_root) && !directory.starts_with(&actual_cargo_target) {
+    if !cargo_managed_output
+        && directory.starts_with(&actual_crate_root)
+        && !directory.starts_with(&actual_cargo_target)
+    {
         return Err(error(
             "binding output directory overlaps this generator's source tree; choose Cargo's target/ or OUT_DIR",
         ));
@@ -976,6 +1079,22 @@ pub(crate) fn validate_output(
         context.version_header.clone(),
     ]);
     forbidden.extend(context.generated_headers.iter().cloned());
+    for source_root in [
+        "src",
+        "build_support",
+        "cmake",
+        "docs",
+        "eng",
+        "tests",
+        ".github",
+    ] {
+        for crate_root in [&claimed_crate_root, &actual_crate_root] {
+            let path = crate_root.join(source_root);
+            if path.exists() {
+                forbidden.push(path);
+            }
+        }
+    }
     for root in forbidden {
         let canonical = root.canonicalize().map_err(|_| {
             error("a protected source, SDK, header, or Cargo registry path is unavailable")
