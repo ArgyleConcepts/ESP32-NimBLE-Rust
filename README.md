@@ -1,1 +1,1 @@
-# ESP32-Nimble-Rust
+# ESP32-NimBLE-Rust
