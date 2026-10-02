@@ -54,6 +54,28 @@ fn host_clang() -> PathBuf {
     PathBuf::from(path)
 }
 
+fn macos_sdk_root() -> PathBuf {
+    let output = Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-path"])
+        .output()
+        .unwrap_or_else(|error| {
+            panic!("could not run `xcrun --sdk macosx --show-sdk-path`: {error}")
+        });
+    assert!(
+        output.status.success(),
+        "`xcrun --sdk macosx --show-sdk-path` failed:\n{}",
+        output_message(&output)
+    );
+    let path = String::from_utf8(output.stdout)
+        .expect("`xcrun --sdk macosx --show-sdk-path` should return UTF-8 output");
+    let path = path.trim();
+    assert!(
+        !path.is_empty(),
+        "`xcrun --sdk macosx --show-sdk-path` returned an empty path"
+    );
+    PathBuf::from(path)
+}
+
 fn assert_command_success(command: &mut Command, description: &str) {
     let output = command
         .output()
@@ -122,12 +144,15 @@ fn private_c_shim_behaves_with_sdk_free_controlled_stubs() {
         .expect("copy controlled SDK stubs into isolated fixture");
 
     let clang = host_clang();
+    let sdk_root = macos_sdk_root();
     let mut compile = Command::new(clang);
     compile
         .arg("-std=c11")
         .arg("-Wall")
         .arg("-Wextra")
         .arg("-Werror")
+        .arg("-isysroot")
+        .arg(&sdk_root)
         .arg("-I")
         .arg(&scratch.0)
         .arg("-I")

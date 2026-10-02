@@ -413,7 +413,7 @@ pub(crate) fn compiler_arguments(
                 arguments.push(resolved.display().to_string());
                 index += 2;
             } else if arg.starts_with(option) && arg.len() > option.len() {
-                if &arg[option.len()..] != include.path.to_string_lossy() {
+                if arg[option.len()..] != include.path.to_string_lossy() {
                     return Err(error(
                         "validated include metadata no longer matches compiler argv",
                     ));
