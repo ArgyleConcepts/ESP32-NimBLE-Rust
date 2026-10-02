@@ -265,7 +265,7 @@ fn unchanged_staged_generation_publishes_the_same_private_identity() {
     let output = publish();
     let first_output = fs::read(&output).unwrap();
     let first_manifest = fs::read(fixture.out_dir.join(lifecycle::MANIFEST_FILE)).unwrap();
-    assert!(output.starts_with(&fixture.out_dir.canonicalize().unwrap()));
+    assert!(output.starts_with(fixture.out_dir.canonicalize().unwrap()));
     assert_eq!(output.file_name().unwrap(), lifecycle::GENERATED_FILE);
     lifecycle::verify_published_output(&output, &fixture.out_dir).unwrap();
 
