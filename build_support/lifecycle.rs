@@ -216,7 +216,7 @@ pub(crate) fn verify_published_output(output: &Path, out_dir: &Path) -> Result<(
     let canonical = output
         .canonicalize()
         .map_err(|_| "generated bindings are unavailable after publication".to_owned())?;
-    if !canonical.starts_with(out_dir) || !canonical.is_file() {
+    if !canonical.starts_with(&out_dir) || !canonical.is_file() {
         return Err("generated bindings escaped Cargo OUT_DIR".to_owned());
     }
     let manifest_path = out_dir.join(MANIFEST_FILE);
