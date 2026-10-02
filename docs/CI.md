@@ -8,22 +8,22 @@ Every build/test job selects the self-hosted `macOS` pool (pool ID 15, project
 queue ID 14) and demands a Darwin agent. There is no publishing job.
 
 The GitHub check name is **`argyle-nimble PR Validation`**, supplied by the
-Azure Pipelines GitHub App, app ID **9426**. Branch protections should require
-this exact name and App after the repository-policy setup. The initial successful
+Azure Pipelines GitHub App, app ID **9426**. Branch protections require
+this exact name and App on `develop` and `master`. The initial successful
 validation is [run 7585](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build/results?buildId=7585).
 
-PRs targeting `develop` and `master` are covered; `main` is temporarily included
-during bootstrap. Azure's server-side PR trigger configuration is authoritative:
-its branch filters cover these three branches and fork execution is disabled.
-The YAML mirrors the intended filters for readability. Update both configurations
-when removing the bootstrap `main` branch. There is no push trigger.
+PRs targeting `develop` and `master` are covered. Azure's server-side PR trigger
+configuration is authoritative: its branch filters cover these two branches and
+fork execution is disabled. The YAML mirrors these filters for readability.
+Update both configurations when changing target branches. There is no push trigger;
+the read-only bootstrap `main` is no longer a PR target.
 The YAML `pr` block (including auto-cancellation) is ignored while the server
 override is enabled; review the saved trigger settings when changing PR behavior.
 
-While this setup PR is pending, the pipeline's manual-run default source branch
-is `azure-validation`, where the YAML exists. After merging it, update the Azure
-default source to `main`; the later branch-policy setup must update it to
-`develop`. This does not change the PR target filters.
+The pipeline's manual-run default source branch is `develop`. Both protected
+bases contain the ownership file and the Azure YAML from the merged bootstrap.
+Promote subsequent policy/tooling changes from `develop` to `master` through a
+reviewed PR to keep both branches current. This does not publish packages.
 
 ## Tools and checks
 
