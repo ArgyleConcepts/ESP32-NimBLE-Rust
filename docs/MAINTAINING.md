@@ -80,6 +80,23 @@ metadata/package contents, and verifies license inclusion and relative docs link
 There are no behavior tests yet; zero tests do not establish BLE correctness or
 target compatibility. Follow the CI guide when extending or rerunning checks.
 
+The initial repository-policy check on 2026-10-02 used
+[PR #4 to develop](https://github.com/ArgyleConcepts/ESP32-NimBLE-Rust/pull/4) and
+[probe PR #5 to master](https://github.com/ArgyleConcepts/ESP32-NimBLE-Rust/pull/5),
+both at commit `29e8841`. GitHub reported both blocked while validation was absent,
+despite David's review exception. Azure
+[run 7600](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build/results?buildId=7600)
+validated `develop` and
+[run 7601](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build/results?buildId=7601)
+validated `master`, on `macOS`. Both passed, and GitHub then reported the owner-authored
+PRs mergeable without self-approval. Later commits require their own successful check.
+The master probe is not a release promotion and will be closed without merging.
+
+Protection/ruleset, administrator, Actions, security, and Azure settings were read
+back; CODEOWNERS had no reported errors on either base. Force-push/deletion policy
+was inspected without attempting destructive operations. The non-owner review
+requirement was verified through configuration, not by impersonating a contributor.
+
 Each later implementation includes its own tests. The final Phase 1 matrix
 integrates compile-pass/fail, unit/property, lifecycle, concurrency,
 fault-injection, FFI, and C3/S3 compile/link checks. Require 90% line coverage of

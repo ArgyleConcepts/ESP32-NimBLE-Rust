@@ -9,8 +9,8 @@ Do not disclose a vulnerability in a public issue or pull request.
 Private reporting is enabled. If the
 link is unavailable, contact [David](https://github.com/david-cyman-argyle)
 through a private contact option on his profile to arrange a private channel.
-Do not send vulnerability details until that channel is established. Enabling
-and periodically checking GitHub private reporting is part of repository maintenance.
+Do not send vulnerability details until that channel is established. Periodically
+checking GitHub private reporting is part of repository maintenance.
 
 Include the affected version or commit, target/ESP-IDF configuration when
 relevant, a minimal reproduction, impact, and any suggested fix. Remove real
