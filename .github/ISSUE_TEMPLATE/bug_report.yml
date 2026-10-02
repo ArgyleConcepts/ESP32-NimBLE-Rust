@@ -1,0 +1,32 @@
+name: Bug report
+description: Report a reproducible problem
+body:
+  - type: markdown
+    attributes:
+      value: "For vulnerabilities, follow [SECURITY.md](https://github.com/ArgyleConcepts/ESP32-Nimble-Rust/blob/HEAD/SECURITY.md). Remove secrets, personal data, and proprietary firmware from examples."
+  - type: textarea
+    id: problem
+    attributes:
+      label: Expected and actual behavior
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include a small generic Rust example or public reproduction repository and the steps that produced the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include crate version or commit, host OS, Rust/ESP-IDF versions, target chip, and relevant non-sensitive sdkconfig options. Mark inapplicable items accordingly.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Validation evidence
+      description: Link an existing Azure run or sanitized output if available. Distinguish build evidence from hardware observations; contributors do not need Azure credentials.

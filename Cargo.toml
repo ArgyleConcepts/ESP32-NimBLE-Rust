@@ -1,0 +1,22 @@
+[package]
+name = "argyle-nimble"
+version = "0.1.0-dev.0"
+edition = "2021"
+description = "A Rust framework for ESP-IDF NimBLE; currently an initial crate skeleton"
+license = "MIT"
+repository = "https://github.com/ArgyleConcepts/ESP32-Nimble-Rust"
+readme = "README.md"
+keywords = ["ble", "bluetooth", "esp32", "esp-idf", "nimble"]
+categories = ["embedded", "hardware-support"]
+# Publication requires a separate maintainer decision after package verification.
+publish = false
+include = [
+    "/Cargo.toml",
+    "/src/**",
+    "/README.md",
+    "/LICENSE",
+    "/CONTRIBUTING.md",
+    "/SECURITY.md",
+    "/CODE_OF_CONDUCT.md",
+    "/docs/**",
+]
