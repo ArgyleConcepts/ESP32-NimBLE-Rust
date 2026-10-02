@@ -10,10 +10,12 @@ skeleton compiles and runs its empty host test harness without ESP-IDF through
 [Azure validation](docs/CI.md). There are no behavior tests yet. `publish = false`
 prevents accidental Cargo publication during development.
 
-Repository setup is also in progress: the default branch is currently `main`.
-The intended `develop`/`master` workflow, branch protections, and GitHub private
-vulnerability reporting still require configuration. These
-documents specify policy; they do not establish remote settings.
+`develop` is the default contribution branch; `master` is for release preparation.
+Both require PRs and Azure validation with an up-to-date branch, resolved review
+conversations, and code-owner review subject to David's review exception.
+Administrators remain subject to protection. The bootstrap `main` branch is
+retained read-only. See the [maintainer guide](docs/MAINTAINING.md) for policy
+and verified repository settings.
 
 ## Planned Phase 1
 
@@ -60,7 +62,7 @@ milestones.
 Public contributors need no private Jira, Confluence, or Azure account. Use
 [GitHub issues](https://github.com/ArgyleConcepts/ESP32-Nimble-Rust/issues) for
 bugs, questions, and features. Follow [SECURITY.md](SECURITY.md) for private
-reporting, including its temporary setup limitation, and the
+reporting, and the
 [Code of Conduct](CODE_OF_CONDUCT.md) in all project spaces.
 
 All project builds/tests run through Azure's self-hosted `macOS` pool. The

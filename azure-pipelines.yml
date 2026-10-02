@@ -3,11 +3,10 @@ name: validation-$(Date:yyyyMMdd)$(Rev:.r)
 trigger: none
 pr:
   # Mirrored only: Azure's server-side trigger override is authoritative.
-  # Update both configurations when removing bootstrap main (docs/CI.md).
+  # Update both configurations when changing target branches (docs/CI.md).
   autoCancel: true
   branches:
     include:
-      - main
       - develop
       - master
 

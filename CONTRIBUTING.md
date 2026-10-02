@@ -29,14 +29,13 @@ to the tool or maintainers.
 
 ## Branches and implementation
 
-The intended contribution branch and PR target is `develop`; `master` is for
+The default contribution branch and PR target is `develop`; `master` is for
 maintainer-managed release preparation. Use a fork and a concise branch name
 describing the work, without `codex/` or other agent-specific prefixes. Keep PRs
 focused and do not push directly to the long-lived branches.
 
-During bootstrap the repository still uses `main`; the planned branches and
-protections have not been configured. Coordinate the base branch with a
-maintainer until setup is complete.
+Both branches are protected, including for administrators. The former default
+`main` remains read-only as a bootstrap reference; do not target contributions there.
 
 Start with the single library crate. Introduce public APIs with implementation
 and tests, without placeholder APIs. Keep unsafe code and generated bindings
@@ -65,7 +64,7 @@ PRs should explain the problem and resulting behavior, link public issues,
 identify breaking changes, and include Azure run links when available. Update
 docs/examples for API changes. Draft PRs are welcome.
 
-Once protections are configured, merging requires an up-to-date branch,
+Merging requires an up-to-date branch,
 the `argyle-nimble PR Validation` Azure check, resolved review conversations, and
 designated code-owner approval, subject to the documented review-only exception.
 [CODEOWNERS](https://github.com/ArgyleConcepts/ESP32-Nimble-Rust/blob/HEAD/.github/CODEOWNERS)
