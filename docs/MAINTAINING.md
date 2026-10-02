@@ -2,10 +2,11 @@
 
 ## Setup status
 
-The repository uses `main`. The `develop`/`master` branches, remote protections,
-and private vulnerability reporting are pending setup. This
-guide specifies intended policy, adapted from FSharp.MinimalApi. Update this
-notice and README, CONTRIBUTING, and SECURITY as each setting is verified.
+`develop` is the default contribution branch; `master` is for release preparation.
+Both were created from the merged bootstrap history and have the protections below.
+`main` is retained as a read-only bootstrap reference, with administrator enforcement
+and force-push/deletion protection. Repository settings were read back during setup;
+this guide records policy adapted from FSharp.MinimalApi.
 
 The crate skeleton's host compilation and empty test harness have passed through
 Azure; see [CI.md](CI.md) for evidence. It has no BLE behavior tests yet.
@@ -14,19 +15,26 @@ an intentional guard.
 
 ## Branches, ownership, and access
 
-- Make `develop` the default branch and contribution PR target. Retain `master`
+- `develop` is the default branch and contribution PR target. Retain `master`
   for release preparation through promotion PRs; merging does not publish.
-- Require PRs, code-owner review, resolved conversations, up-to-date branches,
-  and successful mandatory Azure validation on both branches. Dismiss stale
-  approvals, disallow force pushes/deletion, and enforce rules for administrators.
+- Both branches require PRs, code-owner review, resolved conversations, up-to-date
+  branches, and successful mandatory Azure validation. Stale approvals are dismissed,
+  force pushes/deletion are disallowed, and protections apply to administrators.
 - [CODEOWNERS](https://github.com/ArgyleConcepts/ESP32-Nimble-Rust/blob/HEAD/.github/CODEOWNERS)
   assigns all files, including ownership policy, to `@david-cyman-argyle`.
   Require code-owner approval with no additional numeric reviewer quota. GitHub
   reads ownership from the PR base branch, so include the file in both branches.
-- Give David an explicit review-only bypass for his own PRs. Required CI,
+- David has an explicit review bypass for his own PRs. Required CI,
   branch freshness, conversation resolution, and force-push/deletion restrictions
   still apply. Do not use blanket admin exemptions or bypass all branch rules.
-- Preserve existing administrators. Public contributors use forks and need no
+- The additional [mandatory-PR ruleset](https://github.com/ArgyleConcepts/ESP32-NimBLE-Rust/rules/24377498)
+  has no bypass actors and applies to both branches. It requires a PR even for
+  David, while classic branch protection supplies code ownership and his review
+  exception. Its zero approval quota does not replace the classic code-owner rule.
+  GitHub's user allowance is not limited by PR author; repository policy limits
+  use of David's exception to his own PRs. Other contributions receive his review.
+- Existing administrators `david-cyman-argyle`, `ted-cyman-argyle`, and `jdoyle1331`
+  retain their access. Public contributors use forks and need no
   write access; periodically review access and grant only the role needed.
 
 Keep merge commits available for long-lived branch promotion. Do not delete
@@ -38,8 +46,8 @@ is merged and no open PR depends on them.
 All builds/tests use Azure DevOps's self-hosted `macOS` pool through
 [pipeline 35, argyle-nimble PR Validation](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build?definitionId=35).
 The verified GitHub check is `argyle-nimble PR Validation`, emitted by the
-Azure Pipelines GitHub App (app ID `9426`). The upcoming protection setup should
-require that exact name/App pair on `develop` and `master`; see [CI.md](CI.md)
+Azure Pipelines GitHub App (app ID `9426`). Both branches require that exact
+name/App pair; see [CI.md](CI.md)
 for tooling, diagnostics, and server-side trigger configuration.
 
 Disable direct fork builds through Azure controls outside contributor-editable
@@ -81,10 +89,15 @@ also requires compiling a fresh external consumer through Azure.
 
 ## Security and releases
 
-Enable and verify GitHub private vulnerability reporting, dependency alerts and
-security updates, secret scanning, and push protection as supported for this
-repository. Update [SECURITY.md](../SECURITY.md) once private reporting works.
-Dependency update PRs target `develop` and use the normal review/validation rules.
+Private vulnerability reporting, dependency alerts/security updates, secret
+scanning, and push protection are enabled and were read back during setup.
+Periodically verify these settings and follow [SECURITY.md](../SECURITY.md) for
+private reports. Weekly Cargo version-update PRs target `develop`, with at most
+three open version-update PRs. Dependency update PRs require normal review and
+Azure validation; no auto-merge or publishing workflow is configured.
+Dependabot's same-repository branches can trigger Azure validation, so they
+receive the same trust as other repository branches. Review executable dependencies
+and build scripts; fork restrictions are not a sandbox for dependency updates.
 GitHub Actions must retain read-only default token permissions and cannot approve
 PRs; do not add an Actions build/test workflow.
 
