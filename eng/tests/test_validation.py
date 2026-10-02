@@ -49,10 +49,12 @@ class ValidationTests(unittest.TestCase):
     def test_complete_package_listing(self):
         validation.check_package_listing("\n".join([
             "Cargo.toml", "LICENSE", "README.md", "src/lib.rs", "CONTRIBUTING.md",
-            "build_support/context.rs", "cmake/ArgyleNimbleBuildContext.cmake",
+            "build_support/context.rs", "build_support/bindings.rs",
+            "src/backend/nimble_shim.h", "src/backend/nimble_shim.c",
+            "cmake/ArgyleNimbleBuildContext.cmake",
             "cmake/capture_compiler.py", "cmake/export_build_context.py",
             "SECURITY.md", "CODE_OF_CONDUCT.md", "docs/MAINTAINING.md",
-            "docs/BUILD_CONTEXT.md",
+            "docs/BUILD_CONTEXT.md", "docs/BINDING_GENERATION.md",
         ]))
 
     def test_failed_command_retains_status_and_diagnostics(self):

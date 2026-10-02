@@ -50,8 +50,11 @@ Markdown links. Checks continue after a command failure so diagnostics from
 other commands are available, and any failed command fails validation.
 
 The Rust integration tests validate the private context contract and mode
-selection with SDK-free filesystem fixtures. They do not parse real SDK headers,
-establish a target ABI, compile firmware, or test BLE behavior. The Python tests
+selection with SDK-free filesystem fixtures, exercise private binding
+generation with generic host C fixtures, and compile the copied private C shim
+against controlled stubs to test its wrappers. They do not parse real
+ESP-IDF/NimBLE headers, establish a target ABI, compile firmware, or test BLE
+stack interoperability. The Python tests
 exercise context export/capture token handling as well as CI failure propagation,
 missing executables, diagnostic retention, report encoding, unexpected
 exceptions/interrupts, inherited configuration, exact-case tracked-file links,

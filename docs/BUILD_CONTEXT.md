@@ -81,9 +81,10 @@ product profiles.
 
 The captured argv belongs to the one-source C probe, so it also contains
 compile-action operands such as `-c`, the probe source, and any output path.
-The later binding-generation step must remove those probe-action operands before
-building its libclang argument list while retaining target, ABI, include, and
-define options.
+The private binding generator removes those documented probe-action operands
+while retaining ordered target, ABI, include, and define inputs. See
+[private binding generation](BINDING_GENERATION.md) for its toolchain, shim,
+allowlist, output, and evidence contracts.
 
 ## Host and ESP selection
 
