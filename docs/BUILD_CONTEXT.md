@@ -31,13 +31,19 @@ rejects compiler response files because their contents are not an argv array.
 It does not parse `compile_commands.json`, split command strings, inspect a
 global SDK installation, or inspect inherited environment values.
 
-For reliable capture, the exporter rejects nonempty `RULE_LAUNCH_COMPILE`
-settings at global, caller-directory, probe, or consumer-target scope, and a
-custom `C_COMPILER_LAUNCHER` on the consumer target. Disable those launchers for
-context export; the exporter does not replace or reinterpret their behavior.
-It repeats these checks at the end of top-level CMake configuration so launchers
-added by later components or project code also fail before generation. The
-consumer's scalar C compile properties are refreshed in that final check.
+For reliable capture, call the exporter from the consumer target's defining
+CMake source and binary directory. It rejects nonempty `RULE_LAUNCH_COMPILE`
+settings at global scope, on the consumer/probe targets, and in every parent
+directory scope of those targets. This includes ESP-IDF's ccache setting; disable
+ccache or other compile launchers for context export. The exporter does not
+replace or reinterpret launcher behavior. It repeats the checks after the
+top-level `CMakeLists.txt` finishes, so launcher properties added later by
+components or ordinary project code also fail before generation. Deferred CMake
+callbacks queued after the exporter check are outside this guard. The consumer's
+scalar C compile properties, including generic and active-configuration IPO
+settings, are refreshed in the final check. A project that adds the same source
+directory under multiple binary directories is unsupported because CMake's
+parent-directory property identifies the parent by source path.
 
 The emitted contract preserves these values:
 

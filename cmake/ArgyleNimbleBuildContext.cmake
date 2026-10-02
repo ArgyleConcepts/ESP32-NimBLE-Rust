@@ -1,6 +1,6 @@
 include_guard(GLOBAL)
 
-function(_argyle_nimble_reject_compile_launchers consumer probe caller_directory root_directory)
+function(_argyle_nimble_reject_compile_launchers consumer probe)
     set(_argyle_has_custom_compile_launcher FALSE)
 
     get_property(_argyle_global_rule_launch_set GLOBAL PROPERTY RULE_LAUNCH_COMPILE SET)
@@ -11,31 +11,38 @@ function(_argyle_nimble_reject_compile_launchers consumer probe caller_directory
         endif()
     endif()
 
-    get_target_property(_argyle_consumer_source_dir "${consumer}" SOURCE_DIR)
-    set(_argyle_source_directories
-        "${caller_directory}" "${root_directory}" "${_argyle_consumer_source_dir}")
-    if(probe)
-        get_target_property(_argyle_probe_source_dir "${probe}" SOURCE_DIR)
-        list(APPEND _argyle_source_directories "${_argyle_probe_source_dir}")
-    endif()
-    list(REMOVE_DUPLICATES _argyle_source_directories)
-    foreach(_argyle_source_directory IN LISTS _argyle_source_directories)
-        get_property(_argyle_directory_rule_launch_set DIRECTORY "${_argyle_source_directory}"
-            PROPERTY RULE_LAUNCH_COMPILE SET)
-        if(_argyle_directory_rule_launch_set)
-            get_property(_argyle_directory_rule_launch DIRECTORY "${_argyle_source_directory}"
-                PROPERTY RULE_LAUNCH_COMPILE)
-            if(NOT "${_argyle_directory_rule_launch}" STREQUAL "")
-                set(_argyle_has_custom_compile_launcher TRUE)
-            endif()
-        endif()
-    endforeach()
-
     set(_argyle_targets "${consumer}")
     if(probe)
         list(APPEND _argyle_targets "${probe}")
     endif()
     foreach(_argyle_target IN LISTS _argyle_targets)
+        get_target_property(_argyle_target_binary_dir "${_argyle_target}" BINARY_DIR)
+        set(_argyle_directory "${_argyle_target_binary_dir}")
+        while(_argyle_directory)
+            get_property(_argyle_directory_rule_launch_set DIRECTORY "${_argyle_directory}"
+                PROPERTY RULE_LAUNCH_COMPILE SET)
+            if(_argyle_directory_rule_launch_set)
+                get_property(_argyle_directory_rule_launch DIRECTORY "${_argyle_directory}"
+                    PROPERTY RULE_LAUNCH_COMPILE)
+                if(NOT "${_argyle_directory_rule_launch}" STREQUAL "")
+                    set(_argyle_has_custom_compile_launcher TRUE)
+                endif()
+            endif()
+            get_property(_argyle_parent_source_dir DIRECTORY "${_argyle_directory}"
+                PROPERTY PARENT_DIRECTORY)
+            if(_argyle_parent_source_dir)
+                get_property(_argyle_parent_binary_dir DIRECTORY "${_argyle_parent_source_dir}"
+                    PROPERTY BINARY_DIR)
+                if(NOT _argyle_parent_binary_dir)
+                    message(FATAL_ERROR
+                        "Could not identify the parent CMake binary directory while checking compile launchers")
+                endif()
+                set(_argyle_directory "${_argyle_parent_binary_dir}")
+            else()
+                set(_argyle_directory "")
+            endif()
+        endwhile()
+
         get_property(_argyle_target_rule_launch_set TARGET "${_argyle_target}"
             PROPERTY RULE_LAUNCH_COMPILE SET)
         if(_argyle_target_rule_launch_set)
@@ -59,14 +66,17 @@ function(_argyle_nimble_reject_compile_launchers consumer probe caller_directory
 
     if(_argyle_has_custom_compile_launcher)
         message(FATAL_ERROR
-            "Build-context export cannot preserve custom CMake compile launchers; disable RULE_LAUNCH_COMPILE at global, directory, and target scope and clear the consumer target's C_COMPILER_LAUNCHER")
+            "Build-context export cannot preserve custom CMake compile launchers (including ccache); disable RULE_LAUNCH_COMPILE at global, every target-directory ancestor, and target scope, and clear the consumer target's C_COMPILER_LAUNCHER")
     endif()
 endfunction()
 
 function(_argyle_nimble_copy_scalar_compile_properties consumer probe)
     get_target_property(_argyle_consumer_type "${consumer}" TYPE)
+    get_target_property(_argyle_consumer_binary_dir "${consumer}" BINARY_DIR)
+    get_directory_property(_argyle_consumer_build_type DIRECTORY "${_argyle_consumer_binary_dir}"
+        DEFINITION CMAKE_BUILD_TYPE)
     foreach(_argyle_property IN ITEMS C_STANDARD C_STANDARD_REQUIRED C_EXTENSIONS
-        POSITION_INDEPENDENT_CODE C_VISIBILITY_PRESET)
+        POSITION_INDEPENDENT_CODE C_VISIBILITY_PRESET INTERPROCEDURAL_OPTIMIZATION)
         get_property(_argyle_property_set TARGET "${consumer}" PROPERTY "${_argyle_property}" SET)
         if(_argyle_property_set)
             get_target_property(_argyle_value "${consumer}" "${_argyle_property}")
@@ -79,23 +89,38 @@ function(_argyle_nimble_copy_scalar_compile_properties consumer probe)
             set_property(TARGET "${probe}" PROPERTY "${_argyle_property}")
         endif()
     endforeach()
+
+    # IPO has a configuration-specific override. The contract rejects
+    # multi-config generators, so copy the selected single-config override
+    # when one exists as well as the generic property above.
+    if(_argyle_consumer_build_type)
+        string(TOUPPER "${_argyle_consumer_build_type}" _argyle_build_type_upper)
+        set(_argyle_ipo_config_property
+            "INTERPROCEDURAL_OPTIMIZATION_${_argyle_build_type_upper}")
+        get_property(_argyle_ipo_config_set TARGET "${consumer}"
+            PROPERTY "${_argyle_ipo_config_property}" SET)
+        if(_argyle_ipo_config_set)
+            get_target_property(_argyle_ipo_config_value "${consumer}"
+                "${_argyle_ipo_config_property}")
+            set_property(TARGET "${probe}" PROPERTY "${_argyle_ipo_config_property}"
+                "${_argyle_ipo_config_value}")
+        else()
+            set_property(TARGET "${probe}" PROPERTY "${_argyle_ipo_config_property}")
+        endif()
+    endif()
 endfunction()
 
 function(_argyle_nimble_finalize_build_context_export)
     get_property(_argyle_consumer_target GLOBAL PROPERTY ARGYLE_NIMBLE_CONTEXT_CONSUMER_TARGET)
     get_property(_argyle_probe_target GLOBAL PROPERTY ARGYLE_NIMBLE_CONTEXT_PROBE_TARGET)
-    get_property(_argyle_caller_directory GLOBAL PROPERTY ARGYLE_NIMBLE_CONTEXT_CALLER_DIRECTORY)
-    get_property(_argyle_root_directory GLOBAL PROPERTY ARGYLE_NIMBLE_CONTEXT_ROOT_DIRECTORY)
     get_property(_argyle_expected_probe_launcher GLOBAL PROPERTY ARGYLE_NIMBLE_CONTEXT_PROBE_LAUNCHER)
 
-    if(NOT _argyle_consumer_target OR NOT _argyle_probe_target
-        OR NOT _argyle_caller_directory OR NOT _argyle_root_directory)
+    if(NOT _argyle_consumer_target OR NOT _argyle_probe_target)
         message(FATAL_ERROR
             "Deferred build-context validation has incomplete target state; re-run the configured ESP-IDF CMake project")
     endif()
     _argyle_nimble_reject_compile_launchers(
-        "${_argyle_consumer_target}" "${_argyle_probe_target}"
-        "${_argyle_caller_directory}" "${_argyle_root_directory}")
+        "${_argyle_consumer_target}" "${_argyle_probe_target}")
 
     get_property(_argyle_probe_launcher_set TARGET "${_argyle_probe_target}"
         PROPERTY C_COMPILER_LAUNCHER SET)
@@ -122,6 +147,13 @@ function(argyle_nimble_export_build_context)
     if(NOT ARG_CONSUMER_TARGET OR NOT TARGET "${ARG_CONSUMER_TARGET}")
         message(FATAL_ERROR
             "argyle_nimble_export_build_context requires CONSUMER_TARGET to name an existing configured CMake target")
+    endif()
+    get_target_property(_argyle_consumer_source_dir "${ARG_CONSUMER_TARGET}" SOURCE_DIR)
+    get_target_property(_argyle_consumer_binary_dir "${ARG_CONSUMER_TARGET}" BINARY_DIR)
+    if(NOT "${_argyle_consumer_source_dir}" STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}"
+        OR NOT "${_argyle_consumer_binary_dir}" STREQUAL "${CMAKE_CURRENT_BINARY_DIR}")
+        message(FATAL_ERROR
+            "argyle_nimble_export_build_context must be called from the consumer target's defining CMake source and binary directory so directory-scoped compiler flags match")
     endif()
     if(NOT ESP_PLATFORM OR NOT COMMAND idf_build_get_property)
         message(FATAL_ERROR
@@ -162,7 +194,7 @@ function(argyle_nimble_export_build_context)
     # A compile launcher may rewrite or skip the probe invocation. Preserve
     # the consumer's selected compiler argv by requiring an unwrapped probe.
     _argyle_nimble_reject_compile_launchers(
-        "${ARG_CONSUMER_TARGET}" "" "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}")
+        "${ARG_CONSUMER_TARGET}" "")
 
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     find_package(Git REQUIRED)
@@ -239,8 +271,7 @@ function(argyle_nimble_export_build_context)
     add_library("${_argyle_probe_target}" OBJECT "${_argyle_probe_source}")
     set_target_properties("${_argyle_probe_target}" PROPERTIES EXCLUDE_FROM_ALL TRUE)
     _argyle_nimble_reject_compile_launchers(
-        "${ARG_CONSUMER_TARGET}" "${_argyle_probe_target}"
-        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}")
+        "${ARG_CONSUMER_TARGET}" "${_argyle_probe_target}")
 
     # Copy the consumer's private compile properties. CMake's corresponding
     # TARGET_PROPERTY expressions include transitive usage requirements. Do
@@ -297,14 +328,12 @@ function(argyle_nimble_export_build_context)
         COMMENT "Exporting configured ESP-IDF C build context")
     add_dependencies("${_argyle_export_target}" "${_argyle_probe_target}")
 
-    # Store literal target/path identities because deferred calls run after
-    # this function's local variables have gone out of scope. The callback is
+    # Store the target identity because deferred calls run after this
+    # function's local variables have gone out of scope. The callback is
     # scheduled in the source root so it sees properties set by later
     # components and top-level CMake code.
     set_property(GLOBAL PROPERTY ARGYLE_NIMBLE_CONTEXT_CONSUMER_TARGET "${ARG_CONSUMER_TARGET}")
     set_property(GLOBAL PROPERTY ARGYLE_NIMBLE_CONTEXT_PROBE_TARGET "${_argyle_probe_target}")
-    set_property(GLOBAL PROPERTY ARGYLE_NIMBLE_CONTEXT_CALLER_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
-    set_property(GLOBAL PROPERTY ARGYLE_NIMBLE_CONTEXT_ROOT_DIRECTORY "${CMAKE_SOURCE_DIR}")
     set_property(GLOBAL PROPERTY ARGYLE_NIMBLE_CONTEXT_PROBE_LAUNCHER
         "${Python3_EXECUTABLE};${CMAKE_CURRENT_FUNCTION_LIST_DIR}/capture_compiler.py;${_argyle_capture}")
     cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
