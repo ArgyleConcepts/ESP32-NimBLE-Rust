@@ -58,7 +58,8 @@ exceptions/interrupts, inherited configuration, exact-case tracked-file links,
 and invalid package contracts. Genuine C3/S3 binding generation and target
 configuration checks are later matrix work; no hardware verification is claimed.
 These runs do not configure a real ESP-IDF CMake consumer project; C3/S3 CMake
-exporter fixtures and compile-launcher rejection coverage are pending NIMBLERS-24.
+exporter fixtures, including rejection of launchers set after component
+registration, are pending NIMBLERS-24.
 
 ## Reports, artifacts, and isolation
 

@@ -35,6 +35,9 @@ For reliable capture, the exporter rejects nonempty `RULE_LAUNCH_COMPILE`
 settings at global, caller-directory, probe, or consumer-target scope, and a
 custom `C_COMPILER_LAUNCHER` on the consumer target. Disable those launchers for
 context export; the exporter does not replace or reinterpret their behavior.
+It repeats these checks at the end of top-level CMake configuration so launchers
+added by later components or project code also fail before generation. The
+consumer's scalar C compile properties are refreshed in that final check.
 
 The emitted contract preserves these values:
 
