@@ -5,10 +5,7 @@ pr:
   autoCancel: true
   branches:
     include:
-      # Bootstrap only; remove main after the branch-policy setup.
-      - main
-      - develop
-      - master
+      - "*"
 
 pool:
   name: macOS
