@@ -49,12 +49,14 @@ denied, package identity/publication guard, packaged license/docs, and relative
 Markdown links. Checks continue after a command failure so diagnostics from
 other commands are available, and any failed command fails validation.
 
-The framework still has zero behavior tests. The Python tests exercise CI
-failure propagation, missing executables, diagnostic retention, report encoding,
-unexpected exceptions/interrupts, inherited configuration, exact-case tracked-file
-links, and invalid package contracts. C3/S3 compile/link jobs arrive with
-ESP-IDF integration; the final verification matrix adds the full framework suite
-and coverage enforcement. No hardware verification is claimed.
+The Rust integration tests validate the private context contract and mode
+selection with SDK-free filesystem fixtures. They do not parse real SDK headers,
+establish a target ABI, compile firmware, or test BLE behavior. The Python tests
+exercise context export/capture token handling as well as CI failure propagation,
+missing executables, diagnostic retention, report encoding, unexpected
+exceptions/interrupts, inherited configuration, exact-case tracked-file links,
+and invalid package contracts. Genuine C3/S3 binding generation and target
+configuration checks are later matrix work; no hardware verification is claimed.
 
 ## Reports, artifacts, and isolation
 

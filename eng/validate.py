@@ -27,8 +27,10 @@ def check_metadata(metadata):
 def check_package_listing(listing):
     required = {
         "Cargo.toml", "LICENSE", "README.md", "src/lib.rs",
+        "build_support/context.rs", "cmake/ArgyleNimbleBuildContext.cmake",
+        "cmake/capture_compiler.py", "cmake/export_build_context.py",
         "CONTRIBUTING.md", "SECURITY.md", "CODE_OF_CONDUCT.md",
-        "docs/MAINTAINING.md",
+        "docs/MAINTAINING.md", "docs/BUILD_CONTEXT.md",
     }
     missing = required - set(listing.splitlines())
     if missing:
@@ -124,7 +126,7 @@ def run_validation(commands, root, reports, contract=None):
     finally:
         write_report(results, reports / "validation.xml")
         (reports / "summary.json").write_text(json.dumps({
-            "scope": "host scaffold and CI tooling; no target or hardware verification",
+            "scope": "host build-context tooling and CI; no target or hardware verification",
             "command_results": results,
         }, indent=2) + "\n")
     return int(any(result["status"] for result in results))

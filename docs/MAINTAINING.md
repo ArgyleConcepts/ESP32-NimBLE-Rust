@@ -8,10 +8,11 @@ Both were created from the merged bootstrap history and have the protections bel
 and force-push/deletion protection. Repository settings were read back during setup;
 this guide records policy adapted from FSharp.MinimalApi.
 
-The crate skeleton's host compilation and empty test harness have passed through
-Azure; see [CI.md](CI.md) for evidence. It has no BLE behavior tests yet.
-Its version is an unpublished development identifier, and `publish = false` is
-an intentional guard.
+The crate's host compilation and SDK-free build-context contract tests run
+through Azure; see [CI.md](CI.md) for evidence. The contract tests do not verify
+target ABI compatibility, firmware compilation, or BLE behavior. Its version is
+an unpublished development identifier, and `publish = false` is an intentional
+guard.
 
 ## Branches, ownership, and access
 
@@ -75,10 +76,11 @@ accepting external contribution builds.
 
 ## Validation evidence
 
-Azure validation compiles/tests the host skeleton without ESP-IDF, inspects
-metadata/package contents, and verifies license inclusion and relative docs links.
-There are no behavior tests yet; zero tests do not establish BLE correctness or
-target compatibility. Follow the CI guide when extending or rerunning checks.
+Azure validation compiles/tests host-side build-context tooling without requiring
+ESP-IDF, inspects metadata/package contents, and verifies license inclusion and
+relative docs links. The private parser fixtures do not establish BLE behavior,
+target ABI compatibility, or C3/S3 firmware compilation. Follow the CI guide
+when extending or rerunning checks.
 
 The initial repository-policy check on 2026-10-02 used
 [PR #4 to develop](https://github.com/ArgyleConcepts/ESP32-NimBLE-Rust/pull/4) and

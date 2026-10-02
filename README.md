@@ -5,10 +5,15 @@ A public MIT-licensed Rust framework for ESP-IDF's NimBLE stack.
 ## Current status
 
 This is an initial library crate and contribution structure. It has **no public
-BLE API, implemented BLE behavior, or published package**. The dependency-free
-skeleton compiles and runs its empty host test harness without ESP-IDF through
-[Azure validation](docs/CI.md). There are no behavior tests yet. `publish = false`
-prevents accidental Cargo publication during development.
+BLE API, implemented BLE behavior, or published package**. Its private,
+versioned ESP-IDF build-context contract can validate the configured SDK,
+consumer compiler arguments, and Bluetooth/NimBLE configuration for ESP32-C3
+and ESP32-S3. Contract parser tests do not establish target ABI compatibility,
+firmware compilation, or BLE behavior. Ordinary host validation remains
+ESP-IDF-free and runs through [Azure validation](docs/CI.md). `publish = false`
+prevents accidental Cargo publication during development. See the
+[build-context contract](docs/BUILD_CONTEXT.md) for exporter and mode-selection
+details.
 
 `develop` is the default contribution branch; `master` is for release preparation.
 Both require PRs and Azure validation with an up-to-date branch, resolved review
@@ -55,6 +60,8 @@ milestones.
 
 - `Cargo.toml`: package identity and explicit package-file inclusion.
 - `src/lib.rs`: library entry point and crate documentation.
+- `build_support/context.rs` and `cmake/`: private build-context validation and
+  CMake export contract.
 - `src/backend/`: reserved private boundary; no backend exists yet.
 - [CONTRIBUTING.md](CONTRIBUTING.md): contributor workflow and validation policy.
 - [Maintainer guide](docs/MAINTAINING.md): governance and external contributions.
