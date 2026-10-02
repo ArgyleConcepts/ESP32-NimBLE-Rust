@@ -18,6 +18,7 @@ const HOST_CHILD_ENV: &str = "ARGYLE_NIMBLE_BINDGEN_HOST_FIXTURE_CHILD";
 const HOST_HEADER_ENV: &str = "ARGYLE_NIMBLE_BINDGEN_HOST_FIXTURE_HEADER";
 const HOST_OUTPUT_ENV: &str = "ARGYLE_NIMBLE_BINDGEN_HOST_FIXTURE_OUTPUT";
 const HOST_CASE_ENV: &str = "ARGYLE_NIMBLE_BINDGEN_HOST_FIXTURE_CASE";
+const HOST_DEPENDENCIES_ENV: &str = "ARGYLE_NIMBLE_BINDGEN_HOST_FIXTURE_DEPENDENCIES";
 
 struct Fixture {
     root: PathBuf,
@@ -781,16 +782,40 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
         } else {
             &["FIXTURE_MODE"][..]
         };
-        let generated = bindings::generate_source(
-            &header,
-            &["-x".into(), "c".into()],
-            &allowlist,
-            &["fixture_required"],
-            &["fixture_payload_t"],
-            required_variables,
-        );
+        let generated = if case == "nested-transitive-dependencies" {
+            bindings::generate_source_with_dependencies(
+                &header,
+                &["-x".into(), "c".into()],
+                &allowlist,
+                &["fixture_required"],
+                &["fixture_payload_t"],
+                required_variables,
+            )
+            .map(|(source, dependencies)| {
+                let serialized = dependencies
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                fs::write(
+                    PathBuf::from(std::env::var_os(HOST_DEPENDENCIES_ENV).unwrap()),
+                    serialized,
+                )
+                .unwrap();
+                source
+            })
+        } else {
+            bindings::generate_source(
+                &header,
+                &["-x".into(), "c".into()],
+                &allowlist,
+                &["fixture_required"],
+                &["fixture_payload_t"],
+                required_variables,
+            )
+        };
         match case.as_str() {
-            "valid" | "named-enum-alias" => {
+            "valid" | "named-enum-alias" | "nested-transitive-dependencies" => {
                 let generated = generated.unwrap();
                 assert!(!generated.contains("fixture_private"));
                 if case == "named-enum-alias" {
@@ -851,6 +876,10 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
             "#include \"missing transitive dependency.h\"\ntypedef struct { unsigned short count; } fixture_payload_t;\nint fixture_required(fixture_payload_t *value);\nenum { FIXTURE_MODE = 7 };\n",
         ),
         (
+            "nested-transitive-dependencies",
+            "#include \"first dependency.h\"\nint fixture_required(fixture_payload_t *value);\nenum { FIXTURE_MODE = 7 };\n",
+        ),
+        (
             "missing-required-function",
             "typedef struct { unsigned short count; } fixture_payload_t;\nenum { FIXTURE_MODE = 7 };\n",
         ),
@@ -864,7 +893,21 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
         fs::create_dir_all(&case_directory).unwrap();
         let header = case_directory.join("generic fixture.h");
         let output = case_directory.join("generated bindings.rs");
+        let dependency_output = case_directory.join("resolved dependencies.txt");
         fs::write(&header, contents).unwrap();
+        if case == "nested-transitive-dependencies" {
+            fs::create_dir_all(case_directory.join("nested headers")).unwrap();
+            fs::write(
+                case_directory.join("first dependency.h"),
+                "#include \"nested headers/second dependency.h\"\n",
+            )
+            .unwrap();
+            fs::write(
+                case_directory.join("nested headers/second dependency.h"),
+                "typedef struct { unsigned short count; } fixture_payload_t;\n",
+            )
+            .unwrap();
+        }
         let mut command = Command::new(&executable);
         command
             .args([
@@ -875,6 +918,7 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
             .env(HOST_CASE_ENV, case)
             .env(HOST_HEADER_ENV, &header)
             .env(HOST_OUTPUT_ENV, &output)
+            .env(HOST_DEPENDENCIES_ENV, &dependency_output)
             .env("LIBCLANG_PATH", &libclang)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -896,7 +940,8 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
             "isolated generic host bindgen fixture `{case}` failed: {}",
             String::from_utf8_lossy(&result.stderr)
         );
-        if case != "valid" && case != "named-enum-alias" {
+        if case != "valid" && case != "named-enum-alias" && case != "nested-transitive-dependencies"
+        {
             assert!(!output.exists(), "failed `{case}` fixture published output");
             continue;
         }
@@ -909,6 +954,24 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
             assert!(generated.contains("FIXTURE_ERROR_ALIAS"));
             assert!(!generated.contains("FIXTURE_REM_USER_CONN_TERM"));
             assert!(!generated.contains("FIXTURE_UNRELATED_ERROR"));
+        }
+        if case == "nested-transitive-dependencies" {
+            let dependencies = fs::read_to_string(&dependency_output).unwrap();
+            let dependencies = dependencies
+                .lines()
+                .map(|path| PathBuf::from(path).canonicalize().unwrap())
+                .collect::<std::collections::BTreeSet<_>>();
+            for path in [
+                &header,
+                &case_directory.join("first dependency.h"),
+                &case_directory.join("nested headers/second dependency.h"),
+            ] {
+                assert!(
+                    dependencies.contains(&path.canonicalize().unwrap()),
+                    "bindgen omitted parsed header dependency {}",
+                    path.display()
+                );
+            }
         }
     }
     let _ = fs::remove_dir_all(root);

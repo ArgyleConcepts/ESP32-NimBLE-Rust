@@ -3,6 +3,7 @@
 #[path = "../build_support/lifecycle.rs"]
 mod lifecycle;
 
+use serde_json::json;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -251,6 +252,75 @@ fn fresh_native_path_consumer_builds_and_documents_without_esp_selectors() {
             .is_file(),
         "relative Cargo-configured target-dir did not receive dependency docs"
     );
+}
+
+#[test]
+fn missing_esp_clang_selector_clears_stale_cargo_outputs_after_context_validation() {
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest = format!(
+        "[package]\nname = \"nimble-stale-output-consumer\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\nargyle-nimble = {{ path = {} }}\n",
+        toml_string(&repository_root)
+    );
+    let project = TempCargoProject::new("stale-output-consumer", &manifest);
+    project.write(
+        "src/lib.rs",
+        "//! Native consumer used to exercise the dependency build script.\npub use argyle_nimble as nimble;\n",
+    );
+
+    let native_build = project.run_cargo("build");
+    assert_success(
+        "native path-consumer build before ESP-mode failure",
+        &native_build,
+    );
+    let dependency_out_dir = find_build_out_dir(&project.target, "argyle-nimble");
+    let stale_bindings = dependency_out_dir.join(lifecycle::GENERATED_FILE);
+    let stale_manifest = dependency_out_dir.join(lifecycle::MANIFEST_FILE);
+    fs::write(
+        &stale_bindings,
+        "// stale ESP bindings from a previous build\n",
+    )
+    .expect("could not seed stale generated bindings");
+    fs::write(&stale_manifest, "{\"stale\":true}\n")
+        .expect("could not seed stale binding manifest");
+
+    let context_path = write_sdk_free_esp_context_fixture(&project);
+    let mut command = project.cargo_command("build");
+    command
+        .arg("--verbose")
+        .env_remove("ARGYLE_NIMBLE_ESP_CLANG")
+        .env_remove("LIBCLANG_PATH")
+        .env("ARGYLE_NIMBLE_BUILD_MODE", "esp")
+        .env("ARGYLE_NIMBLE_BUILD_CONTEXT", &context_path);
+    let output = command
+        .output()
+        .expect("could not start explicit ESP-mode Cargo command");
+    let diagnostics = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "ESP generation without an explicit clang selector unexpectedly succeeded"
+    );
+    assert!(
+        diagnostics.contains("Cargo or build selector ARGYLE_NIMBLE_ESP_CLANG is missing"),
+        "ESP build did not reach the expected missing-selector diagnostic\n{diagnostics}"
+    );
+    for incidental in [
+        "ESP build-context file is malformed",
+        "Cargo OUT_DIR is not an authorized generated-output directory",
+        "binding output directory must be inside the caller-authorized Cargo output root",
+        "Cargo or build selector ARGYLE_NIMBLE_ESP_CLANG is missing or not UTF-8",
+    ] {
+        assert!(
+            !diagnostics.contains(incidental),
+            "ESP build failed before the missing-selector contract ({incidental})"
+        );
+    }
+    assert!(
+        !diagnostics.contains("cargo:rustc-cfg=argyle_nimble_esp"),
+        "a failed ESP generation must not emit the successful ESP cfg\n{diagnostics}"
+    );
+    assert_absent(&stale_bindings);
+    assert_absent(&stale_manifest);
 }
 
 #[test]
@@ -576,6 +646,140 @@ fn main() {
         project.write("include/second/.keep", "");
     }
     project
+}
+
+fn find_build_out_dir(target_dir: &Path, package_name: &str) -> PathBuf {
+    let build_root = target_dir.join("debug/build");
+    let prefix = format!("{package_name}-");
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(&build_root).expect("Cargo did not create its build-script directory")
+    {
+        let entry = entry.expect("could not inspect Cargo build-script directory");
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let out_dir = entry.path().join("out");
+        if out_dir.is_dir() {
+            matches.push(out_dir);
+        }
+    }
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected one Cargo OUT_DIR for package {package_name}"
+    );
+    matches.pop().expect("Cargo OUT_DIR match disappeared")
+}
+
+fn write_sdk_free_esp_context_fixture(project: &TempCargoProject) -> PathBuf {
+    let root = project.root.join("SDK-free ESP context fixture");
+    let sdk_root = root.join("fake ESP-IDF root");
+    let build_root = root.join("consumer build");
+    let sysroot = root.join("compiler sysroot");
+    let include = root.join("compiler include");
+    let compiler = root.join("compiler bin/selected C compiler");
+    let sdkconfig = root.join("consumer configuration/sdkconfig");
+    let generated_header = build_root.join("generated headers/sdkconfig.h");
+    let version_header = sdk_root.join("components/esp_common/include/esp_idf_version.h");
+
+    for directory in [
+        sdk_root.clone(),
+        build_root.clone(),
+        sysroot.clone(),
+        include.clone(),
+        compiler
+            .parent()
+            .expect("compiler path has a parent")
+            .to_path_buf(),
+        sdkconfig
+            .parent()
+            .expect("sdkconfig path has a parent")
+            .to_path_buf(),
+        generated_header
+            .parent()
+            .expect("generated header path has a parent")
+            .to_path_buf(),
+        version_header
+            .parent()
+            .expect("version header path has a parent")
+            .to_path_buf(),
+    ] {
+        fs::create_dir_all(&directory).expect("could not create SDK-free context fixture tree");
+    }
+    fs::write(
+        &compiler,
+        "fixture compiler; build.rs must not execute it\n",
+    )
+    .expect("could not write fixture compiler file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755))
+            .expect("could not mark fixture compiler executable");
+    }
+
+    fs::write(
+        &sdkconfig,
+        "CONFIG_IDF_TARGET=\"esp32c3\"\nCONFIG_IDF_TARGET_ESP32C3=y\nCONFIG_BT_ENABLED=y\nCONFIG_BT_NIMBLE_ENABLED=y\n",
+    )
+    .expect("could not write fixture sdkconfig");
+    fs::write(
+        &generated_header,
+        "#define CONFIG_IDF_TARGET \"esp32c3\"\n#define CONFIG_IDF_TARGET_ESP32C3 1\n#define CONFIG_BT_ENABLED 1\n#define CONFIG_BT_NIMBLE_ENABLED 1\n",
+    )
+    .expect("could not write fixture sdkconfig header");
+    fs::write(
+        &version_header,
+        "#define ESP_IDF_VERSION_MAJOR 6\n#define ESP_IDF_VERSION_MINOR 1\n#define ESP_IDF_VERSION_PATCH 0\n",
+    )
+    .expect("could not write fixture ESP-IDF version header");
+
+    let compiler_arguments = vec![
+        "-march=fixture-abi",
+        "-I",
+        include.to_str().expect("fixture include path is UTF-8"),
+        "--sysroot",
+        sysroot.to_str().expect("fixture sysroot path is UTF-8"),
+        "-c",
+        "context_probe.c",
+    ];
+    let context = json!({
+        "schema_version": 1,
+        "sdk": {
+            "version": "6.1.0",
+            "revision": "0123456789abcdef0123456789abcdef01234567",
+            "idf_version": "v6.1"
+        },
+        "roots": {
+            "sdk": sdk_root,
+            "build": build_root
+        },
+        "target": {"chip": "esp32c3", "architecture": "riscv32"},
+        "compiler": {
+            "path": compiler,
+            "sysroot": sysroot,
+            "working_directory": build_root,
+            "build_configuration": "Debug",
+            "arguments": compiler_arguments,
+            "includes": [
+                {"kind": "normal", "path": include, "argument_index": 1}
+            ],
+            "defines": [],
+            "implicit_includes": []
+        },
+        "configuration": {
+            "sdkconfig": sdkconfig,
+            "generated_headers": [generated_header],
+            "version_header": version_header
+        }
+    });
+    let contract = root.join("valid CMake build context.json");
+    fs::write(
+        &contract,
+        serde_json::to_vec_pretty(&context).expect("could not serialize context fixture"),
+    )
+    .expect("could not write context fixture");
+    contract
 }
 
 fn toml_string(path: &Path) -> String {

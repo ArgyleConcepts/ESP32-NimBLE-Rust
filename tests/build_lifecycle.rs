@@ -1,3 +1,8 @@
+#[allow(dead_code)]
+#[path = "../build_support/context.rs"]
+mod context;
+#[path = "../build_support/inputs.rs"]
+mod inputs;
 #[path = "../build_support/lifecycle.rs"]
 mod lifecycle;
 
@@ -90,6 +95,105 @@ fn identity() -> lifecycle::GenerationIdentity {
         })],
         bindings_sha256: "bindings-a".into(),
     }
+}
+
+#[test]
+fn production_watch_set_covers_context_configuration_tools_and_ordered_directories() {
+    let crate_root = PathBuf::from("/crate");
+    let first_include = PathBuf::from("/sdk/components/nimble/include");
+    let second_include = PathBuf::from("/sdk/components/freertos/include");
+    let resource_dir = PathBuf::from("/tools/esp-clang/lib/clang/21");
+    let clang = PathBuf::from("/tools/esp-clang/bin/clang");
+    let libclang = PathBuf::from("/tools/esp-clang/lib/libclang.dylib");
+    let sdk_git_head = PathBuf::from("/sdk/.git/HEAD");
+    let context = context::EspBuildContext {
+        sdk_version: "6.1.0".into(),
+        sdk_revision: "0123456789abcdef0123456789abcdef01234567".into(),
+        idf_version: "v6.1".into(),
+        sdk_root: PathBuf::from("/sdk"),
+        build_root: PathBuf::from("/consumer/build"),
+        chip: "esp32c3".into(),
+        architecture: "riscv32".into(),
+        compiler: PathBuf::from("/sdk/toolchain/bin/riscv32-esp-elf-gcc"),
+        sysroot: PathBuf::from("/sdk/toolchain/sysroot"),
+        working_directory: PathBuf::from("/consumer/build"),
+        build_configuration: "Debug".into(),
+        compiler_arguments: vec!["-march=rv32imc".into()],
+        includes: vec![],
+        implicit_includes: vec![],
+        defines: vec![],
+        sdkconfig: PathBuf::from("/consumer/build/sdkconfig"),
+        generated_headers: vec![
+            PathBuf::from("/consumer/build/config/sdkconfig.h"),
+            PathBuf::from("/consumer/build/config/bt_config.h"),
+        ],
+        version_header: PathBuf::from("/sdk/components/esp_common/include/esp_idf_version.h"),
+    };
+
+    let watches = inputs::esp_generation_watch_inputs(
+        &context,
+        &crate_root,
+        &[first_include.clone(), second_include.clone()],
+        &clang,
+        &libclang,
+        &resource_dir,
+        std::slice::from_ref(&sdk_git_head),
+    );
+
+    assert_eq!(
+        &watches.directories[..2],
+        &[first_include.clone(), second_include.clone()],
+        "include directories must retain compiler search order"
+    );
+    for path in [
+        &resource_dir,
+        &context.sysroot,
+        &context.working_directory,
+        &crate_root.join("src/backend"),
+    ] {
+        assert!(
+            watches.directories.contains(path),
+            "missing watch for {path:?}"
+        );
+    }
+    for path in [
+        &context.sdkconfig,
+        &context.generated_headers[0],
+        &context.generated_headers[1],
+        &context.version_header,
+        &context.compiler,
+        &clang,
+        &libclang,
+        &sdk_git_head,
+        &crate_root.join("src/backend/nimble_shim.h"),
+        &crate_root.join("src/backend/nimble_shim.c"),
+    ] {
+        assert!(watches.files.contains(path), "missing watch for {path:?}");
+    }
+}
+
+#[test]
+fn generator_sources_are_shared_by_watch_emission_and_identity_without_consumer_lockfile() {
+    let paths = inputs::generator_source_paths(PathBuf::from("/crate").as_path());
+    let relative = paths
+        .iter()
+        .map(|path| path.strip_prefix("/crate").unwrap().to_string_lossy())
+        .map(|path| path.replace('\\', "/"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relative,
+        [
+            "build.rs",
+            "Cargo.toml",
+            "build_support/context.rs",
+            "build_support/bindings.rs",
+            "build_support/inputs.rs",
+            "build_support/lifecycle.rs",
+            "src/backend/nimble_shim.h",
+            "src/backend/nimble_shim.c",
+        ]
+    );
+    assert!(!paths.iter().any(|path| path.ends_with("Cargo.lock")));
 }
 
 #[test]

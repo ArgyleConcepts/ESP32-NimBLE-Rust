@@ -218,7 +218,7 @@ fn generate_with_dependencies_inner(
     let output_file = validate_output_inner(context, output, &header, cargo_managed_output)?;
     validate_shim_with_consumer_compiler(context)?;
 
-    let (source, mut dependencies) = generate_source_with_dependencies(
+    let (source, dependencies) = generate_source_with_dependencies(
         &header,
         &clang_args,
         &NIMBLE_ALLOWLIST,
@@ -227,9 +227,6 @@ fn generate_with_dependencies_inner(
         REQUIRED_VARIABLES,
     )?;
     atomic_write(&output_file, source.as_bytes())?;
-    dependencies.push(header);
-    dependencies.sort();
-    dependencies.dedup();
     Ok((output_file, dependencies))
 }
 
@@ -269,7 +266,7 @@ pub(crate) fn generate_source(
     .map(|(source, _)| source)
 }
 
-fn generate_source_with_dependencies(
+pub(crate) fn generate_source_with_dependencies(
     header: &Path,
     clang_args: &[String],
     allowlist: &Allowlist,
@@ -327,12 +324,15 @@ fn generate_source_with_dependencies(
         required_types,
         required_variables,
     )?;
-    let dependencies = dependencies
+    let mut dependencies = dependencies
         .lock()
         .map_err(|_| error("could not read bindgen's resolved header list"))?
         .iter()
         .map(PathBuf::from)
-        .collect();
+        .collect::<Vec<PathBuf>>();
+    dependencies.push(header.to_path_buf());
+    dependencies.sort();
+    dependencies.dedup();
     Ok((source, dependencies))
 }
 

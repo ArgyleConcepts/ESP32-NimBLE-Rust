@@ -4,6 +4,8 @@
 mod bindings;
 #[path = "build_support/context.rs"]
 mod context;
+#[path = "build_support/inputs.rs"]
+mod inputs;
 #[path = "build_support/lifecycle.rs"]
 mod lifecycle;
 
@@ -209,32 +211,22 @@ fn run() -> Result<(), String> {
     )?;
 
     let include_paths = ordered_include_paths(&context);
-    let mut watch_paths = include_paths.clone();
-    watch_paths.extend([
-        clang_resource_dir.clone(),
-        context.sysroot.clone(),
-        context.working_directory.clone(),
-        manifest_dir.join("src/backend"),
-    ]);
+    let watch_inputs = inputs::esp_generation_watch_inputs(
+        &context,
+        &manifest_dir,
+        &include_paths,
+        &clang_path,
+        &libclang_path,
+        &clang_resource_dir,
+        &sdk_git.watch_paths,
+    );
+    let mut watch_paths = watch_inputs.directories;
     watch_paths.extend(lifecycle::symlink_parent_directories(&[
         context.sdk_root.clone(),
         toolchain.clang.clone(),
         toolchain.libclang.clone(),
     ])?);
-    let file_watches = vec![
-        context.sdkconfig.clone(),
-        context.version_header.clone(),
-        context.compiler.clone(),
-        toolchain.clang.clone(),
-        toolchain.libclang.clone(),
-        manifest_dir.join("src/backend/nimble_shim.h"),
-        manifest_dir.join("src/backend/nimble_shim.c"),
-    ]
-    .into_iter()
-    .chain(context.generated_headers.iter().cloned())
-    .chain(sdk_git.watch_paths.iter().cloned())
-    .collect::<Vec<_>>();
-    let always_rerun = emit_input_watches(&watch_paths, &file_watches, &out_dir)?;
+    let always_rerun = emit_input_watches(&watch_paths, &watch_inputs.files, &out_dir)?;
     if always_rerun {
         emit_watch(&out_dir.join(lifecycle::RERUN_SENTINEL))?;
     }
@@ -294,19 +286,10 @@ fn run() -> Result<(), String> {
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let source_inputs = [
-                manifest_dir.join("build.rs"),
-                manifest_dir.join("Cargo.toml"),
-                manifest_dir.join("Cargo.lock"),
-                manifest_dir.join("build_support/context.rs"),
-                manifest_dir.join("build_support/bindings.rs"),
-                manifest_dir.join("build_support/lifecycle.rs"),
-                manifest_dir.join("src/backend/nimble_shim.h"),
-                manifest_dir.join("src/backend/nimble_shim.c"),
-            ]
-            .iter()
-            .map(|path| canonical_content_identity(path))
-            .collect::<Result<Vec<_>, _>>()?;
+            let source_inputs = inputs::generator_source_paths(&manifest_dir)
+                .iter()
+                .map(|path| canonical_content_identity(path))
+                .collect::<Result<Vec<_>, _>>()?;
             let tool_inputs = vec![
                 tool_identity(&context.compiler, &compiler_version, &compiler_target)?,
                 tool_identity(
@@ -449,17 +432,8 @@ fn emit_environment_watches() {
 
 fn emit_source_watches() -> Result<(), String> {
     let root = required_path("CARGO_MANIFEST_DIR")?;
-    for relative in [
-        "build.rs",
-        "Cargo.toml",
-        "Cargo.lock",
-        "build_support/context.rs",
-        "build_support/bindings.rs",
-        "build_support/lifecycle.rs",
-        "src/backend/nimble_shim.h",
-        "src/backend/nimble_shim.c",
-    ] {
-        emit_watch(&root.join(relative))?;
+    for path in inputs::generator_source_paths(&root) {
+        emit_watch(&path)?;
     }
     Ok(())
 }

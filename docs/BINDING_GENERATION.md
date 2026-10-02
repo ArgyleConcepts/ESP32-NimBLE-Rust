@@ -180,11 +180,15 @@ Interrupted staging state is cleared by the next authorized build-script run.
 The sidecar input manifest uses SHA-256 and records the context bytes, Cargo
 target/host and selectors, SDK revision/submodules, ordered compiler arguments
 and search paths, configuration/header contents, compiler and Espressif Clang
-versions, tool file metadata and content digests, generator source and lockfile contents, and the
-generated binding digest. Its fingerprint is verified after publication; it
-is an output identity record, not a cross-context binding cache. The package
-include list contains the build script and private source tooling, while Cargo
-output remains under `OUT_DIR` and outside packaged source files.
+versions, tool file metadata and content digests, the package manifest and
+generator source files, and the generated binding digest. It intentionally
+does not bind to a workspace `Cargo.lock`: a library consumer resolves that
+lockfile in its own workspace, while Cargo rebuilds the build script when its
+resolved build dependencies change. The manifest fingerprint is verified after
+publication; it is an output identity record, not a cross-context binding
+cache. The package include list contains the build script and private source
+tooling, while Cargo output remains under `OUT_DIR` and outside packaged source
+files.
 
 Azure host tests include SDK-free Cargo lifecycle and output-identity fixtures,
 generic C fixtures parsed with an explicitly selected host libclang, and a
