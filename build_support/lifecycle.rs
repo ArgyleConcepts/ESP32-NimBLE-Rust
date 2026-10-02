@@ -205,6 +205,9 @@ pub(crate) fn fingerprint_manifest(value: &serde_json::Value) -> Result<String, 
 /// Confirm that both published files match the recorded manifest. This helper
 /// is shared with tests to verify the production readback contract.
 pub(crate) fn verify_published_output(output: &Path, out_dir: &Path) -> Result<(), String> {
+    let out_dir = out_dir
+        .canonicalize()
+        .map_err(|_| "Cargo OUT_DIR is unavailable after publication".to_owned())?;
     let output_metadata = fs::symlink_metadata(output)
         .map_err(|_| "generated bindings are unavailable after publication".to_owned())?;
     if output_metadata.file_type().is_symlink() || !output_metadata.is_file() {
@@ -254,6 +257,12 @@ pub(crate) fn verify_published_output(output: &Path, out_dir: &Path) -> Result<(
 /// OUT_DIR is an authorized Cargo output location. Symlinks and unexpected
 /// object types fail closed; cleanup never follows a staging-directory link.
 pub(crate) fn clear_outputs(out_dir: &Path) -> Result<(), String> {
+    let out_dir = out_dir
+        .canonicalize()
+        .map_err(|_| "Cargo OUT_DIR is unavailable for cleanup".to_owned())?;
+    if !out_dir.is_dir() {
+        return Err("Cargo OUT_DIR is not a directory".to_owned());
+    }
     for path in [
         out_dir.join(GENERATED_FILE),
         out_dir.join(MANIFEST_FILE),
@@ -261,7 +270,7 @@ pub(crate) fn clear_outputs(out_dir: &Path) -> Result<(), String> {
         out_dir.join(STAGING_DIRECTORY),
         out_dir.join(RERUN_SENTINEL),
     ] {
-        remove_owned_path(out_dir, &path)?;
+        remove_owned_path(&out_dir, &path)?;
     }
     Ok(())
 }

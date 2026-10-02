@@ -628,7 +628,7 @@ fn sdk_git_snapshot(sdk_root: &Path) -> Result<SdkGitSnapshot, String> {
 }
 
 fn git_metadata_identity(paths: &[PathBuf]) -> Result<Vec<Value>, String> {
-    let mut pending = paths.iter().cloned().collect::<Vec<_>>();
+    let mut pending = paths.to_vec();
     let mut files = BTreeSet::new();
     while let Some(path) = pending.pop() {
         let metadata = match fs::symlink_metadata(&path) {

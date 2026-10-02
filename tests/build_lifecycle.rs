@@ -265,7 +265,7 @@ fn unchanged_staged_generation_publishes_the_same_private_identity() {
     let output = publish();
     let first_output = fs::read(&output).unwrap();
     let first_manifest = fs::read(fixture.out_dir.join(lifecycle::MANIFEST_FILE)).unwrap();
-    assert!(output.starts_with(&fixture.out_dir));
+    assert!(output.starts_with(&fixture.out_dir.canonicalize().unwrap()));
     assert_eq!(output.file_name().unwrap(), lifecycle::GENERATED_FILE);
     lifecycle::verify_published_output(&output, &fixture.out_dir).unwrap();
 
@@ -416,6 +416,14 @@ fn overlapping_include_root_uses_absent_watch_path_without_watching_output_tree(
         .directories
         .iter()
         .any(|path| path.starts_with(&nested_out)));
+    let canonical_out = nested_out.canonicalize().unwrap();
+    assert_eq!(
+        plan.cargo_directory_watches(&canonical_out),
+        vec![
+            separate.canonicalize().unwrap(),
+            canonical_out.join(lifecycle::RERUN_SENTINEL)
+        ]
+    );
 
     let ordinary =
         lifecycle::include_watch_plan(std::slice::from_ref(&overlapping), &fixture.out_dir)
@@ -428,6 +436,10 @@ fn overlapping_include_root_uses_absent_watch_path_without_watching_output_tree(
     assert!(ordinary
         .directories
         .contains(&overlapping.canonicalize().unwrap()));
+    assert_eq!(
+        ordinary.cargo_directory_watches(&fixture.out_dir.canonicalize().unwrap()),
+        ordinary.directories
+    );
 }
 
 #[cfg(unix)]
