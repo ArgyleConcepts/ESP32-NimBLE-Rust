@@ -55,7 +55,8 @@ to a trusted repository branch for validation. See the
 [maintainer guide](docs/MAINTAINING.md).
 
 The [host pipeline and pinned tools](docs/CI.md) are available. Describe checks
-actually performed and link the Azure run for the proposed commit. Target builds
+actually performed. Maintainers link the Azure run for the promoted commit and
+relay failures to external contributors, who need no Azure access. Target builds
 are pending ESP-IDF integration. File inspection or an empty test harness is not BLE behavior
 or target verification. Each behavior change needs appropriate positive,
 negative, and failure-path tests as part of its implementation.

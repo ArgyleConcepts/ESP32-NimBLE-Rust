@@ -7,6 +7,7 @@ if [[ "${TF_BUILD:-}" != "True" && "${TF_BUILD:-}" != "true" ]]; then
   exit 1
 fi
 [[ "$(uname -s)" == Darwin ]] || { printf 'A macOS agent is required\n' >&2; exit 1; }
+bash eng/preflight-ci.sh
 : "${NIMBLE_TOOLS_DIRECTORY:?Azure must supply the tools directory}"
 : "${RUSTUP_HOME:?}" "${CARGO_HOME:?}" "${UV_PYTHON_INSTALL_DIR:?}"
 mkdir -p "$NIMBLE_TOOLS_DIRECTORY" "$CARGO_HOME/bin"
@@ -34,9 +35,12 @@ case "$("$uv" --version)" in
   'uv 0.8.22'|'uv 0.8.22 ('*) ;;
   *) printf 'Unexpected uv version\n' >&2; exit 1 ;;
 esac
-"$uv" python install 3.13.7
+export UV_NO_CONFIG=1
+"$uv" python install --no-bin 3.13.7
 python_path=$("$uv" python find --managed-python 3.13.7)
-[[ "$("$python_path" --version)" == 'Python 3.13.7' ]]
+[[ "$("$python_path" --version)" == 'Python 3.13.7' ]] || {
+  printf 'Unexpected Python version\n' >&2; exit 1;
+}
 printf '##vso[task.setvariable variable=nimblePython;isReadOnly=true]%s\n' "$python_path"
 
 rustup_init="$NIMBLE_TOOLS_DIRECTORY/rustup-init"
@@ -47,11 +51,16 @@ curl --fail --location --silent --show-error --retry 3 "$rustup_url.sha256" \
 read -r rustup_digest _ < "$NIMBLE_TOOLS_DIRECTORY/rustup-init.sha256"
 printf '%s  %s\n' "$rustup_digest" "$rustup_init" | shasum -a 256 --check
 chmod +x "$rustup_init"
-"$rustup_init" -y --no-modify-path --profile minimal --default-toolchain 1.90.0
+rust_version=$("$python_path" -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+[[ "$rust_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  printf 'Expected an exact Rust version in rust-toolchain.toml\n' >&2; exit 1;
+}
+"$rustup_init" -y --no-modify-path --profile minimal --default-toolchain "$rust_version"
 export PATH="$CARGO_HOME/bin:$PATH"
-rustup component add --toolchain 1.90.0 rustfmt clippy
+rustup component add --toolchain "$rust_version" rustfmt clippy
 printf '##vso[task.prependpath]%s\n' "$CARGO_HOME/bin"
 rustup --version
+rustup show active-toolchain
 rustc --version
 cargo --version
 rustfmt --version

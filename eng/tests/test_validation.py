@@ -1,11 +1,14 @@
 """Regression tests for validation failures, diagnostics, and package contracts."""
 
 import importlib.util
+import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 spec = importlib.util.spec_from_file_location("validation", Path(__file__).parents[1] / "validate.py")
@@ -70,6 +73,54 @@ class ValidationTests(unittest.TestCase):
             result = validation.run_command("success", [sys.executable, "-c", "print('ok')"], root, root)
             self.assertEqual(result["status"], 0)
 
+    def test_validation_continues_and_aggregates_middle_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = [(name, [sys.executable, "-c", f"print('{name}'); raise SystemExit({code})"])
+                        for name, code in [("first", 0), ("middle", 42), ("last", 0)]]
+            self.assertEqual(validation.run_validation(commands, root, root), 1)
+            suite = ET.parse(root / "validation.xml").getroot()
+            self.assertEqual(suite.get("failures"), "1")
+            summary = json.loads((root / "summary.json").read_text())
+            self.assertEqual([r["status"] for r in summary["command_results"]], [0, 42, 0])
+            self.assertIn("last", (root / "last.log").read_text())
+
+    def test_successful_validation_returns_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(validation.run_validation(
+                [("pass", [sys.executable, "-c", "pass"])], root, root), 0)
+
+    def test_contract_oserror_is_reported_as_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def broken_contract(*args):
+                raise FileNotFoundError("missing tracked document")
+            self.assertEqual(validation.run_validation([], root, root, broken_contract), 1)
+            suite = ET.parse(root / "validation.xml").getroot()
+            self.assertEqual(suite.get("failures"), "1")
+            result = json.loads((root / "summary.json").read_text())["command_results"][0]
+            self.assertEqual(result["status"], 1)
+            self.assertIn("missing tracked document", (root / (result["name"] + ".log")).read_text())
+
+    def test_unexpected_harness_exception_is_reported_and_reraised(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(validation, "run_command", side_effect=RuntimeError("harness defect")):
+                with self.assertRaisesRegex(RuntimeError, "harness defect"):
+                    validation.run_validation([("unexpected", [])], root, root)
+            suite = ET.parse(root / "validation.xml").getroot()
+            self.assertEqual(suite.get("failures"), "1")
+            self.assertIn("harness defect", (root / "validation-harness.log").read_text())
+
+    def test_interrupt_is_reported_and_reraised(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(validation, "run_command", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    validation.run_validation([("interrupted", [])], root, root)
+            self.assertEqual(ET.parse(root / "validation.xml").getroot().get("failures"), "1")
+
     def test_report_preserves_failure_and_escapes_names(self):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "report.xml"
@@ -100,6 +151,55 @@ class ValidationTests(unittest.TestCase):
             (root / "file.md").write_text("# Anchor\n")
             subprocess.run(["git", "add", "."], cwd=root, check=True)
             validation.check_documentation(root)
+
+    def test_case_mismatched_link_fails(self):
+        self.check_invalid_link("File.md", "file.md", tracked=True)
+
+    def test_untracked_link_target_fails(self):
+        self.check_invalid_link("file.md", "file.md", tracked=False)
+
+    def check_invalid_link(self, filename, target, tracked):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / "README.md").write_text(f"[invalid]({target})\n")
+            (root / filename).write_text("existing destination\n")
+            subprocess.run(["git", "add", "README.md"], cwd=root, check=True)
+            if tracked:
+                subprocess.run(["git", "add", filename], cwd=root, check=True)
+            with self.assertRaisesRegex(ValueError, "missing link"):
+                validation.check_documentation(root)
+
+    def test_preflight_clean_environment_passes(self):
+        self.run_preflight({}, expected=0)
+
+    def test_preflight_rejects_inherited_tool_overrides_without_values(self):
+        for variable in ["RUSTUP_TOOLCHAIN", "RUSTUP_DIST_SERVER", "RUSTFLAGS", "RUSTC_WRAPPER",
+                         "CARGO_BUILD_TARGET", "CARGO_REGISTRIES_PRIVATE_TOKEN", "UV_CONFIG_FILE"]:
+            with self.subTest(variable=variable):
+                result = self.run_preflight({variable: "private-value"}, expected=1)
+                self.assertIn(variable, result.stdout)
+                self.assertNotIn("private-value", result.stdout)
+
+    def test_preflight_rejects_ancestor_cargo_configuration(self):
+        for filename in ["config", "config.toml"]:
+            with self.subTest(filename=filename):
+                self.run_preflight({}, expected=1, config=filename)
+
+    def run_preflight(self, overrides, expected, config=None):
+        script = Path(__file__).resolve().parents[1] / "preflight-ci.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            root = parent / "checkout"
+            root.mkdir()
+            if config:
+                (parent / ".cargo").mkdir()
+                (parent / ".cargo" / config).write_text("[build]\nrustc-wrapper = 'shared'\n")
+            environment = {"PATH": os.environ["PATH"], **overrides}
+            result = subprocess.run(["bash", str(script)], cwd=root, env=environment,
+                                    stdout=subprocess.PIPE, text=True, stderr=subprocess.STDOUT)
+            self.assertEqual(result.returncode, expected, result.stdout)
+            return result
 
 
 if __name__ == "__main__":

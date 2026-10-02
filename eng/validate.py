@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 import xml.etree.ElementTree as ET
 
 
@@ -37,16 +38,18 @@ def check_package_listing(listing):
 def check_documentation(root):
     """Validate relative links in source-controlled Markdown, not build output."""
     result = subprocess.run(
-        ["git", "ls-files", "-z", "--", "*.md"], cwd=root,
+        ["git", "ls-files", "-z"], cwd=root,
         check=True, capture_output=True, text=True,
     )
-    files = [root / name for name in result.stdout.split("\0") if name]
+    tracked = {name for name in result.stdout.split("\0") if name}
+    files = [root / name for name in sorted(tracked) if name.endswith(".md")]
     for file in files:
         for target in re.findall(r"\]\(([^)]+)\)", file.read_text()):
             if "://" in target or target.startswith(("#", "mailto:")):
                 continue
             target = target.split("#")[0]
-            if not (file.parent / target).is_file():
+            relative = os.path.normpath(str(file.parent.relative_to(root) / target))
+            if relative not in tracked or not (root / relative).is_file():
                 raise ValueError(f"{file.relative_to(root)}: missing link {target}")
     print(f"Resolved relative links in {len(files)} Markdown files")
 
@@ -87,6 +90,46 @@ def write_report(results, destination):
     ET.ElementTree(suite).write(destination, encoding="utf-8", xml_declaration=True)
 
 
+def check_contract(root, reports):
+    check_metadata(json.loads((reports / "metadata.log").read_text()))
+    check_package_listing((reports / "package-list.log").read_text())
+    check_documentation(root)
+
+
+def run_validation(commands, root, reports, contract=None):
+    """Continue command failures; preserve unexpected failures in both reports."""
+    results = []
+    try:
+        for name, command in commands:
+            results.append(run_command(name, command, root, reports))
+        if contract is not None:
+            started = time.monotonic()
+            name = "package-and-documentation-contract"
+            status = 0
+            try:
+                contract(root, reports)
+                diagnostic = "Package/documentation contract passed\n"
+            except Exception:
+                diagnostic = traceback.format_exc()
+                status = 1
+            (reports / f"{name}.log").write_text(diagnostic)
+            print(diagnostic, flush=True)
+            results.append({"name": name, "status": status,
+                            "seconds": time.monotonic() - started})
+    except BaseException:
+        # Include interrupts and harness defects, then preserve their exit behavior.
+        (reports / "validation-harness.log").write_text(traceback.format_exc())
+        results.append({"name": "validation-harness", "status": 1, "seconds": 0})
+        raise
+    finally:
+        write_report(results, reports / "validation.xml")
+        (reports / "summary.json").write_text(json.dumps({
+            "scope": "host scaffold and CI tooling; no target or hardware verification",
+            "command_results": results,
+        }, indent=2) + "\n")
+    return int(any(result["status"] for result in results))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reports", type=Path, required=True)
@@ -98,7 +141,7 @@ def main():
     reports.mkdir(parents=True, exist_ok=True)
     commands = [
         ("ci-tool-tests", [sys.executable, "-m", "unittest", "discover", "-s", "eng/tests", "-v"]),
-        ("shell-syntax", ["bash", "-n", "eng/bootstrap-ci.sh"]),
+        ("shell-syntax", ["bash", "-c", "bash -n eng/bootstrap-ci.sh && bash -n eng/preflight-ci.sh"]),
         ("format", ["cargo", "fmt", "--all", "--", "--check"]),
         ("clippy", ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"]),
         ("host-build", ["cargo", "build", "--locked"]),
@@ -108,28 +151,7 @@ def main():
         ("metadata", ["cargo", "metadata", "--no-deps", "--offline", "--format-version", "1"]),
         ("package-list", ["cargo", "package", "--list", "--locked", "--offline"]),
     ]
-    results = []
-    try:
-        for name, command in commands:
-            results.append(run_command(name, command, root, reports))
-        started = time.monotonic()
-        try:
-            check_metadata(json.loads((reports / "metadata.log").read_text()))
-            check_package_listing((reports / "package-list.log").read_text())
-            check_documentation(root)
-            status = 0
-        except (ValueError, KeyError, StopIteration, subprocess.SubprocessError) as error:
-            print(f"Package/documentation contract failed: {error}", flush=True)
-            status = 1
-        results.append({"name": "package-and-documentation-contract", "status": status,
-                        "seconds": time.monotonic() - started})
-    finally:
-        write_report(results, reports / "validation.xml")
-        (reports / "summary.json").write_text(json.dumps({
-            "scope": "host scaffold and CI tooling; no target or hardware verification",
-            "command_results": results,
-        }, indent=2) + "\n")
-    return int(any(result["status"] for result in results))
+    return run_validation(commands, root, reports, check_contract)
 
 
 if __name__ == "__main__":

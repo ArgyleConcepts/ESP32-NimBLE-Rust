@@ -2,10 +2,11 @@ name: validation-$(Date:yyyyMMdd)$(Rev:.r)
 
 trigger: none
 pr:
+  # Mirrored only: Azure's server-side trigger override is authoritative.
+  # Update both configurations when removing bootstrap main (docs/CI.md).
   autoCancel: true
   branches:
     include:
-      # Bootstrap only; remove main after the branch-policy setup.
       - main
       - develop
       - master
@@ -19,9 +20,11 @@ variables:
   toolsDirectory: $(Agent.TempDirectory)/argyle-nimble/$(Build.BuildId)
   RUSTUP_HOME: $(toolsDirectory)/rustup
   CARGO_HOME: $(toolsDirectory)/cargo
-  CARGO_TARGET_DIR: $(toolsDirectory)/target/host-rust-1.90.0-debug
+  CARGO_TARGET_DIR: $(toolsDirectory)/target/host-debug
   UV_CACHE_DIR: $(toolsDirectory)/uv-cache
   UV_PYTHON_INSTALL_DIR: $(toolsDirectory)/python
+  UV_PYTHON_BIN_DIR: $(toolsDirectory)/python-bin
+  UV_NO_CONFIG: '1'
   nimblePython: ''
 
 jobs:
@@ -44,6 +47,9 @@ jobs:
           mkdir -p "$VALIDATION_REPORTS"
           bash eng/bootstrap-ci.sh 2>&1 | tee "$VALIDATION_REPORTS/tool-setup.log"
         displayName: Install pinned isolated host tools
+        target:
+          settableVariables:
+            - nimblePython
         env:
           NIMBLE_TOOLS_DIRECTORY: $(toolsDirectory)
           VALIDATION_REPORTS: $(Build.ArtifactStagingDirectory)/validation
@@ -52,6 +58,8 @@ jobs:
           set -euo pipefail
           "$NIMBLE_PYTHON" eng/validate.py --reports "$VALIDATION_REPORTS"
         displayName: Validate host crate and contribution structure
+        target:
+          settableVariables: none
         env:
           NIMBLE_PYTHON: $(nimblePython)
           VALIDATION_REPORTS: $(Build.ArtifactStagingDirectory)/validation

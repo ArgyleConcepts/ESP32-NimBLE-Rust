@@ -17,6 +17,8 @@ during bootstrap. Azure's server-side PR trigger configuration is authoritative:
 its branch filters cover these three branches and fork execution is disabled.
 The YAML mirrors the intended filters for readability. Update both configurations
 when removing the bootstrap `main` branch. There is no push trigger.
+The YAML `pr` block (including auto-cancellation) is ignored while the server
+override is enabled; review the saved trigger settings when changing PR behavior.
 
 While this setup PR is pending, the pipeline's manual-run default source branch
 is `azure-validation`, where the YAML exists. After merging it, update the Azure
@@ -28,6 +30,7 @@ default source to `main`; the later branch-policy setup must update it to
 - Host Rust **1.90.0**, with its matching rustfmt and Clippy components, is pinned
   by `rust-toolchain.toml`. This is a validated host version, not an embedded
   toolchain or minimum-supported-version claim.
+  Bootstrap reads the exact version from that file and records the active toolchain.
 - Rustup bootstrap **1.28.2** uses its published checksum. uv **0.8.22** uses
   committed SHA-256 digests for the macOS ARM64/x86-64 release archives and
   installs managed Python **3.13.7**. Python CI helpers use only the standard
@@ -48,7 +51,8 @@ other commands are available, and any failed command fails validation.
 
 The framework still has zero behavior tests. The Python tests exercise CI
 failure propagation, missing executables, diagnostic retention, report encoding,
-broken links, and invalid package contracts. C3/S3 compile/link jobs arrive with
+unexpected exceptions/interrupts, inherited configuration, exact-case tracked-file
+links, and invalid package contracts. C3/S3 compile/link jobs arrive with
 ESP-IDF integration; the final verification matrix adds the full framework suite
 and coverage enforcement. No hardware verification is claimed.
 
@@ -60,6 +64,9 @@ The `host-validation` artifact contains tool setup output, a log for each comman
 Cargo test output is retained in `host-tests.log` and `doc-tests.log`; a zero-test
 result must not be reported as BLE test coverage. Later test runners should
 publish their actual per-test reports in addition to these command diagnostics.
+Unexpected contract errors produce a failed command result and retained traceback.
+Harness exceptions and interrupts produce a failed harness result before being
+re-raised; they cannot leave a report containing only successful completed checks.
 
 JUnit publication runs after success or failure; diagnostic artifact publication
 and temporary-state cleanup run even after failure. If setup fails before a test
@@ -71,6 +78,20 @@ and tools/Cargo home/target/Python cache directories are unique to each build ID
 There are no shared CI caches to restore. This run's temporary state is deleted
 after diagnostics are published. Future target caches must additionally isolate
 the chip, target toolchain, ESP-IDF revision, and configuration.
+
+uv configuration discovery is disabled. Python installation uses `--no-bin`,
+with a run-specific bin directory as additional protection, so it does not create
+launchers in the shared agent home. Before installing tools, the preflight rejects
+inherited compiler/wrapper/toolchain/registry/uv overrides and Cargo configuration
+in checkout ancestors (including the agent home). It reports variable names and
+configuration paths without printing values or file contents. Pipeline-owned
+home/cache paths and the explicitly set rustdoc flags are allowed. A rejection
+requires correcting the agent configuration before rerunning; it does not silently
+validate with another project's settings. Repository-local Cargo configuration
+remains an executable input that maintainers must review before promotion.
+
+Azure logging commands may set only `nimblePython` during bootstrap and no
+variables during validation. Checkout credentials are not passed to these steps.
 
 ## Azure controls outside the repository
 
@@ -98,3 +119,19 @@ Review server-side triggers, ACLs, pool/connection authorization, and centralize
 settings after configuration changes. Keep external contributions disabled for
 direct execution; review and promote their exact changes with attribution as
 described in the maintainer guide. Promotion is a trust decision, not a sandbox.
+
+## Bootstrap verification evidence (2026-10-02)
+
+- [Run 7586](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build/results?buildId=7586)
+  deliberately failed a CI-helper test: GitHub validation failed, JUnit and
+  diagnostic artifacts were retained, and cleanup completed. The probe was removed.
+- [Run 7587](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build/results?buildId=7587)
+  and [run 7589](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build/results?buildId=7589)
+  passed at commit `354818f`, before the review fixes. These runs exposed uv's
+  shared-bin launcher behavior; the review fixes disable that installation.
+- [Closed fork probe PR #3](https://github.com/ArgyleConcepts/ESP32-NimBLE-Rust/pull/3)
+  expanded the YAML PR branch filter. No run/check appeared during more than
+  2m42s of observation; the authoritative `forks.enabled=false` setting was also
+  read back. The probe PR was closed without merging and its branch deleted.
+
+These results cover the bootstrap commit; changes require fresh Azure validation.
