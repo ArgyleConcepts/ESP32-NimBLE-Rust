@@ -573,7 +573,8 @@ fn relevant_environment(target: &str, chip: &str) -> Result<Value, String> {
     let values = names
         .into_iter()
         .filter_map(|name| {
-            env::var_os(&name).map(|value| (name, value.to_string_lossy().into_owned()))
+            env::var_os(&name)
+                .map(|value| (name, Value::String(value.to_string_lossy().into_owned())))
         })
         .collect::<serde_json::Map<_, _>>();
     Ok(Value::Object(values))
