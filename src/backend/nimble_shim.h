@@ -29,6 +29,12 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
+/* `BLE_ERR_REM_USER_CONN_TERM` is a variant of a broad named SDK enum.
+ * Bindgen exposes only this audited value through the narrow anonymous enum. */
+enum {
+    ARGYLE_NIMBLE_ERR_REM_USER_CONN_TERM = BLE_ERR_REM_USER_CONN_TERM
+};
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -54,7 +60,8 @@ void argyle_nimble_set_gatts_register_callback(ble_gatt_register_fn *callback,
                                                void *callback_arg);
 
 /* Returns 0 for the copied peripheral-server events and -1 for an event that
- * this audited shim does not expose. `event` and `out` must be non-null. */
+ * this audited shim does not expose. Null `event` or `out` also returns -1
+ * without writing to `out`. */
 int argyle_nimble_gap_event_extract(const struct ble_gap_event *event,
                                     struct argyle_nimble_gap_event_view *out);
 

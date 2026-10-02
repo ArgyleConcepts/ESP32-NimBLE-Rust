@@ -89,8 +89,11 @@ safety guarantees.
 
 The exact constants needed for open peripheral-server registration, advertising,
 ATT access results, connection termination, and ATT channel identification are
-also checked as bindgen roots. Characteristic property bits (`BLE_GATT_CHR_PROP_*`)
-and GATT server flag bits (`BLE_GATT_CHR_F_*`) remain distinct SDK values.
+also checked as bindgen roots. The SDK's remote-user-termination reason is a
+variant of a broad named error enum, so the private shim re-exports only that
+value through one anonymous enum constant; unrelated SDK error variants are
+not binding roots. Characteristic property bits (`BLE_GATT_CHR_PROP_*`) and
+GATT server flag bits (`BLE_GATT_CHR_F_*`) remain distinct SDK values.
 
 No security manager, bond store, central-role, or arbitrary NimBLE declarations
 are included. Expanding this set requires header-level review and matching

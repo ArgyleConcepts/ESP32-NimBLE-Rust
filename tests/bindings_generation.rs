@@ -722,7 +722,7 @@ fn shim_syntax_check_forwards_consumer_flags_without_probe_actions() {
 }
 
 #[test]
-fn generic_host_bindgen_fixture_is_isolated_and_does_not_claim_esp_abi() {
+fn generic_host_bindgen_fixture_filters_named_enum_variants() {
     if std::env::var_os(HOST_CHILD_ENV).is_some() {
         let header = PathBuf::from(std::env::var_os(HOST_HEADER_ENV).unwrap());
         let output = PathBuf::from(std::env::var_os(HOST_OUTPUT_ENV).unwrap());
@@ -730,9 +730,14 @@ fn generic_host_bindgen_fixture_is_isolated_and_does_not_claim_esp_abi() {
         let allowlist = Allowlist {
             functions: &["fixture_required"],
             types: &["fixture_payload_t"],
-            variables: &["FIXTURE_MODE"],
+            variables: &["FIXTURE_MODE", "FIXTURE_ERROR_ALIAS"],
             opaque_types: &[],
             blocked_types: &[],
+        };
+        let required_variables = if case == "named-enum-alias" {
+            &["FIXTURE_MODE", "FIXTURE_ERROR_ALIAS"][..]
+        } else {
+            &["FIXTURE_MODE"][..]
         };
         let generated = bindings::generate_source(
             &header,
@@ -740,12 +745,17 @@ fn generic_host_bindgen_fixture_is_isolated_and_does_not_claim_esp_abi() {
             &allowlist,
             &["fixture_required"],
             &["fixture_payload_t"],
-            &["FIXTURE_MODE"],
+            required_variables,
         );
         match case.as_str() {
-            "valid" => {
+            "valid" | "named-enum-alias" => {
                 let generated = generated.unwrap();
                 assert!(!generated.contains("fixture_private"));
+                if case == "named-enum-alias" {
+                    assert!(generated.contains("FIXTURE_ERROR_ALIAS"));
+                    assert!(!generated.contains("FIXTURE_REM_USER_CONN_TERM"));
+                    assert!(!generated.contains("FIXTURE_UNRELATED_ERROR"));
+                }
                 fs::write(output, generated).unwrap();
             }
             "syntax-error" | "missing-transitive-header" => {
@@ -787,6 +797,10 @@ fn generic_host_bindgen_fixture_is_isolated_and_does_not_claim_esp_abi() {
             "typedef struct { unsigned short count; } fixture_payload_t;\nint fixture_required(fixture_payload_t *value);\nenum { FIXTURE_MODE = 7 };\nint fixture_private(void);\n",
         ),
         (
+            "named-enum-alias",
+            "typedef struct { unsigned short count; } fixture_payload_t;\nint fixture_required(fixture_payload_t *value);\nenum fixture_error_codes { FIXTURE_REM_USER_CONN_TERM = 0x13, FIXTURE_UNRELATED_ERROR = 0x14 };\nenum { FIXTURE_ERROR_ALIAS = FIXTURE_REM_USER_CONN_TERM, FIXTURE_MODE = 7 };\n",
+        ),
+        (
             "syntax-error",
             "typedef struct { unsigned short count; } fixture_payload_t;\nint fixture_required( ;\nenum { FIXTURE_MODE = 7 };\n",
         ),
@@ -813,7 +827,7 @@ fn generic_host_bindgen_fixture_is_isolated_and_does_not_claim_esp_abi() {
         command
             .args([
                 "--exact",
-                "generic_host_bindgen_fixture_is_isolated_and_does_not_claim_esp_abi",
+                "generic_host_bindgen_fixture_filters_named_enum_variants",
             ])
             .env(HOST_CHILD_ENV, "1")
             .env(HOST_CASE_ENV, case)
@@ -840,7 +854,7 @@ fn generic_host_bindgen_fixture_is_isolated_and_does_not_claim_esp_abi() {
             "isolated generic host bindgen fixture `{case}` failed: {}",
             String::from_utf8_lossy(&result.stderr)
         );
-        if case != "valid" {
+        if case != "valid" && case != "named-enum-alias" {
             assert!(!output.exists(), "failed `{case}` fixture published output");
             continue;
         }
@@ -849,6 +863,11 @@ fn generic_host_bindgen_fixture_is_isolated_and_does_not_claim_esp_abi() {
         assert!(generated.contains("fixture_payload_t"));
         assert!(generated.contains("FIXTURE_MODE"));
         assert!(!generated.contains("fixture_private"));
+        if case == "named-enum-alias" {
+            assert!(generated.contains("FIXTURE_ERROR_ALIAS"));
+            assert!(!generated.contains("FIXTURE_REM_USER_CONN_TERM"));
+            assert!(!generated.contains("FIXTURE_UNRELATED_ERROR"));
+        }
     }
     let _ = fs::remove_dir_all(root);
 }

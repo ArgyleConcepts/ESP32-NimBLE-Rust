@@ -27,6 +27,8 @@ static int reset_first_reason;
 static int reset_second_reason;
 static unsigned register_first_calls;
 static unsigned register_second_calls;
+static struct ble_gatt_register_ctxt *seen_register_context;
+static void *seen_register_arg;
 
 static void
 sync_first(void)
@@ -52,18 +54,20 @@ reset_second(int reason)
     reset_second_reason = reason;
 }
 
-static int
-register_first(void)
+static void
+register_first(struct ble_gatt_register_ctxt *context, void *callback_arg)
 {
     ++register_first_calls;
-    return 17;
+    seen_register_context = context;
+    seen_register_arg = callback_arg;
 }
 
-static int
-register_second(void)
+static void
+register_second(struct ble_gatt_register_ctxt *context, void *callback_arg)
 {
     ++register_second_calls;
-    return -19;
+    seen_register_context = context;
+    seen_register_arg = callback_arg;
 }
 
 uint16_t
@@ -161,21 +165,34 @@ test_callback_setters(void)
 
     int first_argument = 31;
     int second_argument = 37;
+    struct ble_gatt_register_ctxt context = {.marker = 43};
     argyle_nimble_set_gatts_register_callback(&register_first,
                                                &first_argument);
     assert(ble_hs_cfg.gatts_register_cb == &register_first);
     assert(ble_hs_cfg.gatts_register_arg == &first_argument);
-    assert(ble_hs_cfg.gatts_register_cb() == 17);
+    ble_hs_cfg.gatts_register_cb(&context, ble_hs_cfg.gatts_register_arg);
     assert(register_first_calls == 1);
+    assert(seen_register_context == &context);
+    assert(seen_register_arg == &first_argument);
     argyle_nimble_set_gatts_register_callback(&register_second,
                                                &second_argument);
     assert(ble_hs_cfg.gatts_register_cb == &register_second);
     assert(ble_hs_cfg.gatts_register_arg == &second_argument);
-    assert(ble_hs_cfg.gatts_register_cb() == -19);
+    ble_hs_cfg.gatts_register_cb(&context, ble_hs_cfg.gatts_register_arg);
     assert(register_second_calls == 1);
+    assert(seen_register_context == &context);
+    assert(seen_register_arg == &second_argument);
     argyle_nimble_set_gatts_register_callback(NULL, NULL);
     assert(ble_hs_cfg.gatts_register_cb == NULL);
     assert(ble_hs_cfg.gatts_register_arg == NULL);
+}
+
+static void
+test_sdk_error_alias(void)
+{
+    assert(BLE_ERR_REM_USER_CONN_TERM == 19);
+    assert(ARGYLE_NIMBLE_ERR_REM_USER_CONN_TERM == 19);
+    assert(ARGYLE_NIMBLE_ERR_REM_USER_CONN_TERM == BLE_ERR_REM_USER_CONN_TERM);
 }
 
 static void
@@ -348,6 +365,7 @@ int
 main(void)
 {
     test_callback_setters();
+    test_sdk_error_alias();
     test_uuid_constructors_and_uuid128_errors();
     test_gap_event_views();
     test_mbuf_forwarding_and_guards();

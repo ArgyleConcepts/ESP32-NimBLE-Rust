@@ -87,7 +87,7 @@ pub const REQUIRED_VARIABLES: &[&str] = &[
     "BLE_HS_FOREVER",
     "BLE_HS_ADV_F_DISC_GEN",
     "BLE_HS_ADV_F_BREDR_UNSUP",
-    "BLE_ERR_REM_USER_CONN_TERM",
+    "ARGYLE_NIMBLE_ERR_REM_USER_CONN_TERM",
     "BLE_L2CAP_CID_ATT",
     "BLE_ADDR_PUBLIC",
     "BLE_ADDR_RANDOM",
@@ -523,12 +523,10 @@ pub(crate) fn strip_probe_action_arguments(
             let value = args
                 .get(index + 1)
                 .ok_or_else(|| error("CMake probe dependency option has no output operand"))?;
-            if arg == "-MF" {
-                if !is_contained_build_output(context, value) {
-                    return Err(error(
-                        "CMake probe dependency output is outside the configured ESP-IDF build directory",
-                    ));
-                }
+            if arg == "-MF" && !is_contained_build_output(context, value) {
+                return Err(error(
+                    "CMake probe dependency output is outside the configured ESP-IDF build directory",
+                ));
             }
             index += 2;
             continue;
@@ -990,10 +988,14 @@ pub(crate) fn validate_output(
     }
 
     let destination = directory.join(GENERATED_FILE);
-    for protected_file in [header.to_path_buf(), crate_root.join(SHIM_SOURCE)]
-        .into_iter()
-        .chain(context.generated_headers.iter().cloned())
-        .chain([context.sdkconfig.clone(), context.version_header.clone()])
+    for protected_file in [
+        header.to_path_buf(),
+        actual_crate_root.join(SHIM_SOURCE),
+        claimed_crate_root.join(SHIM_SOURCE),
+    ]
+    .into_iter()
+    .chain(context.generated_headers.iter().cloned())
+    .chain([context.sdkconfig.clone(), context.version_header.clone()])
     {
         let canonical = protected_file.canonicalize().map_err(|_| {
             error("a protected shim, SDK configuration, or generated header is unavailable")

@@ -1,11 +1,16 @@
-#ifndef TEST_NIMBLE_SHIM_H
-#define TEST_NIMBLE_SHIM_H
+#ifndef ARGYLE_NIMBLE_TEST_SDK_H
+#define ARGYLE_NIMBLE_TEST_SDK_H
 
 #include <stdint.h>
 
 typedef void ble_hs_sync_fn(void);
 typedef void ble_hs_reset_fn(int reason);
-typedef int ble_gatt_register_fn(void);
+
+struct ble_gatt_register_ctxt {
+    uint8_t marker;
+};
+typedef void ble_gatt_register_fn(struct ble_gatt_register_ctxt *context,
+                                  void *callback_arg);
 
 struct ble_hs_cfg {
     ble_hs_sync_fn *sync_cb;
@@ -15,6 +20,11 @@ struct ble_hs_cfg {
 };
 
 extern struct ble_hs_cfg ble_hs_cfg;
+
+enum ble_error_codes {
+    BLE_ERR_REM_USER_CONN_TERM = 19,
+    BLE_ERR_TEST_SENTINEL = 20
+};
 
 enum {
     BLE_UUID_TYPE_16 = 1,
@@ -95,30 +105,6 @@ struct ble_gap_event {
     };
 };
 
-struct argyle_nimble_gap_event_view {
-    uint8_t type;
-    uint8_t subscribe_reason;
-    uint8_t notify_enabled;
-    uint8_t indicate_enabled;
-    uint16_t conn_handle;
-    uint16_t attr_handle;
-    uint16_t mtu;
-    uint16_t channel_id;
-    int status;
-    int reason;
-    uint8_t indication;
-};
-
-void argyle_nimble_set_sync_callback(ble_hs_sync_fn *callback);
-void argyle_nimble_set_reset_callback(ble_hs_reset_fn *callback);
-void argyle_nimble_set_gatts_register_callback(ble_gatt_register_fn *callback,
-                                               void *callback_arg);
-int argyle_nimble_gap_event_extract(const struct ble_gap_event *event,
-                                    struct argyle_nimble_gap_event_view *out);
-ble_uuid16_t argyle_nimble_uuid16(uint16_t value);
-ble_uuid32_t argyle_nimble_uuid32(uint32_t value);
-int argyle_nimble_uuid128(const uint8_t value[16], ble_uuid128_t *out);
-
 struct os_mbuf {
     struct os_mbuf *next;
     uint16_t segment_len;
@@ -130,12 +116,5 @@ int os_mbuf_copydata(const struct os_mbuf *mbuf, int offset, int length,
                      void *destination);
 int os_mbuf_append(struct os_mbuf *mbuf, const void *source, uint16_t length);
 int os_mbuf_free_chain(struct os_mbuf *mbuf);
-
-uint16_t argyle_nimble_mbuf_len(const struct os_mbuf *mbuf);
-int argyle_nimble_mbuf_copydata(const struct os_mbuf *mbuf, int offset,
-                                int length, void *destination);
-int argyle_nimble_mbuf_append(struct os_mbuf *mbuf, const void *source,
-                              uint16_t length);
-int argyle_nimble_mbuf_free_chain(struct os_mbuf *mbuf);
 
 #endif
