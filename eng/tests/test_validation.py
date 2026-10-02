@@ -48,8 +48,9 @@ class ValidationTests(unittest.TestCase):
 
     def test_complete_package_listing(self):
         validation.check_package_listing("\n".join([
-            "Cargo.toml", "LICENSE", "README.md", "src/lib.rs", "CONTRIBUTING.md",
+            "Cargo.toml", "build.rs", "LICENSE", "README.md", "src/lib.rs", "CONTRIBUTING.md",
             "build_support/context.rs", "build_support/bindings.rs",
+            "build_support/lifecycle.rs",
             "src/backend/nimble_shim.h", "src/backend/nimble_shim.c",
             "cmake/ArgyleNimbleBuildContext.cmake",
             "cmake/capture_compiler.py", "cmake/export_build_context.py",

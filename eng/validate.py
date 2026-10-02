@@ -26,8 +26,9 @@ def check_metadata(metadata):
 
 def check_package_listing(listing):
     required = {
-        "Cargo.toml", "LICENSE", "README.md", "src/lib.rs",
+        "Cargo.toml", "build.rs", "LICENSE", "README.md", "src/lib.rs",
         "build_support/context.rs", "build_support/bindings.rs",
+        "build_support/lifecycle.rs",
         "src/backend/nimble_shim.h", "src/backend/nimble_shim.c",
         "cmake/ArgyleNimbleBuildContext.cmake",
         "cmake/capture_compiler.py", "cmake/export_build_context.py",

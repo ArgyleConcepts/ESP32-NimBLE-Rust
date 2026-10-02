@@ -172,7 +172,12 @@ pub fn parse_context_file(path: &Path) -> Result<EspBuildContext, ContextError> 
             "ESP build-context file is unreadable; rerun the CMake exporter after configuring ESP-IDF".into(),
         )
     })?;
-    let value: Value = serde_json::from_slice(&contents).map_err(|_| {
+    parse_context_bytes(&contents)
+}
+
+/// Parse the exact context bytes retained for the Cargo output identity.
+pub fn parse_context_bytes(contents: &[u8]) -> Result<EspBuildContext, ContextError> {
+    let value: Value = serde_json::from_slice(contents).map_err(|_| {
         ContextError("ESP build-context file is malformed JSON; rerun the CMake exporter".into())
     })?;
     validate_context(&value)

@@ -466,6 +466,48 @@ fn output_cannot_target_the_actual_crate_tree_through_a_claimed_fixture_root() {
     );
 }
 
+#[test]
+fn cargo_authority_accepts_custom_target_roots_but_still_protects_sources() {
+    let fixture = Fixture::new();
+    let header = fixture.root.join("source crate/src/backend/nimble_shim.h");
+    fs::create_dir_all(header.parent().unwrap()).unwrap();
+    fs::write(&header, "/* protected shim */\n").unwrap();
+    fs::write(
+        fixture.root.join("source crate/src/backend/nimble_shim.c"),
+        "/* shim */\n",
+    )
+    .unwrap();
+
+    let custom_target = fixture
+        .root
+        .join("source crate/.custom-target/debug/build/package/out");
+    fs::create_dir_all(&custom_target).unwrap();
+    let output = OutputLocation {
+        directory: custom_target.clone(),
+        authorized_root: custom_target,
+        crate_root: fixture.root.join("source crate"),
+        forbidden_roots: Vec::new(),
+    };
+    assert!(bindings::validate_cargo_output(&fixture.context, &output, &header).is_ok());
+
+    let source_output = fixture
+        .root
+        .join("source crate/src/custom-target/debug/build/package/out");
+    fs::create_dir_all(&source_output).unwrap();
+    let output = OutputLocation {
+        directory: source_output.clone(),
+        authorized_root: source_output,
+        crate_root: fixture.root.join("source crate"),
+        forbidden_roots: Vec::new(),
+    };
+    assert!(
+        bindings::validate_cargo_output(&fixture.context, &output, &header)
+            .unwrap_err()
+            .to_string()
+            .contains("protected source, SDK")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn output_refuses_symlinked_binding_destination() {
