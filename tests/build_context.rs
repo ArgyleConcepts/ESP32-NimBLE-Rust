@@ -470,9 +470,11 @@ fn declared_sysroot_must_match_the_explicit_argument() {
         .to_string()
         .contains("does not match the explicit sysroot argument"));
 
+    let fixture = Fixture::new("esp32c3");
     let mut value = fixture.read();
     let mut arguments = fixture.compiler_args.clone();
-    *arguments.last_mut().unwrap() = "--sysroot=".to_owned();
+    arguments.truncate(arguments.len() - 2);
+    arguments.push("--sysroot=".to_owned());
     value["compiler"]["arguments"] = json!(arguments);
     fixture.write(&value);
     assert!(context::parse_context_file(&fixture.contract)
