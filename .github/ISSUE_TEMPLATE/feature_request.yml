@@ -1,0 +1,22 @@
+name: Feature request
+description: Propose an improvement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: Describe what you are trying to accomplish using a generic example.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include an example API or usage if useful. Do not include private product profiles.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and compatibility
+      description: Mention workarounds, target/ESP-IDF requirements, and possible breaking changes.
