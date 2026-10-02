@@ -49,12 +49,19 @@ denied, package identity/publication guard, packaged license/docs, and relative
 Markdown links. Checks continue after a command failure so diagnostics from
 other commands are available, and any failed command fails validation.
 
-The framework still has zero behavior tests. The Python tests exercise CI
-failure propagation, missing executables, diagnostic retention, report encoding,
-unexpected exceptions/interrupts, inherited configuration, exact-case tracked-file
-links, and invalid package contracts. C3/S3 compile/link jobs arrive with
-ESP-IDF integration; the final verification matrix adds the full framework suite
-and coverage enforcement. No hardware verification is claimed.
+The Rust integration tests validate the private context contract and mode
+selection with SDK-free filesystem fixtures. They do not parse real SDK headers,
+establish a target ABI, compile firmware, or test BLE behavior. The Python tests
+exercise context export/capture token handling as well as CI failure propagation,
+missing executables, diagnostic retention, report encoding, unexpected
+exceptions/interrupts, inherited configuration, exact-case tracked-file links,
+and invalid package contracts. Genuine C3/S3 binding generation and target
+configuration checks are later matrix work; no hardware verification is claimed.
+These runs do not configure a real ESP-IDF CMake consumer project; C3/S3 CMake
+exporter fixtures, including rejection of launchers set after component
+registration, are pending NIMBLERS-24. The CMake fixtures should also add
+`add_compile_options(-DARGYLE_LEAK)` after consumer target creation and before
+export, then verify that the probe capture excludes this directory-only define.
 
 ## Reports, artifacts, and isolation
 
@@ -135,3 +142,12 @@ described in the maintainer guide. Promotion is a trust decision, not a sandbox.
   read back. The probe PR was closed without merging and its branch deleted.
 
 These results cover the bootstrap commit; changes require fresh Azure validation.
+
+## NIMBLERS-21 validation evidence
+
+- [Run 7627](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build/results?buildId=7627)
+  passed the reviewed PR head `07ee71e9f48f946634732ed014239e7593658934`: 32
+  Python tests, 13 Rust integration tests, and the Clippy, host build, docs,
+  and package checks.
+- This evidence applies only to that exact head. Later commits require a fresh
+  Azure run before their validation can be reported.

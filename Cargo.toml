@@ -12,6 +12,8 @@ categories = ["embedded", "hardware-support"]
 publish = false
 include = [
     "/Cargo.toml",
+    "/build_support/**",
+    "/cmake/**",
     "/src/**",
     "/README.md",
     "/LICENSE",
@@ -20,3 +22,6 @@ include = [
     "/CODE_OF_CONDUCT.md",
     "/docs/**",
 ]
+
+[dev-dependencies]
+serde_json = "1.0"
