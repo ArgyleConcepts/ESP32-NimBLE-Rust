@@ -56,12 +56,14 @@ jobs:
 
       - bash: |
           set -euo pipefail
+          export PATH="$NIMBLE_CARGO_BIN:$PATH"
           "$NIMBLE_PYTHON" eng/validate.py --reports "$VALIDATION_REPORTS"
         displayName: Validate host crate and contribution structure
         target:
           settableVariables: none
         env:
           NIMBLE_PYTHON: $(nimblePython)
+          NIMBLE_CARGO_BIN: $(CARGO_HOME)/bin
           VALIDATION_REPORTS: $(Build.ArtifactStagingDirectory)/validation
           PYTHONDONTWRITEBYTECODE: '1'
           CARGO_TERM_COLOR: never

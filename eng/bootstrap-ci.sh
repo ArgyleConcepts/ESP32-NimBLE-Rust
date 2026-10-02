@@ -58,7 +58,6 @@ rust_version=$("$python_path" -c 'import tomllib; print(tomllib.load(open("rust-
 "$rustup_init" -y --no-modify-path --profile minimal --default-toolchain "$rust_version"
 export PATH="$CARGO_HOME/bin:$PATH"
 rustup component add --toolchain "$rust_version" rustfmt clippy
-printf '##vso[task.prependpath]%s\n' "$CARGO_HOME/bin"
 rustup --version
 rustup show active-toolchain
 rustc --version
