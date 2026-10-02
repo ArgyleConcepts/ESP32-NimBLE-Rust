@@ -33,17 +33,23 @@ global SDK installation, or inspect inherited environment values.
 
 For reliable capture, call the exporter from the consumer target's defining
 CMake source and binary directory. It rejects nonempty `RULE_LAUNCH_COMPILE`
-settings at global scope, on the consumer/probe targets, and in every parent
-directory scope of those targets. This includes ESP-IDF's ccache setting; disable
-ccache or other compile launchers for context export. The exporter does not
-replace or reinterpret launcher behavior. It repeats the checks after the
-top-level `CMakeLists.txt` finishes, so launcher properties added later by
-components or ordinary project code also fail before generation. Deferred CMake
-callbacks queued after the exporter check are outside this guard. The consumer's
-scalar C compile properties, including generic and active-configuration IPO
-settings, are refreshed in the final check. A project that adds the same source
-directory under multiple binary directories is unsupported because CMake's
+settings at global scope, on the consumer/probe targets, and in each target's
+directory and every ancestor directory scope. This includes ESP-IDF's ccache
+setting; disable ccache or other compile launchers for context export. The
+exporter does not replace or reinterpret launcher behavior. It repeats the
+checks after the top-level `CMakeLists.txt` finishes, so launcher properties
+added later by components or ordinary project code also fail before generation.
+Deferred CMake callbacks queued after the exporter check are outside this guard.
+The consumer's scalar C compile properties, including generic and
+active-configuration IPO settings, are refreshed in the final check. A project
+that adds the same source directory under multiple binary directories is
+unsupported because CMake's
 parent-directory property identifies the parent by source path.
+
+The probe replaces its directory-seeded include, definition, option, and
+feature properties with the consumer target's effective properties. This keeps
+directory properties added after consumer target creation from leaking into
+the probe's captured compiler arguments.
 
 The emitted contract preserves these values:
 

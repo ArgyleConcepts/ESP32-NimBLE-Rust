@@ -66,7 +66,7 @@ function(_argyle_nimble_reject_compile_launchers consumer probe)
 
     if(_argyle_has_custom_compile_launcher)
         message(FATAL_ERROR
-            "Build-context export cannot preserve custom CMake compile launchers (including ccache); disable RULE_LAUNCH_COMPILE at global, every target-directory ancestor, and target scope, and clear the consumer target's C_COMPILER_LAUNCHER")
+            "Build-context export cannot preserve custom CMake compile launchers (including ccache); disable RULE_LAUNCH_COMPILE at global scope, in each target directory and every ancestor directory, and on target scope, and clear the consumer target's C_COMPILER_LAUNCHER")
     endif()
 endfunction()
 
@@ -273,19 +273,21 @@ function(argyle_nimble_export_build_context)
     _argyle_nimble_reject_compile_launchers(
         "${ARG_CONSUMER_TARGET}" "${_argyle_probe_target}")
 
-    # Copy the consumer's private compile properties. CMake's corresponding
-    # TARGET_PROPERTY expressions include transitive usage requirements. Do
-    # not add a target_link_libraries edge: a consumer may depend on Cargo,
-    # while Cargo depends on this export target, which would form a cycle.
-    # TARGET_GENEX_EVAL resolves configured generator expressions in the
+    # Replace the probe's directory-seeded properties with the consumer's
+    # effective target properties. Appending with target_* commands would keep
+    # directory flags added after the consumer was created, even though the
+    # consumer never inherited them. The target-property expressions include
+    # transitive usage requirements; no target_link_libraries edge is needed,
+    # avoiding a cycle when the consumer depends on Cargo and Cargo depends on
+    # this export target. TARGET_GENEX_EVAL resolves expressions in the
     # consumer target's context.
-    target_include_directories("${_argyle_probe_target}" PRIVATE
+    set_property(TARGET "${_argyle_probe_target}" PROPERTY INCLUDE_DIRECTORIES
         "$<TARGET_GENEX_EVAL:${ARG_CONSUMER_TARGET},$<TARGET_PROPERTY:${ARG_CONSUMER_TARGET},INCLUDE_DIRECTORIES>>")
-    target_compile_definitions("${_argyle_probe_target}" PRIVATE
+    set_property(TARGET "${_argyle_probe_target}" PROPERTY COMPILE_DEFINITIONS
         "$<TARGET_GENEX_EVAL:${ARG_CONSUMER_TARGET},$<TARGET_PROPERTY:${ARG_CONSUMER_TARGET},COMPILE_DEFINITIONS>>")
-    target_compile_options("${_argyle_probe_target}" PRIVATE
+    set_property(TARGET "${_argyle_probe_target}" PROPERTY COMPILE_OPTIONS
         "$<TARGET_GENEX_EVAL:${ARG_CONSUMER_TARGET},$<TARGET_PROPERTY:${ARG_CONSUMER_TARGET},COMPILE_OPTIONS>>")
-    target_compile_features("${_argyle_probe_target}" PRIVATE
+    set_property(TARGET "${_argyle_probe_target}" PROPERTY COMPILE_FEATURES
         "$<TARGET_GENEX_EVAL:${ARG_CONSUMER_TARGET},$<TARGET_PROPERTY:${ARG_CONSUMER_TARGET},COMPILE_FEATURES>>")
 
     # Scalar properties do not accept generator expressions as their values.

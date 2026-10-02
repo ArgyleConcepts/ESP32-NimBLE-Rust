@@ -59,7 +59,9 @@ and invalid package contracts. Genuine C3/S3 binding generation and target
 configuration checks are later matrix work; no hardware verification is claimed.
 These runs do not configure a real ESP-IDF CMake consumer project; C3/S3 CMake
 exporter fixtures, including rejection of launchers set after component
-registration, are pending NIMBLERS-24.
+registration, are pending NIMBLERS-24. The CMake fixtures should also add
+`add_compile_options(-DARGYLE_LEAK)` after consumer target creation and before
+export, then verify that the probe capture excludes this directory-only define.
 
 ## Reports, artifacts, and isolation
 
