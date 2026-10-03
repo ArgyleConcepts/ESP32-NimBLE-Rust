@@ -178,16 +178,23 @@ fn run() -> Result<(), String> {
     if !clang_resource_dir.is_absolute() || !clang_resource_dir.is_dir() {
         return Err("selected Espressif clang resource directory is unavailable".to_owned());
     }
-    let bindgen_target =
+    let compiler_target =
         bindings::resolve_clang_target(&context).map_err(|error| error.to_string())?;
     let bindgen_arguments =
-        bindings::compiler_arguments(&context, &bindgen_target, &clang_resource_dir)
+        bindings::compiler_arguments(&context, &compiler_target, &clang_resource_dir)
             .map_err(|error| error.to_string())?;
     output_location
         .forbidden_roots
         .push(clang_resource_dir.clone());
     bindings::validate_cargo_output(&context, &output_location, &shim_header)
         .map_err(|error| error.to_string())?;
+    context
+        .verify_include_lookups_unchanged()
+        .map_err(|error| {
+            format!(
+                "an explicit compiler include lookup changed before binding generation; discard this context and re-export: {error}"
+            )
+        })?;
 
     // Resolve/validate every source, SDK, configuration, tool, and protected
     // registry root before removing a prior output or creating staging state.
@@ -210,13 +217,13 @@ fn run() -> Result<(), String> {
         &["--version"],
         "selected ESP-IDF C compiler",
     )?;
-    let compiler_target = query_tool(
+    let consumer_compiler_target = query_tool(
         &context.compiler,
         &["-dumpmachine"],
         "selected ESP-IDF C compiler",
     )?;
 
-    let include_paths = ordered_include_paths(&context);
+    let include_paths = ordered_include_watch_paths(&context);
     let watch_inputs = inputs::esp_generation_watch_inputs(
         &context,
         &manifest_dir,
@@ -242,6 +249,13 @@ fn run() -> Result<(), String> {
     let output = lifecycle::transactional_publish(
         &out_dir,
         |staging| {
+            context
+                .verify_include_lookups_unchanged()
+                .map_err(|error| {
+                    format!(
+                        "an explicit compiler include lookup changed before binding generation; discard this context and re-export: {error}"
+                    )
+                })?;
             let staged_output = bindings::OutputLocation {
                 directory: staging.to_path_buf(),
                 authorized_root: out_dir.clone(),
@@ -263,6 +277,13 @@ fn run() -> Result<(), String> {
                 .map_err(|error| {
                     format!(
                         "SDK response file changed during ESP binding generation; discard this context and re-export: {error}"
+                    )
+                })?;
+            context
+                .verify_include_lookups_unchanged()
+                .map_err(|error| {
+                    format!(
+                        "an explicit compiler include lookup changed during binding generation; discard this context and re-export: {error}"
                     )
                 })?;
             let headers = resolved_headers.borrow();
@@ -299,22 +320,17 @@ fn run() -> Result<(), String> {
                 }
                 config_inputs.push(identity);
             }
-            let ordered_search_paths = include_paths
-                .iter()
-                .map(|path| {
-                    path.canonicalize()
-                        .map(|path| path.display().to_string())
-                        .map_err(|_| {
-                            "a configured compiler include directory disappeared".to_owned()
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let ordered_search_paths = ordered_include_search_path_identities(&context)?;
             let source_inputs = inputs::generator_source_paths(&manifest_dir)
                 .iter()
                 .map(|path| canonical_content_identity(path))
                 .collect::<Result<Vec<_>, _>>()?;
             let tool_inputs = vec![
-                tool_identity(&context.compiler, &compiler_version, &compiler_target)?,
+                tool_identity(
+                    &context.compiler,
+                    &compiler_version,
+                    &consumer_compiler_target,
+                )?,
                 tool_identity(
                     &clang_path,
                     &clang_version,
@@ -367,7 +383,14 @@ fn run() -> Result<(), String> {
                     );
                     paths.sort();
                     paths.dedup();
-                    lifecycle::path_resolution_identities(&paths)?
+                    let mut resolutions = lifecycle::path_resolution_identities(&paths)?;
+                    resolutions.extend(
+                        context
+                            .include_lookups
+                            .iter()
+                            .map(lifecycle::IncludeLookupPath::identity),
+                    );
+                    resolutions
                 },
                 sdk: json!({
                     "version": context.sdk_version,
@@ -391,7 +414,8 @@ fn run() -> Result<(), String> {
                         "sha256": response.sha256,
                         "arguments": response.arguments,
                     })).collect::<Vec<_>>(),
-                    "translated_clang_target": bindgen_target,
+                    "translated_clang_target": compiler_target.bindgen_target,
+                    "effective_compiler_abi": compiler_target.effective_abi,
                     "bindgen_arguments": bindgen_arguments,
                     "ordered_include_search_paths": ordered_search_paths,
                     "tool_identity": tool_inputs,
@@ -539,11 +563,11 @@ fn selected_toolchain() -> Result<bindings::EspClangToolchain, String> {
     })
 }
 
-fn ordered_include_paths(context: &context::EspBuildContext) -> Vec<PathBuf> {
+fn ordered_include_watch_paths(context: &context::EspBuildContext) -> Vec<PathBuf> {
     context
-        .includes
+        .include_lookups
         .iter()
-        .map(|include| resolve_from(&context.working_directory, &include.path))
+        .map(|lookup| lookup.watch_directory().to_path_buf())
         .chain(
             context
                 .implicit_includes
@@ -552,6 +576,30 @@ fn ordered_include_paths(context: &context::EspBuildContext) -> Vec<PathBuf> {
         )
         .chain(std::iter::once(context.sysroot.clone()))
         .collect()
+}
+
+fn ordered_include_search_path_identities(
+    context: &context::EspBuildContext,
+) -> Result<Vec<String>, String> {
+    let mut paths = context
+        .include_lookups
+        .iter()
+        .map(|lookup| lookup.search_path_identity().display().to_string())
+        .collect::<Vec<_>>();
+    for path in context
+        .implicit_includes
+        .iter()
+        .map(|path| resolve_from(&context.working_directory, path))
+        .chain(std::iter::once(context.sysroot.clone()))
+    {
+        paths.push(
+            path.canonicalize()
+                .map_err(|_| "a required compiler include directory disappeared".to_owned())?
+                .display()
+                .to_string(),
+        );
+    }
+    Ok(paths)
 }
 
 fn relevant_environment(target: &str, chip: &str) -> Result<Value, String> {

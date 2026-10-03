@@ -16,6 +16,186 @@ const MANIFEST_TEMP_FILE: &str = ".nimble_bindings.manifest.json.tmp";
 pub(crate) const STAGING_DIRECTORY: &str = ".argyle-nimble-bindings-stage";
 pub(crate) const RERUN_SENTINEL: &str = ".argyle-nimble-header-watch";
 
+/// Filesystem state for one explicit compiler include lookup directory.
+/// Existing paths keep their canonical target. A genuinely absent path keeps
+/// both its lexical ancestor and the ancestor's canonical resolution so Cargo
+/// can watch for creation without treating the missing lookup as invalid.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IncludeLookupPath {
+    pub(crate) selected_path: PathBuf,
+    pub(crate) state: IncludeLookupState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum IncludeLookupState {
+    Present {
+        resolved_path: PathBuf,
+    },
+    Missing {
+        nearest_existing_path: PathBuf,
+        canonical_parent: PathBuf,
+        unresolved_suffix: PathBuf,
+    },
+}
+
+impl IncludeLookupPath {
+    /// The existing directory Cargo can recurse through for this lookup.
+    pub(crate) fn watch_directory(&self) -> &Path {
+        match &self.state {
+            IncludeLookupState::Present { .. } => &self.selected_path,
+            IncludeLookupState::Missing {
+                canonical_parent, ..
+            } => canonical_parent,
+        }
+    }
+
+    /// The effective search entry represented in the generation manifest.
+    pub(crate) fn search_path_identity(&self) -> &Path {
+        match &self.state {
+            IncludeLookupState::Present { resolved_path } => resolved_path,
+            IncludeLookupState::Missing { .. } => &self.selected_path,
+        }
+    }
+
+    pub(crate) fn is_missing(&self) -> bool {
+        matches!(&self.state, IncludeLookupState::Missing { .. })
+    }
+
+    /// Stable manifest evidence for the current lookup state and resolution.
+    pub(crate) fn identity(&self) -> Value {
+        match &self.state {
+            IncludeLookupState::Present { resolved_path } => json!({
+                "selected_path": self.selected_path.display().to_string(),
+                "state": "present",
+                "resolved_path": resolved_path.display().to_string(),
+            }),
+            IncludeLookupState::Missing {
+                nearest_existing_path,
+                canonical_parent,
+                unresolved_suffix,
+            } => json!({
+                "selected_path": self.selected_path.display().to_string(),
+                "state": "missing",
+                "nearest_existing_path": nearest_existing_path.display().to_string(),
+                "canonical_parent": canonical_parent.display().to_string(),
+                "unresolved_suffix": unresolved_suffix.display().to_string(),
+            }),
+        }
+    }
+}
+
+/// Resolve one compiler `-I`-family lookup path. Only a path that is
+/// genuinely absent is accepted; files, dangling symlinks, and inspection
+/// errors remain failures.
+pub(crate) fn resolve_include_lookup(
+    path: &Path,
+    working_directory: &Path,
+) -> Result<IncludeLookupPath, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_directory.join(path)
+    };
+    if !absolute.is_absolute() {
+        return Err(
+            "an explicit compiler include path did not resolve to an absolute path".to_owned(),
+        );
+    }
+    let selected_path = absolute;
+
+    let components = selected_path.components().collect::<Vec<_>>();
+    let mut prefix = PathBuf::new();
+    let mut nearest_existing_path = PathBuf::new();
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::Prefix(value) => prefix.push(value.as_os_str()),
+            std::path::Component::RootDir => prefix.push(component.as_os_str()),
+            std::path::Component::ParentDir | std::path::Component::Normal(_) => {
+                prefix.push(component.as_os_str());
+            }
+        }
+        let link_metadata = match fs::symlink_metadata(&prefix) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if nearest_existing_path.as_os_str().is_empty() {
+                    return Err(
+                        "an explicit compiler include path has no existing ancestor".to_owned()
+                    );
+                }
+                fs::read_dir(&nearest_existing_path).map_err(|_| {
+                    "the nearest existing compiler include directory is not readable".to_owned()
+                })?;
+                let canonical_parent = nearest_existing_path.canonicalize().map_err(|_| {
+                    "could not resolve the nearest existing compiler include directory".to_owned()
+                })?;
+                let mut unresolved_suffix = PathBuf::new();
+                for remaining in &components[index..] {
+                    unresolved_suffix.push(remaining.as_os_str());
+                }
+                return Ok(IncludeLookupPath {
+                    selected_path,
+                    state: IncludeLookupState::Missing {
+                        nearest_existing_path,
+                        canonical_parent,
+                        unresolved_suffix,
+                    },
+                });
+            }
+            Err(_) => return Err("could not inspect an explicit compiler include path".to_owned()),
+        };
+        let metadata = fs::metadata(&prefix).map_err(|error| {
+            if link_metadata.file_type().is_symlink()
+                && error.kind() == std::io::ErrorKind::NotFound
+            {
+                "an explicit compiler include path contains a dangling symlink".to_owned()
+            } else {
+                "could not inspect an explicit compiler include path".to_owned()
+            }
+        })?;
+        if !metadata.is_dir()
+            && components[index + 1..]
+                .iter()
+                .any(|component| !matches!(component, std::path::Component::CurDir))
+        {
+            return Err(
+                "an explicit compiler include path has a non-directory ancestor".to_owned(),
+            );
+        }
+        nearest_existing_path = prefix.clone();
+    }
+    present_include_lookup(
+        selected_path,
+        fs::symlink_metadata(&prefix)
+            .map_err(|_| "could not inspect an explicit compiler include path".to_owned())?,
+    )
+}
+
+fn present_include_lookup(
+    selected_path: PathBuf,
+    link_metadata: fs::Metadata,
+) -> Result<IncludeLookupPath, String> {
+    let metadata = fs::metadata(&selected_path).map_err(|error| {
+        if link_metadata.file_type().is_symlink() && error.kind() == std::io::ErrorKind::NotFound {
+            "an explicit compiler include path is a dangling symlink".to_owned()
+        } else {
+            "could not inspect an explicit compiler include path".to_owned()
+        }
+    })?;
+    if !metadata.is_dir() {
+        return Err("an explicit compiler include path must name a directory".to_owned());
+    }
+    fs::read_dir(&selected_path)
+        .map_err(|_| "an explicit compiler include directory is not readable".to_owned())?;
+    let resolved_path = selected_path
+        .canonicalize()
+        .map_err(|_| "could not resolve an explicit compiler include directory".to_owned())?;
+    Ok(IncludeLookupPath {
+        selected_path,
+        state: IncludeLookupState::Present { resolved_path },
+    })
+}
+
 /// Exact input axes stored by the Cargo build script for generated bindings.
 /// Keep construction centralized so tests exercise the same manifest contract
 /// that production publishes.

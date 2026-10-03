@@ -5,6 +5,7 @@
 //! or chooses a host ABI on its own.
 
 use crate::context::{EspBuildContext, IncludeKind};
+use crate::lifecycle::IncludeLookupState;
 use std::env;
 use std::ffi::CStr;
 use std::fmt;
@@ -138,6 +139,14 @@ pub struct EspClangToolchain {
     pub package_release: String,
 }
 
+/// Closed translation of the configured GCC target into the private bindgen
+/// target and any target ABI that GCC selected implicitly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompilerTarget {
+    pub(crate) bindgen_target: String,
+    pub(crate) effective_abi: Option<String>,
+}
+
 /// Existing directory that the caller designates for generated build output.
 /// The roots let the generator reject source, SDK, and Cargo registry paths.
 #[derive(Clone, Debug)]
@@ -207,8 +216,8 @@ fn generate_with_dependencies_inner(
     reject_bindgen_environment_overrides()?;
     validate_toolchain(toolchain)?;
     let clang_resource_dir = query_clang_resource_dir(&toolchain.clang)?;
-    let clang_target = resolve_clang_target(context)?;
-    let clang_args = compiler_arguments(context, &clang_target, &clang_resource_dir)?;
+    let compiler_target = resolve_clang_target(context)?;
+    let clang_args = compiler_arguments(context, &compiler_target, &clang_resource_dir)?;
     let header = crate_root().join(SHIM_HEADER);
     if !header.is_file() {
         return Err(error(
@@ -406,12 +415,12 @@ pub(crate) fn validate_required_items(
 
 pub(crate) fn compiler_arguments(
     context: &EspBuildContext,
-    clang_target: &str,
+    compiler_target: &CompilerTarget,
     clang_resource_dir: &Path,
 ) -> Result<Vec<String>, BindingError> {
     let stripped = strip_probe_action_arguments(context)?;
     let mut arguments = vec![
-        format!("--target={clang_target}"),
+        format!("--target={}", compiler_target.bindgen_target),
         "-x".into(),
         "c".into(),
         "-working-directory".into(),
@@ -512,6 +521,14 @@ pub(crate) fn compiler_arguments(
             .canonicalize()
             .map_err(|_| error("validated consumer compiler sysroot is unavailable"))?;
         arguments.push(format!("--sysroot={}", sysroot.display()));
+    }
+    if context.chip == "esp32c3"
+        && compiler_option_values(&context.compiler_arguments, "-mabi")?.is_empty()
+    {
+        let effective_abi = compiler_target.effective_abi.as_deref().ok_or_else(|| {
+            error("selected ESP32-C3 compiler target has no verified effective ABI")
+        })?;
+        arguments.push(format!("-mabi={effective_abi}"));
     }
     for path in &context.implicit_includes {
         arguments.push("-isystem".into());
@@ -760,7 +777,9 @@ fn concise_diagnostic(stderr: &[u8]) -> String {
         .to_owned()
 }
 
-pub(crate) fn resolve_clang_target(context: &EspBuildContext) -> Result<String, BindingError> {
+pub(crate) fn resolve_clang_target(
+    context: &EspBuildContext,
+) -> Result<CompilerTarget, BindingError> {
     let output = Command::new(&context.compiler)
         .arg("-dumpmachine")
         .current_dir(&context.working_directory)
@@ -777,14 +796,13 @@ pub(crate) fn resolve_clang_target(context: &EspBuildContext) -> Result<String, 
     let machine = std::str::from_utf8(&output.stdout)
         .map_err(|_| error("the selected C compiler returned a non-UTF-8 target triple"))?
         .trim();
-    let target = match (
+    let bindgen_target = match (
         context.chip.as_str(),
         context.architecture.as_str(),
         machine,
     ) {
         ("esp32c3", "riscv32", "riscv32-esp-elf") => {
             require_compiler_option_value(&context.compiler_arguments, "-march")?;
-            require_compiler_option_value(&context.compiler_arguments, "-mabi")?;
             "riscv32-esp-unknown-elf"
         }
         ("esp32s3", "xtensa", "xtensa-esp-elf") => {
@@ -802,7 +820,106 @@ pub(crate) fn resolve_clang_target(context: &EspBuildContext) -> Result<String, 
         }
         _ => return Err(error("unsupported ESP-IDF chip/architecture for bindings")),
     };
-    Ok(target.into())
+    let effective_abi = if context.chip == "esp32c3" {
+        for captured_abi in compiler_option_values(&context.compiler_arguments, "-mabi")? {
+            if captured_abi != "ilp32" {
+                return Err(error(
+                    "captured `-mabi` option conflicts with the supported ESP32-C3 ABI `ilp32`",
+                ));
+            }
+        }
+        let effective_abi = query_effective_compiler_abi(context)?;
+        if effective_abi != "ilp32" {
+            return Err(error(&format!(
+                "selected ESP32-C3 C compiler reports effective ABI `{effective_abi}`; expected `ilp32`"
+            )));
+        }
+        Some(effective_abi)
+    } else {
+        None
+    };
+    Ok(CompilerTarget {
+        bindgen_target: bindgen_target.into(),
+        effective_abi,
+    })
+}
+
+fn query_effective_compiler_abi(context: &EspBuildContext) -> Result<String, BindingError> {
+    context
+        .verify_response_files_unchanged()
+        .map_err(|context_error| {
+            error(&format!(
+                "SDK response file changed or failed validation before the compiler ABI query: {context_error}"
+            ))
+        })?;
+    let arguments = strip_probe_action_arguments(context)?
+        .into_iter()
+        .map(|(_, argument)| argument)
+        .collect::<Vec<_>>();
+    let output = Command::new(&context.compiler)
+        .args(arguments)
+        .args(["-Q", "--help=target"])
+        .current_dir(&context.working_directory)
+        .env_remove("CPATH")
+        .env_remove("C_INCLUDE_PATH")
+        .env_remove("CPLUS_INCLUDE_PATH")
+        .env_remove("OBJC_INCLUDE_PATH")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|_| error("could not query the selected C compiler's effective ABI"))?;
+    context
+        .verify_response_files_unchanged()
+        .map_err(|context_error| {
+            error(&format!(
+                "SDK response file changed during the compiler ABI query: {context_error}"
+            ))
+        })?;
+    if !output.status.success() {
+        let diagnostic = concise_diagnostic(&output.stderr);
+        return Err(if diagnostic.is_empty() {
+            error("the selected C compiler rejected the effective ABI query")
+        } else {
+            error(&format!(
+                "the selected C compiler rejected the effective ABI query:\n{diagnostic}"
+            ))
+        });
+    }
+    let target_options = std::str::from_utf8(&output.stdout)
+        .map_err(|_| error("the selected C compiler returned non-UTF-8 target options"))?;
+    parse_effective_compiler_abi(target_options)
+}
+
+/// Parse GCC's one effective `-mabi` value from `-Q --help=target` output.
+pub(crate) fn parse_effective_compiler_abi(target_options: &str) -> Result<String, BindingError> {
+    let mut effective_abi = None;
+    for line in target_options.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(option) = fields.next() else {
+            continue;
+        };
+        let Some(option_value) = option.strip_prefix("-mabi=") else {
+            continue;
+        };
+        let value = if !option_value.is_empty() && option_value != "ABI" {
+            option_value
+        } else {
+            fields.next().ok_or_else(|| {
+                error("the selected C compiler did not report an effective `-mabi` value")
+            })?
+        };
+        if value.is_empty() || value == "ABI" {
+            return Err(error(
+                "the selected C compiler did not report an effective `-mabi` value",
+            ));
+        }
+        if effective_abi.replace(value.to_owned()).is_some() {
+            return Err(error(
+                "the selected C compiler reported an ambiguous effective `-mabi` value",
+            ));
+        }
+    }
+    effective_abi
+        .ok_or_else(|| error("the selected C compiler did not report an effective `-mabi` value"))
 }
 
 fn validate_s3_cpu_option(arguments: &[String]) -> Result<(), BindingError> {
@@ -837,8 +954,17 @@ fn reject_bindgen_environment_overrides() -> Result<(), BindingError> {
 }
 
 fn require_compiler_option_value(arguments: &[String], option: &str) -> Result<(), BindingError> {
+    if !compiler_option_values(arguments, option)?.is_empty() {
+        return Ok(());
+    }
+    Err(error(&format!(
+        "captured compiler arguments are missing `{option}` for the ESP32-C3 target; regenerate the CMake context"
+    )))
+}
+
+fn compiler_option_values(arguments: &[String], option: &str) -> Result<Vec<String>, BindingError> {
     let inline = format!("{option}=");
-    let mut found = false;
+    let mut values = Vec::new();
     let mut index = 0;
     while index < arguments.len() {
         if arguments[index] == option {
@@ -850,27 +976,21 @@ fn require_compiler_option_value(arguments: &[String], option: &str) -> Result<(
                     "captured compiler option `{option}` has no value"
                 )));
             }
-            found = true;
+            values.push(value.clone());
             index += 2;
             continue;
         }
-        if arguments[index].starts_with(&inline) {
-            if arguments[index].len() == inline.len() {
+        if let Some(value) = arguments[index].strip_prefix(&inline) {
+            if value.is_empty() {
                 return Err(error(&format!(
                     "captured compiler option `{option}` has no value"
                 )));
             }
-            found = true;
+            values.push(value.to_owned());
         }
         index += 1;
     }
-    if found {
-        Ok(())
-    } else {
-        Err(error(&format!(
-            "captured compiler arguments are missing `{option}` for the ESP32-C3 target; regenerate the CMake context"
-        )))
-    }
+    Ok(values)
 }
 
 pub(crate) fn reject_bindgen_environment_overrides_from<I>(variables: I) -> Result<(), BindingError>
@@ -1124,6 +1244,20 @@ fn validate_output_inner(
             .iter()
             .map(|response| response.path.clone()),
     );
+    let mut lexical_include_lookup_paths = Vec::new();
+    for lookup in &context.include_lookups {
+        match &lookup.state {
+            IncludeLookupState::Present { .. } => {}
+            IncludeLookupState::Missing {
+                canonical_parent,
+                unresolved_suffix,
+                ..
+            } => {
+                lexical_include_lookup_paths.push(lookup.selected_path.clone());
+                lexical_include_lookup_paths.push(canonical_parent.join(unresolved_suffix));
+            }
+        }
+    }
     for source_root in [
         "src",
         "build_support",
@@ -1145,6 +1279,16 @@ fn validate_output_inner(
             error("a protected source, SDK, header, or Cargo registry path is unavailable")
         })?;
         if paths_overlap(&directory, &canonical) {
+            return Err(error(
+                "binding output directory overlaps a protected source, SDK, header, or Cargo registry path",
+            ));
+        }
+    }
+    for selected_path in lexical_include_lookup_paths {
+        let selected_path = normalize_absolute_lexical_path(&selected_path).ok_or_else(|| {
+            error("a missing compiler include lookup path is not an absolute path")
+        })?;
+        if paths_overlap(&directory, &selected_path) {
             return Err(error(
                 "binding output directory overlaps a protected source, SDK, header, or Cargo registry path",
             ));
@@ -1282,6 +1426,25 @@ fn resolve_path_from(directory: &Path, value: &Path) -> PathBuf {
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left.starts_with(right) || right.starts_with(left)
+}
+
+fn normalize_absolute_lexical_path(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Some(normalized)
 }
 
 fn regex_escape(value: &str) -> String {

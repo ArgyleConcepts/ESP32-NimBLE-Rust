@@ -73,10 +73,19 @@ The emitted contract preserves these values:
 | `compiler.path`, `compiler.sysroot`, `compiler.working_directory` | The selected compiler invocation and its effective sysroot. Relative sysroot arguments are resolved from the captured working directory. |
 | `compiler.arguments` | Effective ordered compiler arguments after the single approved IDF `toolchain/cflags` response token has been replaced by parsed tokens. |
 | `compiler.captured_arguments`, `compiler.response_files` | Raw argv with the exact response token and its canonical path, SHA-256 digest, parsed tokens, and argv index. Other or nested response files are rejected. |
-| `compiler.includes`, `compiler.defines` | Ordered include and define/undefine events derived from the authoritative argv, with argument indexes that are checked against it. |
+| `compiler.includes`, `compiler.defines` | Ordered include and define/undefine events derived from the authoritative argv, with argument indexes that are checked against it. Explicit include lookup directories may be genuinely absent; implicit compiler includes, the sysroot, SDK, configuration, and tool paths must exist. |
 | `compiler.implicit_includes` | Ordered implicit include directories reported by CMake for the selected compiler. |
 | `compiler.build_configuration` | The selected single-config name; an empty string is retained when CMake has no named configuration. Multi-config generators are rejected. |
 | `configuration.sdkconfig`, `configuration.generated_headers`, `configuration.version_header` | ESP-IDF's active `SDKCONFIG`, `SDKCONFIG_HEADER`, and configured version header. |
+
+Some ESP-IDF components declare public `-I` lookup directories that are absent
+for a target, while GCC still accepts and preserves those search entries. The
+exporter retains their exact ordered argv tokens and accepts only a genuine
+missing-path lookup with an existing directory ancestor. A file in place of a
+directory, dangling symlink, or inspection error remains a configuration
+failure. Cargo watches the nearest existing parent and records whether the
+lookup is present or missing so later creation/removal changes generation
+identity. Implicit compiler include directories remain required inputs.
 
 The validator checks readable input files and directories, ESP-IDF 6.1.x,
 C3/S3 architecture pairing, agreement between the Cargo target and ESP target,
@@ -85,6 +94,14 @@ headers. Both config sources must enable `CONFIG_BT_ENABLED` and
 `CONFIG_BT_NIMBLE_ENABLED`. The generated version header must agree with the
 reported SDK version. Diagnostics identify the rejected field and corrective
 setup without printing the full context or inherited environment.
+
+For a consumer configuration matching the supported initial baseline, set
+`CONFIG_LIBC_NEWLIB=y` in `sdkconfig.defaults` and reconfigure with `idf.py`
+before exporting context. The C3/S3 matrix fixtures use this setting and
+assert it in both `sdkconfig` and `sdkconfig.h`. ESP-IDF's default Picolibc
+setup adds GCC `-specs` tool-selection flags, which this contract rejects with
+guidance to select Newlib for the supported baseline. Picolibc and other libc
+configurations are not included in the validated generation scope.
 
 The context file contains absolute local paths and compiler arguments from the
 consumer build. Treat it as a local build artifact and review it before sharing;

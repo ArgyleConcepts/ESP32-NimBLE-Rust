@@ -59,6 +59,65 @@ class CompilerExportTests(unittest.TestCase):
             with self.subTest(arguments=arguments), self.assertRaisesRegex(ValueError, message):
                 export_build_context.compile_events(arguments, "/tmp")
 
+    def test_include_lookup_accepts_only_genuine_missing_directories(self):
+        with tempfile.TemporaryDirectory(prefix="argyle include lookup ") as temporary:
+            root = Path(temporary)
+            component = root / "component"
+            component.mkdir()
+            absent = component / "port" / "include"
+            self.assertEqual(
+                export_build_context.validate_include_lookup(str(absent), temporary), "missing"
+            )
+            includes, _ = export_build_context.compile_events([f"-I{absent}"], temporary)
+            self.assertEqual(includes[0]["path"], str(absent))
+
+            absent.mkdir(parents=True)
+            self.assertEqual(
+                export_build_context.validate_include_lookup(str(absent), temporary), "present"
+            )
+
+            existing = component / "existing"
+            existing.mkdir()
+            absent_before_parent = component / "not-created" / ".." / "existing"
+            self.assertEqual(
+                export_build_context.validate_include_lookup(str(absent_before_parent), temporary),
+                "missing",
+            )
+            includes, _ = export_build_context.compile_events(
+                ["-I", str(absent_before_parent)], temporary
+            )
+            self.assertEqual(includes[0]["path"], str(absent_before_parent))
+            (component / "not-created").mkdir()
+            self.assertEqual(
+                export_build_context.validate_include_lookup(str(absent_before_parent), temporary),
+                "present",
+            )
+
+            file_path = root / "not-a-directory"
+            file_path.write_text("file", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "non-directory.*not-a-directory"):
+                export_build_context.validate_include_lookup(str(file_path), temporary)
+            with self.assertRaisesRegex(ValueError, "could not inspect.*not-a-directory"):
+                export_build_context.validate_include_lookup(str(file_path / "include"), temporary)
+            with mock.patch.object(export_build_context.os, "scandir", side_effect=PermissionError):
+                with self.assertRaisesRegex(ValueError, "could not inspect.*component"):
+                    export_build_context.validate_include_lookup(str(component), temporary)
+
+            dangling = component / "dangling"
+            dangling.symlink_to(component / "missing-target")
+            with self.assertRaisesRegex(ValueError, "dangling symlink"):
+                export_build_context.validate_include_lookup(str(dangling), temporary)
+
+            dangling_after_absent = component / "not-created" / ".." / "dangling"
+            (component / "not-created").rmdir()
+            self.assertEqual(
+                export_build_context.validate_include_lookup(str(dangling_after_absent), temporary),
+                "missing",
+            )
+            (component / "not-created").mkdir()
+            with self.assertRaisesRegex(ValueError, "dangling symlink"):
+                export_build_context.validate_include_lookup(str(dangling_after_absent), temporary)
+
     def test_sysroot_rejects_empty_joined_value(self):
         with self.assertRaisesRegex(ValueError, "--sysroot= has an empty sysroot value"):
             export_build_context.query_sysroot("/compiler", ["--sysroot="], "/tmp")
@@ -311,8 +370,14 @@ class CompilerExportTests(unittest.TestCase):
             (b"-c", "unsupported compiler action/input flag"),
             (b"-o object.o", "unsupported compiler output/dependency flag"),
             (b"-B/toolchain", "unsupported compiler tool-selection flag"),
-            (b"-specs=other.specs", "unsupported compiler tool-selection flag"),
-            (b"--specs=other.specs", "unsupported compiler tool-selection flag"),
+            (
+                b"-specs=other.specs",
+                "unsupported compiler tool-selection flag.*CONFIG_LIBC_NEWLIB=y",
+            ),
+            (
+                b"--specs=other.specs",
+                "unsupported compiler tool-selection flag.*CONFIG_LIBC_NEWLIB=y",
+            ),
             (b"-wrapper=wrapper", "unsupported compiler tool-selection flag"),
             (b"-xlanguage", "unsupported compiler tool-selection flag"),
             (b"--target=other-target", "unsupported compiler tool-selection flag"),

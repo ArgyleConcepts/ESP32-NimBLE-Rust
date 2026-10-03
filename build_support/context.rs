@@ -3,6 +3,7 @@
 //! Keep this module independent of Cargo build-script state so the host-side
 //! fixture driver and future Cargo integration can apply the same validation.
 
+use crate::lifecycle::{self, IncludeLookupPath};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -40,6 +41,8 @@ pub struct EspBuildContext {
     pub response_files: Vec<CompilerResponseFile>,
     /// Ordered include paths found in `compiler_arguments`.
     pub includes: Vec<IncludePath>,
+    /// Current present/missing resolution for every explicit compiler include.
+    pub include_lookups: Vec<IncludeLookupPath>,
     /// Compiler-provided include paths reported by CMake in search order.
     pub implicit_includes: Vec<PathBuf>,
     /// Ordered define/undefine events found in `compiler_arguments`.
@@ -296,12 +299,20 @@ fn validate_context(value: &Value) -> Result<EspBuildContext, ContextError> {
         &compiler_arguments,
     )?;
     let includes = parse_includes(compiler_object, &compiler_arguments)?;
+    let include_lookups = includes
+        .iter()
+        .enumerate()
+        .map(|(index, include)| {
+            lifecycle::resolve_include_lookup(&include.path, &working_directory)
+                .map_err(|error| field_error(&format!("compiler.includes[{index}]"), &error))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let implicit_includes = required_path_array(compiler_object, "implicit_includes", "compiler")?;
     for (index, path) in implicit_includes.iter().enumerate() {
         require_directory(path, &format!("compiler.implicit_includes[{index}]"))?;
     }
     let defines = parse_defines(compiler_object, &compiler_arguments)?;
-    validate_argument_events(&compiler_arguments, &includes, &defines, &working_directory)?;
+    validate_argument_events(&compiler_arguments, &includes, &defines)?;
     validate_explicit_sysroot(&compiler_arguments, &sysroot, &working_directory)?;
 
     let configuration = required_object(object, "configuration", "contract")?;
@@ -345,6 +356,7 @@ fn validate_context(value: &Value) -> Result<EspBuildContext, ContextError> {
         captured_compiler_arguments,
         response_files,
         includes,
+        include_lookups,
         implicit_includes,
         defines,
         sdkconfig,
@@ -363,6 +375,30 @@ impl EspBuildContext {
             &self.compiler_arguments,
             &self.response_files,
         )
+    }
+
+    /// Reject a directory appearing, disappearing, or resolving through a
+    /// different symlink after this CMake context was captured.
+    pub fn verify_include_lookups_unchanged(&self) -> Result<(), ContextError> {
+        if self.includes.len() != self.include_lookups.len() {
+            return Err(field_error(
+                "compiler.includes",
+                "lookup state no longer matches captured include options; re-export the CMake context",
+            ));
+        }
+        for (index, (include, captured)) in
+            self.includes.iter().zip(&self.include_lookups).enumerate()
+        {
+            let current = lifecycle::resolve_include_lookup(&include.path, &self.working_directory)
+                .map_err(|error| field_error(&format!("compiler.includes[{index}]"), &error))?;
+            if &current != captured {
+                return Err(field_error(
+                    &format!("compiler.includes[{index}]"),
+                    "lookup directory appeared, disappeared, or changed resolution during binding generation; rerun CMake context export",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1006,7 +1042,6 @@ fn validate_argument_events(
     arguments: &[String],
     includes: &[IncludePath],
     defines: &[DefineEvent],
-    working_directory: &Path,
 ) -> Result<(), ContextError> {
     let mut expected_includes = Vec::new();
     let mut expected_defines = Vec::new();
@@ -1104,14 +1139,6 @@ fn validate_argument_events(
             "compiler.defines",
             "must contain every define/undefine option from compiler.arguments in the same order",
         ));
-    }
-    for include in includes {
-        let effective_path = if include.path.is_absolute() {
-            include.path.clone()
-        } else {
-            working_directory.join(&include.path)
-        };
-        require_directory(&effective_path, "compiler.includes")?;
     }
     Ok(())
 }

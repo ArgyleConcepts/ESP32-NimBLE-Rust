@@ -86,7 +86,15 @@ def _validate_response_flags(arguments: list[str]) -> None:
                 "--target", "--gcc-toolchain", "-fuse-ld",
             ))
         ):
-            raise ValueError(f"response file contains unsupported compiler tool-selection flag {argument}")
+            guidance = (
+                "; select CONFIG_LIBC_NEWLIB=y for the supported ESP-IDF matrix baseline; "
+                "custom GCC specs are not supported"
+                if argument.startswith(("-specs", "--specs"))
+                else ""
+            )
+            raise ValueError(
+                f"response file contains unsupported compiler tool-selection flag {argument}{guidance}"
+            )
         if argument in {
             "-o", "-MF", "-MT", "-MQ", "--output", "--dependency-file",
             "-dependency-file",

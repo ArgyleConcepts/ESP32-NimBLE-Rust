@@ -516,6 +516,34 @@ def retain_file_input(runner: MatrixRunner, chip: str, step: str, input_path: Pa
     return digest
 
 
+def retain_export_failure_inputs(
+    runner: MatrixRunner,
+    chip: str,
+    step: str,
+    context_path: Path,
+    build: Path,
+    project: Path,
+) -> None:
+    candidates = {
+        "compiler_capture": build / "argyle-nimble" / "compiler-capture.json",
+        "response_file": build / "toolchain" / "cflags",
+        "sdkconfig": project / "sdkconfig",
+        "sdkconfig_header": build / "config" / "sdkconfig.h",
+        "previous_context": context_path,
+    }
+    evidence = {}
+    for name, path in candidates.items():
+        if path.is_file():
+            evidence[name] = retain_file_input(runner, chip, step, path)
+        else:
+            evidence[name] = None
+    runner.values.setdefault("matrix", {}).setdefault("export_failure_inputs", []).append({
+        "name": step,
+        "sha256": evidence,
+        "retained_evidence": f"inputs/{chip}/{step}",
+    })
+
+
 def configured_response_input(context_path: Path) -> tuple[dict, Path]:
     context = read_json(context_path)
     compiler = context.get("compiler", {})
@@ -1042,12 +1070,18 @@ def matrix(
         )
         context_path = build / "argyle-nimble" / "build-context-v1.json"
         context_paths[enabled] = context_path
-        runner.command(
-            f"{chip}-{label}-export-context",
-            [args.cmake, "--build", build, "--target", "argyle_nimble_export_context", "--verbose"],
-            cwd=project,
-            env={**common_env, "ARGYLE_MATRIX_FLAG_VALUE": "17"},
-        )
+        try:
+            runner.command(
+                f"{chip}-{label}-export-context",
+                [args.cmake, "--build", build, "--target", "argyle_nimble_export_context", "--verbose"],
+                cwd=project,
+                env={**common_env, "ARGYLE_MATRIX_FLAG_VALUE": "17"},
+            )
+        except MatrixError:
+            retain_export_failure_inputs(
+                runner, chip, f"{label}-export-context-failure", context_path, build, project,
+            )
+            raise
         context = read_json(context_path)
         runner.check(
             f"{chip}-{label}-actual-configured-compiler",

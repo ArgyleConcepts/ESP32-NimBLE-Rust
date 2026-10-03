@@ -84,6 +84,13 @@ a loose-ref checkout or the pointer for an uninitialized submodule) as dirty
 on each invocation until it appears. Those layouts rerun the build script
 repeatedly; the watch avoids recursively scanning the SDK's Git object database.
 
+The generator preserves explicit include lookup paths even when the selected
+ESP-IDF component declares a directory that is absent for that target. It
+watches the nearest existing parent and records present-versus-missing lookup
+resolution in the manifest, so directory creation or removal changes the
+generation identity. Missing SDK, implicit compiler, configuration, or tool
+inputs still fail validation.
+
 ## Toolchain and compiler inputs
 
 The selector must name Espressif's `esp-clang` and `libclang` package

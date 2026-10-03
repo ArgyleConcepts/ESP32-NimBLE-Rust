@@ -4,6 +4,8 @@
 mod bindings;
 #[path = "../build_support/context.rs"]
 mod context;
+#[path = "../build_support/lifecycle.rs"]
+mod lifecycle;
 
 use bindings::{Allowlist, OutputLocation};
 use context::{
@@ -26,6 +28,13 @@ const HOST_DEPENDENCIES_ENV: &str = "ARGYLE_NIMBLE_BINDGEN_HOST_FIXTURE_DEPENDEN
 struct Fixture {
     root: PathBuf,
     context: EspBuildContext,
+}
+
+fn c3_compiler_target() -> bindings::CompilerTarget {
+    bindings::CompilerTarget {
+        bindgen_target: "riscv32-esp-unknown-elf".into(),
+        effective_abi: Some("ilp32".into()),
+    }
 }
 
 impl Fixture {
@@ -115,6 +124,10 @@ impl Fixture {
         let response_token = format!("@{}", response_path.display());
         let mut captured_compiler_arguments = vec![response_token.clone()];
         captured_compiler_arguments.extend(compiler_arguments.iter().skip(3).cloned());
+        let include_lookups = vec![
+            lifecycle::resolve_include_lookup(&include_one, &working_directory).unwrap(),
+            lifecycle::resolve_include_lookup(&include_two, &working_directory).unwrap(),
+        ];
 
         Self {
             root,
@@ -143,6 +156,7 @@ impl Fixture {
                         "-DSTART_BEFORE_ACTION=1".into(),
                     ],
                 }],
+                include_lookups,
                 includes: vec![
                     IncludePath {
                         kind: IncludeKind::Normal,
@@ -192,15 +206,37 @@ fn write_fake_compiler(path: &Path, fail_syntax_check: bool) {
 }
 
 fn write_fake_compiler_for(path: &Path, fail_syntax_check: bool, machine: &str) {
-    let success_script = format!(
-        "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"-dumpmachine\" ]; then echo {machine}; exit 0; fi\ndone\nexit 0\n"
-    );
-    let script = if fail_syntax_check {
-        "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"-fsyntax-only\" ]; then echo 'error: fixture missing SDK member' >&2; exit 19; fi\ndone\nexit 0\n"
-            .to_owned()
+    write_fake_compiler_with_abi(path, fail_syntax_check, machine, "ilp32", false, None);
+}
+
+fn write_fake_compiler_with_abi(
+    path: &Path,
+    fail_syntax_check: bool,
+    machine: &str,
+    effective_abi: &str,
+    fail_abi_query: bool,
+    argument_log: Option<&Path>,
+) {
+    let query_log = argument_log.map_or_else(String::new, |log| {
+        format!("printf '%s\\n' \"$@\" > {}\n", shell_single_quote(log))
+    });
+    let abi_query = if fail_abi_query {
+        "echo 'effective ABI fixture query failed' >&2; exit 23".to_owned()
     } else {
-        success_script
+        format!(
+            "printf '  -mabi=ABI                    {}\\n'\nexit 0",
+            shell_single_quote_value(effective_abi)
+        )
     };
+    let syntax_check = if fail_syntax_check {
+        "if [ \"$arg\" = \"-fsyntax-only\" ]; then echo 'error: fixture missing SDK member' >&2; exit 19; fi\n"
+    } else {
+        ""
+    };
+    let script = format!(
+        "#!/bin/sh\nis_abi_query=0\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"-Q\" ]; then is_abi_query=1; fi\ndone\nif [ \"$is_abi_query\" = \"1\" ]; then\n  {query_log}  {abi_query}\nfi\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"-dumpmachine\" ]; then printf '%s\\n' {}; exit 0; fi\n  {syntax_check}done\nexit 0\n",
+        shell_single_quote_value(machine)
+    );
     fs::write(path, script).unwrap();
     #[cfg(unix)]
     {
@@ -209,13 +245,21 @@ fn write_fake_compiler_for(path: &Path, fail_syntax_check: bool, machine: &str) 
     }
 }
 
+fn shell_single_quote(path: &Path) -> String {
+    shell_single_quote_value(&path.to_string_lossy())
+}
+
+fn shell_single_quote_value(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 #[test]
 fn compiler_arguments_preserve_order_and_original_include_indices() {
     let fixture = Fixture::new();
     let resource_dir = fixture.root.join("selected clang/resource dir");
     fs::create_dir_all(resource_dir.join("include")).unwrap();
     let arguments =
-        bindings::compiler_arguments(&fixture.context, "riscv32-esp-unknown-elf", &resource_dir)
+        bindings::compiler_arguments(&fixture.context, &c3_compiler_target(), &resource_dir)
             .unwrap();
 
     let start = arguments
@@ -292,7 +336,7 @@ fn explicit_sysroot_forms_must_match_the_validated_context() {
     inline.compiler_arguments.remove(sysroot_index + 1);
     let arguments = bindings::compiler_arguments(
         &inline,
-        "riscv32-esp-unknown-elf",
+        &c3_compiler_target(),
         &fixture.root.join("clang resource"),
     )
     .unwrap();
@@ -311,7 +355,7 @@ fn explicit_sysroot_forms_must_match_the_validated_context() {
     mismatch.compiler_arguments[operand_index] = wrong_sysroot.display().to_string();
     let error = bindings::compiler_arguments(
         &mismatch,
-        "riscv32-esp-unknown-elf",
+        &c3_compiler_target(),
         &fixture.root.join("clang resource"),
     )
     .unwrap_err();
@@ -324,7 +368,7 @@ fn explicit_sysroot_forms_must_match_the_validated_context() {
     inline_include_mismatch.compiler_arguments[include_index] = "-I/unreviewed".into();
     assert!(bindings::compiler_arguments(
         &inline_include_mismatch,
-        "riscv32-esp-unknown-elf",
+        &c3_compiler_target(),
         &fixture.root.join("clang resource"),
     )
     .unwrap_err()
@@ -487,6 +531,52 @@ fn output_authority_allows_cargo_dirs_in_build_and_include_roots() {
             .to_string()
             .contains("protected source, SDK")
     );
+}
+
+#[test]
+fn output_authority_protects_missing_include_lookups_but_allows_sibling_out() {
+    let fixture = Fixture::new();
+    let header = fixture.root.join("source crate/src/backend/nimble_shim.h");
+    fs::create_dir_all(header.parent().unwrap()).unwrap();
+    fs::write(&header, "/* protected shim */\n").unwrap();
+    fs::write(
+        fixture.root.join("source crate/src/backend/nimble_shim.c"),
+        "/* shim */\n",
+    )
+    .unwrap();
+
+    let lookup_parent = fixture.root.join("compiler lookup tree");
+    fs::create_dir_all(&lookup_parent).unwrap();
+    let selected_lookup = lookup_parent.join("missing headers/nested");
+    let lookup =
+        lifecycle::resolve_include_lookup(&selected_lookup, &fixture.context.working_directory)
+            .unwrap();
+    assert!(lookup.is_missing());
+    let mut context = fixture.context.clone();
+    context.include_lookups.push(lookup);
+
+    let sibling_output = lookup_parent.join("sibling cargo out");
+    fs::create_dir_all(&sibling_output).unwrap();
+    let sibling = OutputLocation {
+        directory: sibling_output.clone(),
+        authorized_root: sibling_output,
+        crate_root: fixture.root.join("source crate"),
+        forbidden_roots: Vec::new(),
+    };
+    assert!(bindings::validate_output(&context, &sibling, &header).is_ok());
+
+    let overlap_output = selected_lookup.join("cargo out");
+    fs::create_dir_all(&overlap_output).unwrap();
+    let overlap = OutputLocation {
+        directory: overlap_output.clone(),
+        authorized_root: overlap_output,
+        crate_root: fixture.root.join("source crate"),
+        forbidden_roots: Vec::new(),
+    };
+    assert!(bindings::validate_output(&context, &overlap, &header)
+        .unwrap_err()
+        .to_string()
+        .contains("overlaps a protected source, SDK, header, or Cargo registry path"));
 }
 
 #[test]
@@ -730,21 +820,127 @@ fn exact_clang_version_and_explicit_tool_selection_fail_closed() {
 }
 
 #[test]
-fn compiler_target_translation_is_closed_and_requires_c3_abi_options() {
+fn compiler_target_translation_resolves_and_forwards_effective_c3_abi() {
     let fixture = Fixture::new();
     assert_eq!(
-        bindings::resolve_clang_target(&fixture.context).unwrap(),
-        "riscv32-esp-unknown-elf"
+        bindings::parse_effective_compiler_abi("  -mabi=ABI                    ilp32\n").unwrap(),
+        "ilp32"
+    );
+    assert!(bindings::parse_effective_compiler_abi(
+        "  -mabi=ABI                    ilp32\n  -mabi=ABI                    lp64\n"
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("ambiguous effective `-mabi`"));
+    let explicit = bindings::resolve_clang_target(&fixture.context).unwrap();
+    assert_eq!(explicit.bindgen_target, "riscv32-esp-unknown-elf");
+    assert_eq!(explicit.effective_abi.as_deref(), Some("ilp32"));
+    let explicit_clang_arguments = bindings::compiler_arguments(
+        &fixture.context,
+        &explicit,
+        &fixture.root.join("clang resource"),
+    )
+    .unwrap();
+    assert_eq!(
+        explicit_clang_arguments
+            .iter()
+            .filter(|argument| argument.as_str() == "-mabi=ilp32")
+            .count(),
+        1
     );
 
-    let mut missing_mabi = fixture.context.clone();
-    missing_mabi
+    let argument_log = fixture.root.join("effective ABI query args.txt");
+    let default_abi = context_without_mabi(&fixture.context);
+    write_fake_compiler_with_abi(
+        &default_abi.compiler,
+        false,
+        "riscv32-esp-elf",
+        "ilp32",
+        false,
+        Some(&argument_log),
+    );
+    let derived = bindings::resolve_clang_target(&default_abi).unwrap();
+    assert_eq!(derived.effective_abi.as_deref(), Some("ilp32"));
+    let query_arguments = fs::read_to_string(argument_log).unwrap();
+    assert!(query_arguments
+        .lines()
+        .any(|argument| argument == "-march=rv32imc_zicsr_zifencei"));
+    assert!(query_arguments.lines().any(|argument| argument == "-Q"));
+    assert!(query_arguments
+        .lines()
+        .any(|argument| argument == "--help=target"));
+    for removed in [
+        "-mabi",
+        "-mabi=ilp32",
+        "-c",
+        "argyle-nimble/context_probe.c",
+        "-o",
+        "-MMD",
+        "-MF",
+        "-MT",
+    ] {
+        assert!(!query_arguments.lines().any(|argument| argument == removed));
+    }
+    let clang_arguments =
+        bindings::compiler_arguments(&default_abi, &derived, &fixture.root.join("clang resource"))
+            .unwrap();
+    assert!(clang_arguments
+        .iter()
+        .any(|argument| argument == "-mabi=ilp32"));
+    assert!(!default_abi
         .compiler_arguments
-        .retain(|argument| !argument.starts_with("-mabi"));
-    assert!(bindings::resolve_clang_target(&missing_mabi)
+        .iter()
+        .any(|argument| argument == "-mabi=ilp32"));
+
+    let wrong_abi = context_without_mabi(&fixture.context);
+    write_fake_compiler_with_abi(
+        &wrong_abi.compiler,
+        false,
+        "riscv32-esp-elf",
+        "ilp32e",
+        false,
+        None,
+    );
+    assert!(bindings::resolve_clang_target(&wrong_abi)
         .unwrap_err()
         .to_string()
-        .contains("missing `-mabi`"));
+        .contains("effective ABI `ilp32e`; expected `ilp32`"));
+
+    let failed_query = context_without_mabi(&fixture.context);
+    write_fake_compiler_with_abi(
+        &failed_query.compiler,
+        false,
+        "riscv32-esp-elf",
+        "ilp32",
+        true,
+        None,
+    );
+    let query_error = bindings::resolve_clang_target(&failed_query)
+        .unwrap_err()
+        .to_string();
+    assert!(query_error.contains("rejected the effective ABI query"));
+    assert!(query_error.contains("effective ABI fixture query failed"));
+
+    let mut conflicting_explicit = fixture.context.clone();
+    let mabi_index = conflicting_explicit
+        .compiler_arguments
+        .iter()
+        .position(|argument| argument.starts_with("-mabi="))
+        .unwrap();
+    conflicting_explicit.compiler_arguments[mabi_index] = "-mabi=ilp32e".into();
+    assert!(bindings::resolve_clang_target(&conflicting_explicit)
+        .unwrap_err()
+        .to_string()
+        .contains("conflicts with the supported ESP32-C3 ABI `ilp32`"));
+
+    let mut missing_march = context_without_mabi(&fixture.context);
+    missing_march
+        .compiler_arguments
+        .retain(|argument| !argument.starts_with("-march"));
+    assert!(bindings::resolve_clang_target(&missing_march)
+        .unwrap_err()
+        .to_string()
+        .contains("missing `-march`"));
 
     let mut s3 = fixture.context.clone();
     s3.chip = "esp32s3".into();
@@ -752,10 +948,9 @@ fn compiler_target_translation_is_closed_and_requires_c3_abi_options() {
     let s3_compiler = fixture.root.join("toolchain bin/selected S3 C compiler");
     write_fake_compiler_for(&s3_compiler, false, "xtensa-esp-elf");
     s3.compiler = s3_compiler;
-    assert_eq!(
-        bindings::resolve_clang_target(&s3).unwrap(),
-        "xtensa-esp-unknown-elf"
-    );
+    let s3_target = bindings::resolve_clang_target(&s3).unwrap();
+    assert_eq!(s3_target.bindgen_target, "xtensa-esp-unknown-elf");
+    assert_eq!(s3_target.effective_abi, None);
     s3.compiler_arguments.push("-mcpu=esp32".into());
     assert!(bindings::resolve_clang_target(&s3)
         .unwrap_err()
@@ -770,6 +965,26 @@ fn compiler_target_translation_is_closed_and_requires_c3_abi_options() {
         .unwrap_err()
         .to_string()
         .contains("does not match the configured ESP32 chip"));
+}
+
+fn context_without_mabi(context: &EspBuildContext) -> EspBuildContext {
+    let mut context = context.clone();
+    context
+        .compiler_arguments
+        .retain(|argument| !argument.starts_with("-mabi"));
+    context.response_files.clear();
+    context.captured_compiler_arguments = context.compiler_arguments.clone();
+    for include in &mut context.includes {
+        if include.argument_index > 1 {
+            include.argument_index -= 1;
+        }
+    }
+    for define in &mut context.defines {
+        if define.argument_index > 1 {
+            define.argument_index -= 1;
+        }
+    }
+    context
 }
 
 #[test]

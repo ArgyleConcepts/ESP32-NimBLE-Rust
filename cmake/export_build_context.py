@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 
@@ -124,12 +125,45 @@ def compile_events(arguments: list[str], working_directory: str) -> tuple[list[d
         index += 1
 
     for include in includes:
-        include_path = Path(include["path"])
-        if not include_path.is_absolute():
-            include_path = Path(working_directory) / include_path
-        if not include_path.is_dir():
-            fail("compiler.includes", "contains an include directory that is unavailable after CMake configuration")
+        validate_include_lookup(include["path"], working_directory)
     return includes, defines
+
+
+def validate_include_lookup(path: str, working_directory: str) -> str:
+    """Allow only genuinely absent include directories; reject invalid lookups."""
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = Path(working_directory) / candidate
+    probe = candidate
+    while True:
+        try:
+            metadata = probe.stat()
+        except FileNotFoundError:
+            try:
+                probe.lstat()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                fail("compiler.includes", f"could not inspect include lookup path {candidate}")
+            else:
+                fail("compiler.includes", f"include lookup path contains a dangling symlink: {candidate}")
+            parent = probe.parent
+            if parent == probe:
+                fail("compiler.includes", f"could not find a directory parent for include lookup path {candidate}")
+            probe = parent
+            continue
+        except OSError:
+            fail("compiler.includes", f"could not inspect include lookup path {candidate}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            fail("compiler.includes", f"include lookup path resolves to a non-directory: {candidate}")
+        try:
+            with os.scandir(probe):
+                pass
+        except OSError:
+            fail("compiler.includes", f"could not inspect include lookup path {candidate}")
+        if probe == candidate:
+            return "present"
+        return "missing"
 
 
 def query_sysroot(compiler: str, arguments: list[str], working_directory: str) -> str:

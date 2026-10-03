@@ -2,6 +2,8 @@
 
 #[path = "../build_support/context.rs"]
 mod context;
+#[path = "../build_support/lifecycle.rs"]
+mod lifecycle;
 
 use context::{BuildContext, DefineOperation, IncludeKind};
 use serde_json::{json, Value};
@@ -170,6 +172,33 @@ impl Fixture {
         self.root.join(relative)
     }
 
+    fn set_include_path(&self, value: &mut Value, include_index: usize, path: &Path) {
+        let event = value["compiler"]["includes"][include_index].clone();
+        let argument_index = event["argument_index"].as_u64().unwrap() as usize;
+        let option = value["compiler"]["arguments"][argument_index]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(matches!(
+            option.as_str(),
+            "-I" | "-isystem" | "-iquote" | "-idirafter"
+        ));
+        value["compiler"]["arguments"][argument_index + 1] =
+            json!(path.to_string_lossy().into_owned());
+        let response = &value["compiler"]["response_files"][0];
+        let response_index = response["argument_index"].as_u64().unwrap() as usize;
+        let response_argument_count = response["arguments"].as_array().unwrap().len();
+        let captured_index = if argument_index < response_index {
+            argument_index
+        } else {
+            argument_index - response_argument_count + 1
+        };
+        value["compiler"]["captured_arguments"][captured_index + 1] =
+            json!(path.to_string_lossy().into_owned());
+        value["compiler"]["includes"][include_index]["path"] =
+            json!(path.to_string_lossy().into_owned());
+    }
+
     fn set_effective_arguments(&self, value: &mut Value, arguments: Vec<String>) {
         let response_path = self.path("consumer build/toolchain/cflags");
         let response_token = format!("@{}", response_path.display());
@@ -281,6 +310,92 @@ fn legacy_no_response_contexts_remain_valid_when_argv_has_no_at_token() {
         parsed.compiler_arguments
     );
     assert!(parsed.response_files.is_empty());
+}
+
+#[test]
+fn explicit_include_lookup_preserves_absent_parent_components_before_dotdot() {
+    let fixture = Fixture::new("esp32c3");
+    let existing = &fixture.include_paths[0];
+    let parent = existing.parent().unwrap();
+    let selected = parent.join("not-created/../first");
+    let mut value = fixture.read();
+    fixture.set_include_path(&mut value, 0, &selected);
+    fixture.write(&value);
+
+    let parsed = context::parse_context_file(&fixture.contract).unwrap();
+    parsed.verify_include_lookups_unchanged().unwrap();
+    let lookup = &parsed.include_lookups[0];
+    assert_eq!(lookup.selected_path, selected);
+    match &lookup.state {
+        lifecycle::IncludeLookupState::Missing {
+            nearest_existing_path,
+            canonical_parent,
+            unresolved_suffix,
+        } => {
+            assert_eq!(nearest_existing_path, parent);
+            assert_eq!(canonical_parent, &parent.canonicalize().unwrap());
+            assert_eq!(unresolved_suffix, Path::new("not-created/../first"));
+        }
+        state => panic!("expected the missing component to remain unresolved, got {state:?}"),
+    }
+
+    fs::create_dir(parent.join("not-created")).unwrap();
+    assert!(parsed
+        .verify_include_lookups_unchanged()
+        .unwrap_err()
+        .to_string()
+        .contains("lookup directory appeared"));
+    let created = context::parse_context_file(&fixture.contract).unwrap();
+    created.verify_include_lookups_unchanged().unwrap();
+    assert_eq!(
+        created.include_lookups[0].state,
+        lifecycle::IncludeLookupState::Present {
+            resolved_path: existing.canonicalize().unwrap()
+        }
+    );
+    assert_ne!(lookup.identity(), created.include_lookups[0].identity());
+}
+
+#[test]
+fn explicit_include_lookup_rejects_files_dangling_links_and_non_directory_ancestors() {
+    let fixture = Fixture::new("esp32c3");
+    let file = fixture.path("ordinary header.h");
+    fs::write(&file, "/* header */\n").unwrap();
+    let mut value = fixture.read();
+    fixture.set_include_path(&mut value, 0, &file);
+    fixture.write(&value);
+    assert!(context::parse_context_file(&fixture.contract)
+        .unwrap_err()
+        .to_string()
+        .contains("must name a directory"));
+
+    let fixture = Fixture::new("esp32c3");
+    let file_parent = fixture.path("not a directory");
+    fs::write(&file_parent, "file\n").unwrap();
+    let child = file_parent.join("include");
+    let mut value = fixture.read();
+    fixture.set_include_path(&mut value, 0, &child);
+    fixture.write(&value);
+    assert!(context::parse_context_file(&fixture.contract)
+        .unwrap_err()
+        .to_string()
+        .contains("non-directory ancestor"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("esp32c3");
+        let dangling = fixture.path("dangling include alias");
+        symlink(fixture.path("missing include target"), &dangling).unwrap();
+        let mut value = fixture.read();
+        fixture.set_include_path(&mut value, 0, &dangling);
+        fixture.write(&value);
+        assert!(context::parse_context_file(&fixture.contract)
+            .unwrap_err()
+            .to_string()
+            .contains("dangling symlink"));
+    }
 }
 
 #[test]

@@ -71,6 +71,13 @@ pub(crate) fn esp_generation_watch_inputs(
             .iter()
             .map(|response| response.path.clone()),
     );
+    files.extend(
+        context
+            .include_lookups
+            .iter()
+            .filter(|lookup| lookup.is_missing())
+            .map(|lookup| lookup.selected_path.clone()),
+    );
     files.extend(sdk_git_paths.iter().cloned());
 
     GenerationWatchInputs { directories, files }

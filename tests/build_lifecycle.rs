@@ -106,6 +106,20 @@ fn production_watch_set_covers_context_configuration_tools_and_ordered_directori
     let clang = PathBuf::from("/tools/esp-clang/bin/clang");
     let libclang = PathBuf::from("/tools/esp-clang/lib/libclang.dylib");
     let sdk_git_head = PathBuf::from("/sdk/.git/HEAD");
+    let missing_include = lifecycle::IncludeLookupPath {
+        selected_path: PathBuf::from(
+            "/sdk/components/esp_hw_support/mspi/mspi_timing_tuning/port/esp32s3/include",
+        ),
+        state: lifecycle::IncludeLookupState::Missing {
+            nearest_existing_path: PathBuf::from(
+                "/sdk/components/esp_hw_support/mspi/mspi_timing_tuning/port/esp32s3",
+            ),
+            canonical_parent: PathBuf::from(
+                "/sdk/components/esp_hw_support/mspi/mspi_timing_tuning/port/esp32s3",
+            ),
+            unresolved_suffix: PathBuf::from("include"),
+        },
+    };
     let context = context::EspBuildContext {
         sdk_version: "6.1.0".into(),
         sdk_revision: "0123456789abcdef0123456789abcdef01234567".into(),
@@ -127,6 +141,7 @@ fn production_watch_set_covers_context_configuration_tools_and_ordered_directori
             sha256: "a".repeat(64),
             arguments: vec!["-march=rv32imc".into()],
         }],
+        include_lookups: vec![missing_include.clone()],
         includes: vec![],
         implicit_includes: vec![],
         defines: vec![],
@@ -141,7 +156,11 @@ fn production_watch_set_covers_context_configuration_tools_and_ordered_directori
     let watches = inputs::esp_generation_watch_inputs(
         &context,
         &crate_root,
-        &[first_include.clone(), second_include.clone()],
+        &[
+            first_include.clone(),
+            second_include.clone(),
+            missing_include.watch_directory().to_path_buf(),
+        ],
         &clang,
         &libclang,
         &resource_dir,
@@ -179,6 +198,7 @@ fn production_watch_set_covers_context_configuration_tools_and_ordered_directori
     ] {
         assert!(watches.files.contains(path), "missing watch for {path:?}");
     }
+    assert!(watches.files.contains(&missing_include.selected_path));
 }
 
 #[test]
@@ -555,6 +575,79 @@ fn overlapping_include_root_uses_absent_watch_path_without_watching_output_tree(
     );
 }
 
+#[test]
+fn missing_include_lookup_tracks_creation_shadow_header_and_removal() {
+    let fixture = Fixture::new();
+    let existing_parent = fixture.root.join("consumer includes/chip");
+    let missing_include = existing_parent.join("esp32s3/include");
+    let fallback_include = fixture.root.join("fallback include");
+    fs::create_dir_all(&existing_parent).unwrap();
+    fs::create_dir_all(&fallback_include).unwrap();
+    fs::write(fallback_include.join("shadow.h"), "fallback header\n").unwrap();
+
+    let lookup_before = lifecycle::resolve_include_lookup(&missing_include, &fixture.root).unwrap();
+    assert!(lookup_before.is_missing());
+    assert_eq!(lookup_before.identity()["state"], json!("missing"));
+    let missing_plan = lifecycle::include_watch_plan(
+        &[lookup_before.watch_directory().to_path_buf()],
+        &fixture.out_dir,
+    )
+    .unwrap();
+    assert!(missing_plan
+        .directories
+        .contains(&existing_parent.canonicalize().unwrap()));
+
+    let selected_header = |include_order: &[&Path]| {
+        include_order
+            .iter()
+            .map(|directory| directory.join("shadow.h"))
+            .find(|path| path.is_file())
+            .unwrap()
+    };
+    assert_eq!(
+        selected_header(&[missing_include.as_path(), fallback_include.as_path(),]),
+        fallback_include.join("shadow.h")
+    );
+
+    fs::create_dir_all(&missing_include).unwrap();
+    fs::write(missing_include.join("shadow.h"), "new shadow header\n").unwrap();
+    let lookup_created =
+        lifecycle::resolve_include_lookup(&missing_include, &fixture.root).unwrap();
+    assert!(matches!(
+        &lookup_created.state,
+        lifecycle::IncludeLookupState::Present { .. }
+    ));
+    assert_ne!(lookup_before.identity(), lookup_created.identity());
+    let created_plan = lifecycle::include_watch_plan(
+        &[lookup_created.watch_directory().to_path_buf()],
+        &fixture.out_dir,
+    )
+    .unwrap();
+    assert!(created_plan
+        .directories
+        .contains(&missing_include.canonicalize().unwrap()));
+    assert_eq!(
+        selected_header(&[missing_include.as_path(), fallback_include.as_path(),]),
+        missing_include.join("shadow.h")
+    );
+
+    fs::remove_dir_all(existing_parent.join("esp32s3")).unwrap();
+    let lookup_removed =
+        lifecycle::resolve_include_lookup(&missing_include, &fixture.root).unwrap();
+    assert!(lookup_removed.is_missing());
+    assert_eq!(lookup_before.identity(), lookup_removed.identity());
+    let removed_plan = lifecycle::include_watch_plan(
+        &[lookup_removed.watch_directory().to_path_buf()],
+        &fixture.out_dir,
+    )
+    .unwrap();
+    assert_eq!(missing_plan.directories, removed_plan.directories);
+    assert_eq!(
+        selected_header(&[missing_include.as_path(), fallback_include.as_path(),]),
+        fallback_include.join("shadow.h")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn include_watch_plan_tracks_the_parent_of_a_symlinked_root() {
@@ -569,6 +662,10 @@ fn include_watch_plan_tracks_the_parent_of_a_symlinked_root() {
     fs::create_dir_all(&alias_parent).unwrap();
     let alias = alias_parent.join("current");
     symlink(&old_tree, &alias).unwrap();
+
+    let lookup = lifecycle::resolve_include_lookup(&alias, &fixture.root).unwrap();
+    assert_eq!(lookup.watch_directory(), alias.as_path());
+    let lookup_identity = lookup.identity();
 
     let plan =
         lifecycle::include_watch_plan(std::slice::from_ref(&alias), &fixture.out_dir).unwrap();
@@ -586,6 +683,8 @@ fn include_watch_plan_tracks_the_parent_of_a_symlinked_root() {
     symlink(&new_tree, &alias).unwrap();
     let changed = lifecycle::path_resolution_identities(std::slice::from_ref(&alias)).unwrap();
     assert_ne!(resolutions, changed);
+    let changed_lookup = lifecycle::resolve_include_lookup(&alias, &fixture.root).unwrap();
+    assert_ne!(lookup_identity, changed_lookup.identity());
 }
 
 #[cfg(unix)]
