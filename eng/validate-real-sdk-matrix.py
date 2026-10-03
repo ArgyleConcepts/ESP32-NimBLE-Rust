@@ -30,6 +30,7 @@ CLANG_RELEASE = "21.1.3_20260408"
 GCC_RELEASE = "esp-15.2.0_20251204"
 CAFD_OPTION = "CONFIG_BT_NIMBLE_CPFD_CAFD"
 CPFD_FIELDS = {"format", "exponent", "unit", "name_space", "description"}
+CPFD_OPAQUE_MARKERS = {"_unused", "__bindgen_opaque_blob", "_address"}
 ACCEPTANCE_IDS = {
     *(f"NIMBLERS-24-AC{number}" for number in range(1, 7)),
     *(f"NIMBLERS-6-AC{number}" for number in range(1, 6)),
@@ -419,6 +420,22 @@ def type_body(source: str, name: str) -> str:
     return source[start:index - 1]
 
 
+def cpfd_layout(source: str) -> tuple[list[str], str]:
+    """Return semantic CPFD fields, ignoring only bindgen's known opaque markers."""
+    body = type_body(source, "ble_gatt_cpfd")
+    fields = re.findall(r"\bpub\s+([A-Za-z_][A-Za-z0-9_]*)\s*:", body)
+    semantic_fields = {
+        field for field in fields if field not in CPFD_OPAQUE_MARKERS
+    }
+    normalized_fields = {
+        field.removesuffix("_") if field == "format_" else field
+        for field in semantic_fields
+    }
+    ordered_fields = sorted(normalized_fields)
+    shape = "complete" if normalized_fields == CPFD_FIELDS else "opaque"
+    return ordered_fields, shape
+
+
 def public_function_present(source: str, name: str) -> bool:
     return re.search(
         rf"\bpub\s+(?:unsafe\s+)?fn\s+{re.escape(name)}\s*\(",
@@ -448,24 +465,15 @@ def generation_identity(context_path: Path, target_dir: Path) -> dict:
     output, manifest_path = find_output(target_dir)
     manifest = read_json(manifest_path)
     source = output.read_text(encoding="utf-8")
-    cpfd = type_body(source, "ble_gatt_cpfd")
-    cpfd_fields = re.findall(r"\bpub\s+([A-Za-z_][A-Za-z0-9_]*)\s*:", cpfd)
-    semantic_fields = {
-        field for field in cpfd_fields
-        if field not in {"_unused", "__bindgen_opaque_blob"}
-    }
-    normalized_fields = {
-        field.removesuffix("_") if field == "format_" else field
-        for field in semantic_fields
-    }
+    normalized_fields, cpfd_shape = cpfd_layout(source)
     return {
         "output": output,
         "manifest_path": manifest_path,
         "manifest": manifest,
         "input_fingerprint": manifest["input_fingerprint"],
         "bindings_sha256": manifest["bindings_sha256"],
-        "cpfd_fields": sorted(normalized_fields),
-        "cpfd_shape": "complete" if normalized_fields == CPFD_FIELDS else "opaque",
+        "cpfd_fields": normalized_fields,
+        "cpfd_shape": cpfd_shape,
         "context_sha256": sha256(context_path),
     }
 
@@ -477,12 +485,15 @@ def retain_generation_evidence(
     context_path: Path,
     target_dir: Path,
 ) -> dict:
-    identity = generation_identity(context_path, target_dir)
+    output, manifest_path = find_output(target_dir)
     evidence_dir = runner.reports / "inputs" / chip / step
     evidence_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(context_path, evidence_dir / "build-context-v1.json")
-    shutil.copy2(identity["manifest_path"], evidence_dir / "nimble_bindings.manifest.json")
-    shutil.copy2(identity["output"], evidence_dir / "nimble_bindings.rs")
+    shutil.copy2(manifest_path, evidence_dir / "nimble_bindings.manifest.json")
+    shutil.copy2(output, evidence_dir / "nimble_bindings.rs")
+    # Copy the generated files before parsing their Rust shape. If that audit
+    # fails, the report still contains the exact successful generator output.
+    identity = generation_identity(context_path, target_dir)
     identity["retained_evidence"] = evidence_dir.relative_to(runner.reports).as_posix()
     return identity
 
@@ -816,6 +827,9 @@ def summarize_generation(
     cargo_home: Path,
 ) -> dict:
     context = read_json(context_path)
+    evidence = retain_generation_evidence(
+        runner, chip, config_names(enabled), context_path, target_dir,
+    )
     identity = generation_identity(context_path, target_dir)
     output = identity["output"]
     manifest_path = identity["manifest_path"]
@@ -898,9 +912,6 @@ def summarize_generation(
             "generated files remain under this job's Cargo OUT_DIR",
             path.name,
         )
-    evidence = retain_generation_evidence(
-        runner, chip, config_names(enabled), context_path, target_dir,
-    )
     return {
         "chip": chip,
         "configuration": config_names(enabled),

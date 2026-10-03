@@ -207,6 +207,24 @@ class MatrixReportAndDiagnosticTests(unittest.TestCase):
 
 
 class GeneratedSourceInspectionTests(unittest.TestCase):
+    def test_cpfd_layout_recognizes_only_the_known_opaque_markers(self):
+        complete = (
+            "pub struct ble_gatt_cpfd {"
+            "pub format_: i8, pub exponent: i8, pub unit: u16,"
+            "pub name_space: u8, pub description: *const i8,}"
+        )
+        opaque_address = "pub struct ble_gatt_cpfd { pub _address: u8, }"
+        unexpected = "pub struct ble_gatt_cpfd { pub _unexpected: u8, }"
+
+        self.assertEqual(
+            matrix.cpfd_layout(complete),
+            (sorted(matrix.CPFD_FIELDS), "complete"),
+        )
+        self.assertEqual(matrix.cpfd_layout(opaque_address), ([], "opaque"))
+        self.assertEqual(
+            matrix.cpfd_layout(unexpected), (["_unexpected"], "opaque"),
+        )
+
     def test_token_spaced_cpfd_fields_and_excluded_function_are_recognized(self):
         source = (
             "pub struct ble_gatt_cpfd {\n"
