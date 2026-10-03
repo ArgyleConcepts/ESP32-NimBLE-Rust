@@ -138,6 +138,7 @@ jobs:
             - nimbleEspClangPath
             - nimbleLibclangPath
             - nimbleXtensaGccPath
+            - nimbleXtensaS3GccPath
             - nimbleRiscvGccPath
             - nimbleIdfCmakePath
             - nimbleIdfNinjaPath
@@ -285,6 +286,7 @@ jobs:
             - nimbleEspClangPath
             - nimbleLibclangPath
             - nimbleXtensaGccPath
+            - nimbleXtensaS3GccPath
             - nimbleRiscvGccPath
             - nimbleIdfCmakePath
             - nimbleIdfNinjaPath
@@ -320,6 +322,7 @@ jobs:
           }
           assert_selected_tool clang "$NIMBLE_ESP_CLANG"
           assert_selected_tool xtensa-esp-elf-gcc "$NIMBLE_XTENSA_GCC"
+          assert_selected_tool xtensa-esp32s3-elf-gcc "$NIMBLE_XTENSA_S3_GCC"
           assert_selected_tool riscv32-esp-elf-gcc "$NIMBLE_RISCV_GCC"
           assert_selected_tool cmake "$NIMBLE_CMAKE"
           assert_selected_tool ninja "$NIMBLE_NINJA"
@@ -351,9 +354,10 @@ jobs:
           NIMBLE_LIBCLANG: $(nimbleLibclangPath)
           NIMBLE_NINJA: $(nimbleIdfNinjaPath)
           NIMBLE_CMAKE: $(nimbleIdfCmakePath)
-          NIMBLE_COMPILER: $(nimbleXtensaGccPath)
+          NIMBLE_COMPILER: $(nimbleXtensaS3GccPath)
           NIMBLE_CARGO_BIN: $(CARGO_HOME)/bin
           NIMBLE_XTENSA_GCC: $(nimbleXtensaGccPath)
+          NIMBLE_XTENSA_S3_GCC: $(nimbleXtensaS3GccPath)
           NIMBLE_RISCV_GCC: $(nimbleRiscvGccPath)
           NIMBLE_JOB_ROOT: $(toolsDirectory)/idf/$(Build.BuildId)/$(System.JobId)/$(System.JobAttempt)
           NIMBLE_TOOLS_DIRECTORY: $(toolsDirectory)

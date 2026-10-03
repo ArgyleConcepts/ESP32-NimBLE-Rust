@@ -8,7 +8,7 @@ mod lifecycle;
 
 use serde_json::json;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
@@ -588,6 +588,10 @@ fn missing_include_lookup_tracks_creation_shadow_header_and_removal() {
     let lookup_before = lifecycle::resolve_include_lookup(&missing_include, &fixture.root).unwrap();
     assert!(lookup_before.is_missing());
     assert_eq!(lookup_before.identity()["state"], json!("missing"));
+    assert_eq!(
+        lookup_before.search_path_identity(),
+        missing_include.as_path()
+    );
     let missing_plan = lifecycle::include_watch_plan(
         &[lookup_before.watch_directory().to_path_buf()],
         &fixture.out_dir,
@@ -618,6 +622,10 @@ fn missing_include_lookup_tracks_creation_shadow_header_and_removal() {
         lifecycle::IncludeLookupState::Present { .. }
     ));
     assert_ne!(lookup_before.identity(), lookup_created.identity());
+    assert_eq!(
+        lookup_created.search_path_identity(),
+        missing_include.canonicalize().unwrap().as_path()
+    );
     let created_plan = lifecycle::include_watch_plan(
         &[lookup_created.watch_directory().to_path_buf()],
         &fixture.out_dir,

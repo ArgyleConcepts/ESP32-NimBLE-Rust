@@ -86,6 +86,9 @@ directory, dangling symlink, or inspection error remains a configuration
 failure. Cargo watches the nearest existing parent and records whether the
 lookup is present or missing so later creation/removal changes generation
 identity. Implicit compiler include directories remain required inputs.
+The selected absent path is also watched directly; Cargo may rerun the ESP
+build script on every invocation while it remains absent. See the [binding
+generation invalidation notes](BINDING_GENERATION.md#cargo-selection-and-invalidation).
 
 The validator checks readable input files and directories, ESP-IDF 6.1.x,
 C3/S3 architecture pairing, agreement between the Cargo target and ESP target,

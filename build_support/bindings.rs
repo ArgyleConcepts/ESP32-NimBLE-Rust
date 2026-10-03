@@ -22,6 +22,20 @@ const SHIM_HEADER: &str = "src/backend/nimble_shim.h";
 const SHIM_SOURCE: &str = "src/backend/nimble_shim.c";
 const PROBE_SOURCE: &str = "argyle-nimble/context_probe.c";
 
+/// GCC options observed in ESP-IDF 6.1 C3 generation that affect diagnostics
+/// or emitted machine code, but not the C declaration AST parsed by bindgen.
+/// Keep this list exact: ABI, layout, target, preprocessor, and include flags
+/// must continue to reach Clang unchanged.
+const BINDGEN_IRRELEVANT_GCC_OPTIONS: &[&str] = &[
+    "-Wno-old-style-declaration",
+    "-fno-shrink-wrap",
+    "-fstrict-volatile-bitfields",
+    "-fno-tree-switch-conversion",
+    "-fzero-init-padding-bits=all",
+    "-fno-malloc-dce",
+];
+const C3_BINDGEN_IRRELEVANT_GCC_OPTIONS: &[&str] = &["-mtune=esp-base"];
+
 /// Exact public NimBLE and private shim declarations required by the initial
 /// peripheral-server backend. Keep this list explicit and review every
 /// expansion against the pinned ESP-IDF 6.1/NimBLE headers.
@@ -321,7 +335,7 @@ pub(crate) fn generate_source_with_dependencies(
     for name in allowlist.blocked_types {
         builder = builder.blocklist_type(regex_escape(name));
     }
-    let bindings = builder.generate().map_err(|diagnostic| {
+    let bindings = catch_bindgen_panic(|| builder.generate())?.map_err(|diagnostic| {
         error(&format!(
             "Espressif clang could not parse the audited NimBLE shim with the captured consumer context; check SDK headers, compiler options, and the selected Clang release: {diagnostic}"
         ))
@@ -512,6 +526,13 @@ pub(crate) fn compiler_arguments(
             }
             continue;
         }
+        if BINDGEN_IRRELEVANT_GCC_OPTIONS.contains(&arg.as_str())
+            || (context.chip == "esp32c3"
+                && C3_BINDGEN_IRRELEVANT_GCC_OPTIONS.contains(&arg.as_str()))
+        {
+            index += 1;
+            continue;
+        }
         arguments.push(arg.clone());
         index += 1;
     }
@@ -539,6 +560,19 @@ pub(crate) fn compiler_arguments(
         );
     }
     Ok(arguments)
+}
+
+pub(crate) fn catch_bindgen_panic<T>(generate: impl FnOnce() -> T) -> Result<T, BindingError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(generate)).map_err(|payload| {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("libclang returned an internal panic");
+        error(&format!(
+            "Espressif clang panicked while parsing the audited NimBLE shim with the captured consumer context: {detail}"
+        ))
+    })
 }
 
 fn validate_declared_sysroot(

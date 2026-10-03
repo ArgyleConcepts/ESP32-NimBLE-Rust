@@ -324,6 +324,145 @@ fn compiler_arguments_preserve_order_and_original_include_indices() {
 }
 
 #[test]
+fn c3_bindgen_translation_omits_only_exact_tune_and_codegen_switches() {
+    let fixture = Fixture::new();
+    let mut context = fixture.context.clone();
+    let added_arguments = [
+        "-mtune=esp-base".into(),
+        "-Wno-old-style-declaration".into(),
+        "-fno-shrink-wrap".into(),
+        "-fstrict-volatile-bitfields".into(),
+        "-fno-tree-switch-conversion".into(),
+        "-fzero-init-padding-bits=all".into(),
+        "-fno-malloc-dce".into(),
+        "-fpack-struct=2".into(),
+        "-fshort-enums".into(),
+        "-fvisibility=hidden".into(),
+    ];
+    context.compiler_arguments.extend(added_arguments.clone());
+    context.captured_compiler_arguments.extend(added_arguments);
+    let original_arguments = context.compiler_arguments.clone();
+    let arguments = bindings::compiler_arguments(
+        &context,
+        &c3_compiler_target(),
+        &fixture.root.join("clang resource"),
+    )
+    .unwrap();
+
+    assert!(!arguments.contains(&"-mtune=esp-base".to_owned()));
+    assert!(!arguments.contains(&"-mcpu=esp32c3".to_owned()));
+    for gcc_only in [
+        "-mtune=esp-base",
+        "-Wno-old-style-declaration",
+        "-fno-shrink-wrap",
+        "-fstrict-volatile-bitfields",
+        "-fno-tree-switch-conversion",
+        "-fzero-init-padding-bits=all",
+        "-fno-malloc-dce",
+    ] {
+        assert!(!arguments.iter().any(|argument| argument == gcc_only));
+    }
+    for preserved in [
+        "-march=rv32imc_zicsr_zifencei",
+        "-mabi=ilp32",
+        "-DSTART_BEFORE_ACTION=1",
+        "-fpack-struct=2",
+        "-fshort-enums",
+        "-fvisibility=hidden",
+    ] {
+        assert!(arguments.iter().any(|argument| argument == preserved));
+    }
+    assert_eq!(context.compiler_arguments, original_arguments);
+
+    context.compiler_arguments.push("-mtune=other".into());
+    context
+        .captured_compiler_arguments
+        .push("-mtune=other".into());
+    let arguments = bindings::compiler_arguments(
+        &context,
+        &c3_compiler_target(),
+        &fixture.root.join("clang resource"),
+    )
+    .unwrap();
+    assert!(arguments.contains(&"-mtune=other".to_owned()));
+}
+
+#[test]
+fn s3_bindgen_drops_only_the_shared_codegen_switches() {
+    let fixture = Fixture::new();
+    let mut context = fixture.context.clone();
+    context.chip = "esp32s3".into();
+    context.architecture = "xtensa".into();
+    context.compiler_arguments.extend([
+        "-mcpu=esp32s3".into(),
+        "-Wno-old-style-declaration".into(),
+        "-fno-shrink-wrap".into(),
+        "-fstrict-volatile-bitfields".into(),
+        "-fno-tree-switch-conversion".into(),
+        "-fzero-init-padding-bits=all".into(),
+        "-fno-malloc-dce".into(),
+        "-fpack-struct=2".into(),
+    ]);
+    context.response_files.clear();
+    context.captured_compiler_arguments = context.compiler_arguments.clone();
+    let target = bindings::CompilerTarget {
+        bindgen_target: "xtensa-esp-unknown-elf".into(),
+        effective_abi: None,
+    };
+    let arguments =
+        bindings::compiler_arguments(&context, &target, &fixture.root.join("clang resource"))
+            .unwrap();
+
+    assert!(arguments.contains(&"-mcpu=esp32s3".to_owned()));
+    assert!(arguments.contains(&"-fpack-struct=2".to_owned()));
+    for gcc_only in [
+        "-Wno-old-style-declaration",
+        "-fno-shrink-wrap",
+        "-fstrict-volatile-bitfields",
+        "-fno-tree-switch-conversion",
+        "-fzero-init-padding-bits=all",
+        "-fno-malloc-dce",
+    ] {
+        assert!(!arguments.iter().any(|argument| argument == gcc_only));
+    }
+}
+
+#[test]
+fn bindgen_panic_becomes_a_generation_error() {
+    let fixture = Fixture::new();
+    let out_dir = fixture.root.join("panic output");
+    fs::create_dir_all(&out_dir).unwrap();
+    lifecycle::transactional_publish(
+        &out_dir,
+        |staging| {
+            fs::write(staging.join(lifecycle::GENERATED_FILE), "prior bindings")
+                .map_err(|error| error.to_string())
+        },
+        |_| Ok(b"prior manifest".to_vec()),
+    )
+    .unwrap();
+
+    let result = lifecycle::transactional_publish(
+        &out_dir,
+        |_| {
+            bindings::catch_bindgen_panic::<()>(|| {
+                panic!("fixture libclang panic");
+            })
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        },
+        |_| Ok(b"must not publish".to_vec()),
+    );
+
+    let error = result.unwrap_err();
+    assert!(error.contains("Espressif clang panicked"));
+    assert!(error.contains("fixture libclang panic"));
+    assert!(!out_dir.join(lifecycle::GENERATED_FILE).exists());
+    assert!(!out_dir.join(lifecycle::MANIFEST_FILE).exists());
+    assert!(!out_dir.join(lifecycle::STAGING_DIRECTORY).exists());
+}
+
+#[test]
 fn explicit_sysroot_forms_must_match_the_validated_context() {
     let fixture = Fixture::new();
     let mut inline = fixture.context.clone();

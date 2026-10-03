@@ -88,8 +88,12 @@ The generator preserves explicit include lookup paths even when the selected
 ESP-IDF component declares a directory that is absent for that target. It
 watches the nearest existing parent and records present-versus-missing lookup
 resolution in the manifest, so directory creation or removal changes the
-generation identity. Missing SDK, implicit compiler, configuration, or tool
-inputs still fail validation.
+generation identity. It also watches the selected absent path directly;
+Cargo treats a watched path that does not exist as dirty on each invocation,
+so a still-missing lookup can rerun the ESP build script on each build until
+the path appears. This conservative behavior detects newly available search
+directories and headers. Missing SDK, implicit compiler, configuration, or
+tool inputs still fail validation.
 
 ## Toolchain and compiler inputs
 
@@ -119,20 +123,39 @@ consumer's selected GCC compiler. Bindgen then uses the selected Espressif
 Clang with an explicit target and resource directory, `-nostdinc`, the exact
 recorded include search paths, and the captured semantic flags. It does not
 inject Clang's resource headers ahead of the consumer's includes. C3 requires
-captured `-march` and `-mabi` values. The closed target mapping is:
+captured `-march`; the selected GCC's target-option query must report effective
+ABI `ilp32`. An explicit captured `-mabi` must agree with that result. If the
+consumer flags omit `-mabi`, only the private bindgen argument vector receives
+`-mabi=ilp32`; the exported consumer argv remains unchanged. The closed target
+mapping is:
 
 | ESP-IDF context | Selected C compiler target | Espressif Clang target |
 | --- | --- | --- |
 | ESP32-C3 / `riscv32` | `riscv32-esp-elf` | `riscv32-esp-unknown-elf` |
 | ESP32-S3 / `xtensa` | `xtensa-esp-elf` or `xtensa-esp32s3-elf` | `xtensa-esp-unknown-elf` with `-mcpu=esp32s3` |
 
-The generator does not broadly translate GCC-specific options. The single
+The generator does not broadly translate GCC-specific options. For the pinned
+C3 context, bindgen omits the exact GCC tuning flag `-mtune=esp-base` because
+it changes emitted-code tuning, not the declaration AST parsed here. It is not
+translated to a Clang CPU selector; the captured chip target, `-march`, and
+verified ABI remain authoritative. For both supported chip contexts, bindgen
+omits only these additional exact captured options because they control GCC
+diagnostics or emitted machine code rather than the declaration AST it parses:
+`-Wno-old-style-declaration`, `-fno-shrink-wrap`,
+`-fstrict-volatile-bitfields`, `-fno-tree-switch-conversion`,
+`-fzero-init-padding-bits=all`, and `-fno-malloc-dce`. GCC documents the
+optimization flags in its [optimization options](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/Optimize-Options.html)
+and the volatile-bitfield and padding-initialization flags in its
+[code-generation options](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/Code-Gen-Options.html).
+The context's raw/effective compiler arguments remain unchanged, and the
+selected-GCC shim syntax check uses the original consumer options. ABI, record
+layout, preprocessing, and include options are forwarded unchanged. No other
+GCC option is filtered or translated; if Clang rejects one, generation fails
+with a diagnostic to inspect the configured compiler context. The single
 approved IDF response file is expanded and validated by the context exporter;
-bindgen receives its parsed semantic flags while the selected-GCC shim check
-uses the raw argv with that same approved response token. If the selected Clang
-rejects a captured option or cannot parse a selected consumer header,
-generation fails with a diagnostic to inspect the configured compiler context.
-Other response files and nonempty `BINDGEN_EXTRA_CLANG_ARGS*`, `CPATH`,
+bindgen receives its parsed ordered flags while the selected-GCC shim check
+uses the raw argv with that same approved response token. Other response files
+and nonempty `BINDGEN_EXTRA_CLANG_ARGS*`, `CPATH`,
 `C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH`, or `OBJC_INCLUDE_PATH` overrides are
 rejected because those variables can add unrecorded headers. The consumer
 compiler subprocesses also remove the include-path variables defensively.

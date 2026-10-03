@@ -106,6 +106,33 @@ class IdfPinVerificationTests(unittest.TestCase):
 
 
 class MatrixReportAndDiagnosticTests(unittest.TestCase):
+    def test_matrix_tool_paths_select_the_exact_chip_driver_in_the_pinned_packages(self):
+        tools_root = Path("/isolated/idf-tools")
+        c3 = matrix.expected_matrix_tool_paths(tools_root, "esp32c3")
+        s3 = matrix.expected_matrix_tool_paths(tools_root, "esp32s3")
+
+        self.assertEqual(
+            c3["compiler"],
+            tools_root / "tools/riscv32-esp-elf/esp-15.2.0_20251204"
+            / "riscv32-esp-elf/bin/riscv32-esp-elf-gcc",
+        )
+        self.assertEqual(
+            s3["compiler"],
+            tools_root / "tools/xtensa-esp-elf/esp-15.2.0_20251204"
+            / "xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc",
+        )
+        self.assertEqual(
+            s3["clang"],
+            tools_root / "tools/esp-clang/esp-21.1.3_20260408/esp-clang/bin/clang",
+        )
+        self.assertEqual(
+            s3["libclang"],
+            tools_root / "tools/esp-clang-libs/esp-21.1.3_20260408"
+            / "esp-clang/lib/libclang.dylib",
+        )
+        with self.assertRaisesRegex(matrix.MatrixError, "unsupported configured compiler chip"):
+            matrix.expected_matrix_tool_paths(tools_root, "esp32")
+
     def test_ninja_failure_retains_the_referenced_build_file_context(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

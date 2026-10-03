@@ -45,6 +45,33 @@ def expected_fragments_present(output: str, expected: str | list[str]) -> bool:
     return all(fragment in output for fragment in fragments)
 
 
+def expected_matrix_tool_paths(tools_root: Path, chip: str) -> dict[str, Path]:
+    """Return the exact pinned executable/library paths selected by IDF 6.1."""
+    if chip == "esp32c3":
+        compiler = (
+            tools_root / "tools/riscv32-esp-elf" / GCC_RELEASE
+            / "riscv32-esp-elf/bin/riscv32-esp-elf-gcc"
+        )
+    elif chip == "esp32s3":
+        compiler = (
+            tools_root / "tools/xtensa-esp-elf" / GCC_RELEASE
+            / "xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
+        )
+    else:
+        raise MatrixError(f"unsupported configured compiler chip: {chip}")
+    return {
+        "compiler": compiler,
+        "clang": (
+            tools_root / "tools/esp-clang" / CLANG_PACKAGE_RELEASE
+            / "esp-clang/bin/clang"
+        ),
+        "libclang": (
+            tools_root / "tools/esp-clang-libs" / CLANG_PACKAGE_RELEASE
+            / "esp-clang/lib/libclang.dylib"
+        ),
+    }
+
+
 def validate_acceptance_audit(criteria: list[dict], recorded: set[str]) -> None:
     identifiers = [criterion.get("id") for criterion in criteria]
     if set(identifiers) != ACCEPTANCE_IDS or len(identifiers) != len(set(identifiers)):
@@ -516,7 +543,7 @@ def retain_file_input(runner: MatrixRunner, chip: str, step: str, input_path: Pa
     return digest
 
 
-def retain_export_failure_inputs(
+def retain_generation_failure_inputs(
     runner: MatrixRunner,
     chip: str,
     step: str,
@@ -531,13 +558,34 @@ def retain_export_failure_inputs(
         "sdkconfig_header": build / "config" / "sdkconfig.h",
         "previous_context": context_path,
     }
+    if context_path.is_file():
+        try:
+            configuration = read_json(context_path).get("configuration", {})
+        except MatrixError:
+            configuration = {}
+        if isinstance(configuration, dict):
+            sdkconfig = configuration.get("sdkconfig")
+            if isinstance(sdkconfig, str):
+                candidates["context_sdkconfig"] = Path(sdkconfig)
+            generated_headers = configuration.get("generated_headers", [])
+            if isinstance(generated_headers, list):
+                for index, header in enumerate(generated_headers):
+                    if isinstance(header, str):
+                        candidates[f"generated_header_{index}"] = Path(header)
+            version_header = configuration.get("version_header")
+            if isinstance(version_header, str):
+                candidates["version_header"] = Path(version_header)
     evidence = {}
+    retained_digests = {}
     for name, path in candidates.items():
         if path.is_file():
-            evidence[name] = retain_file_input(runner, chip, step, path)
+            key = str(path.resolve())
+            if key not in retained_digests:
+                retained_digests[key] = retain_file_input(runner, chip, step, path)
+            evidence[name] = retained_digests[key]
         else:
             evidence[name] = None
-    runner.values.setdefault("matrix", {}).setdefault("export_failure_inputs", []).append({
+    runner.values.setdefault("matrix", {}).setdefault("generation_failure_inputs", []).append({
         "name": step,
         "sha256": evidence,
         "retained_evidence": f"inputs/{chip}/{step}",
@@ -994,12 +1042,16 @@ def matrix(
     compiler = Path(args.compiler).resolve(strict=True)
     clang = Path(args.clang).resolve(strict=True)
     libclang = Path(args.libclang).resolve(strict=True)
+    expected_tools = {
+        name: path.resolve()
+        for name, path in expected_matrix_tool_paths(tools_root, chip).items()
+    }
     runner.check(
         f"{chip}-tool-paths-pinned",
-        GCC_RELEASE in compiler.as_posix()
-        and CLANG_PACKAGE_RELEASE in clang.as_posix()
-        and CLANG_PACKAGE_RELEASE in libclang.as_posix(),
-        "selected GCC, Espressif Clang and libclang paths contain the pinned package releases",
+        compiler == expected_tools["compiler"]
+        and clang == expected_tools["clang"]
+        and libclang == expected_tools["libclang"],
+        "selected compiler, Espressif Clang and libclang match the exact pinned IDF package paths",
     )
     for path in (compiler, clang, libclang):
         runner.check(f"{chip}-tool-present-{path.name}", path.is_file(), f"selected tool exists: {path.name}")
@@ -1078,7 +1130,7 @@ def matrix(
                 env={**common_env, "ARGYLE_MATRIX_FLAG_VALUE": "17"},
             )
         except MatrixError:
-            retain_export_failure_inputs(
+            retain_generation_failure_inputs(
                 runner, chip, f"{label}-export-context-failure", context_path, build, project,
             )
             raise
@@ -1108,10 +1160,16 @@ def matrix(
             context_path.name,
         )
 
-        cargo_build(
-            runner, f"{chip}-{label}-cargo-generate", root, context_path,
-            target_dir, clang, libclang, common_env,
-        )
+        try:
+            cargo_build(
+                runner, f"{chip}-{label}-cargo-generate", root, context_path,
+                target_dir, clang, libclang, common_env,
+            )
+        except MatrixError:
+            retain_generation_failure_inputs(
+                runner, chip, f"{label}-cargo-generate-failure", context_path, build, project,
+            )
+            raise
         generation = summarize_generation(
             runner, chip, enabled, context_path, target_dir, root, cargo_home,
         )

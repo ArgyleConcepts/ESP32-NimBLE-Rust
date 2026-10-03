@@ -138,11 +138,12 @@ clang="$tools_path/tools/esp-clang/esp-21.1.3_20260408/esp-clang/bin/clang"
 clang_libs_info="$tools_path/tools/esp-clang-libs/esp-21.1.3_20260408/esp-clang/esp-clang-libs.info"
 libclang="$tools_path/tools/esp-clang-libs/esp-21.1.3_20260408/esp-clang/lib/libclang.dylib"
 xtensa_gcc="$tools_path/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/bin/xtensa-esp-elf-gcc"
+xtensa_s3_gcc="$tools_path/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
 riscv_gcc="$tools_path/tools/riscv32-esp-elf/esp-15.2.0_20251204/riscv32-esp-elf/bin/riscv32-esp-elf-gcc"
 cmake="$tools_path/tools/cmake/4.0.3/CMake.app/Contents/bin/cmake"
 ninja="$tools_path/tools/ninja/1.12.1/ninja"
 idf_python="$IDF_PYTHON_ENV_PATH/bin/python"
-for executable in "$idf_python" "$clang" "$xtensa_gcc" "$riscv_gcc" "$cmake" "$ninja"; do
+for executable in "$idf_python" "$clang" "$xtensa_gcc" "$xtensa_s3_gcc" "$riscv_gcc" "$cmake" "$ninja"; do
   [[ -f "$executable" && -x "$executable" ]] || {
     printf 'Pinned executable or library is missing: %s\n' "$executable" >&2
     exit 1
@@ -158,6 +159,7 @@ canonical_path() {
 clang=$(canonical_path "$clang")
 libclang=$(canonical_path "$libclang")
 xtensa_gcc=$(canonical_path "$xtensa_gcc")
+xtensa_s3_gcc=$(canonical_path "$xtensa_s3_gcc")
 riscv_gcc=$(canonical_path "$riscv_gcc")
 cmake=$(canonical_path "$cmake")
 ninja=$(canonical_path "$ninja")
@@ -165,12 +167,13 @@ ninja=$(canonical_path "$ninja")
   printf 'Pinned EspClang/libclang package metadata is missing\n' >&2
   exit 1
 }
-for command_name in clang cmake ninja xtensa-esp-elf-gcc riscv32-esp-elf-gcc; do
+for command_name in clang cmake ninja xtensa-esp-elf-gcc xtensa-esp32s3-elf-gcc riscv32-esp-elf-gcc; do
   case "$command_name" in
     clang) expected_path="$clang" ;;
     cmake) expected_path="$cmake" ;;
     ninja) expected_path="$ninja" ;;
     xtensa-esp-elf-gcc) expected_path="$xtensa_gcc" ;;
+    xtensa-esp32s3-elf-gcc) expected_path="$xtensa_s3_gcc" ;;
     riscv32-esp-elf-gcc) expected_path="$riscv_gcc" ;;
   esac
   command_path=$(command -v "$command_name" || true)
@@ -202,6 +205,10 @@ printf 'Pinned EspClang --version output:\n%s\n' "$clang_version"
   printf 'Unexpected Xtensa GCC version\n' >&2
   exit 1
 }
+[[ "$("$xtensa_s3_gcc" --version)" == *'(crosstool-NG esp-15.2.0_20251204)'* ]] || {
+  printf 'Unexpected ESP32-S3 GCC driver version\n' >&2
+  exit 1
+}
 [[ "$("$riscv_gcc" --version)" == *'(crosstool-NG esp-15.2.0_20251204)'* ]] || {
   printf 'Unexpected RISC-V GCC version\n' >&2
   exit 1
@@ -221,6 +228,7 @@ printf '##vso[task.setvariable variable=nimbleIdfVenvPython;isReadOnly=true]%s\n
 printf '##vso[task.setvariable variable=nimbleEspClangPath;isReadOnly=true]%s\n' "$clang"
 printf '##vso[task.setvariable variable=nimbleLibclangPath;isReadOnly=true]%s\n' "$libclang"
 printf '##vso[task.setvariable variable=nimbleXtensaGccPath;isReadOnly=true]%s\n' "$xtensa_gcc"
+printf '##vso[task.setvariable variable=nimbleXtensaS3GccPath;isReadOnly=true]%s\n' "$xtensa_s3_gcc"
 printf '##vso[task.setvariable variable=nimbleRiscvGccPath;isReadOnly=true]%s\n' "$riscv_gcc"
 printf '##vso[task.setvariable variable=nimbleIdfCmakePath;isReadOnly=true]%s\n' "$cmake"
 printf '##vso[task.setvariable variable=nimbleIdfNinjaPath;isReadOnly=true]%s\n' "$ninja"
