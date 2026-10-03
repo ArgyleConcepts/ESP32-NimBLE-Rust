@@ -28,7 +28,7 @@ function(argyle_fixture_assert_scalar_copy)
 
     set(_report "${CMAKE_BINARY_DIR}/argyle-probe-refresh.txt")
     file(WRITE "${_report}" "")
-    foreach(_property IN ITEMS C_STANDARD C_STANDARD_REQUIRED C_EXTENSIONS
+    foreach(_property IN ITEMS COMPILE_FLAGS C_STANDARD C_STANDARD_REQUIRED C_EXTENSIONS
             POSITION_INDEPENDENT_CODE INTERPROCEDURAL_OPTIMIZATION_RELEASE)
         get_property(_consumer_set TARGET "${_consumer}" PROPERTY "${_property}" SET)
         get_property(_probe_set TARGET "${_probe}" PROPERTY "${_property}" SET)

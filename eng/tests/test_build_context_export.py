@@ -174,14 +174,14 @@ class CompilerExportTests(unittest.TestCase):
             capture = Path(temporary) / "capture.json"
             capture.write_text(json.dumps(["compiler", "-I", "include path"]), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "must be a JSON object"):
-                export_build_context.read_capture(str(capture))
+                export_build_context.read_capture(str(capture), temporary)
 
             capture.write_text(
                 json.dumps({"compiler": "/compiler", "arguments": [], "status": 0}),
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "working_directory"):
-                export_build_context.read_capture(str(capture))
+                export_build_context.read_capture(str(capture), temporary)
 
             capture.write_text(
                 json.dumps({
@@ -193,7 +193,7 @@ class CompilerExportTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "did not complete successfully"):
-                export_build_context.read_capture(str(capture))
+                export_build_context.read_capture(str(capture), temporary)
 
     def test_capture_forwards_exact_argv_and_only_writes_after_success(self):
         with tempfile.TemporaryDirectory(prefix="argyle capture with spaces ") as temporary:
@@ -248,6 +248,7 @@ class CompilerExportTests(unittest.TestCase):
             response_path.parent.mkdir()
             response_contents = b'-DNAME="two words" -I"include path" -DVALUE=foo\\ bar\n'
             response_path.write_bytes(response_contents)
+            response_path = response_path.resolve()
             object_path = build_root / "CMakeFiles/probe.o"
             raw_argv = ["/compiler", "-c", f"@{response_path}", "probe.c", "-o", str(object_path)]
             with (
@@ -283,6 +284,7 @@ class CompilerExportTests(unittest.TestCase):
             response_path = build_root / "toolchain" / "cflags"
             response_path.parent.mkdir()
             response_path.write_text("-DVALUE=before\n", encoding="utf-8")
+            response_path = response_path.resolve()
 
             def mutate_response(*_args, **_kwargs):
                 response_path.write_text("-DVALUE=after\n", encoding="utf-8")
@@ -294,28 +296,42 @@ class CompilerExportTests(unittest.TestCase):
                     "argv",
                     ["capture_compiler.py", str(capture), "/compiler", f"@{response_path}"],
                 ),
-                mock.patch.object(capture_compiler.subprocess, "run", side_effect=mutate_response),
+                mock.patch.object(
+                    capture_compiler.subprocess, "run", side_effect=mutate_response,
+                ) as run,
             ):
                 self.assertEqual(capture_compiler.main(), 2)
 
+            run.assert_called_once()
             self.assertFalse(capture.exists())
 
     def test_gcc_response_parser_rejects_unsafe_or_malformed_contents(self):
-        for contents in (
-            b"@nested.rsp", b"-c", b"-o object.o", b"-B/toolchain",
-            b"-specs=other.specs", b"--specs=other.specs", b"-wrapper=wrapper", b"-xlanguage",
-            b"--target=other-target", b"-fuse-ld=other-linker",
-            b"-save-temps=objects", b"--output=object.o", b"--dependency-file=object.d",
-            b"-dependency-file=object.d",
-            b"-DNAME='unterminated", b"-DNAME=trailing\\",
-            b'-I ""',
-        ):
+        cases = (
+            (b"@nested.rsp", "nested or additional response files"),
+            (b"-c", "unsupported compiler action/input flag"),
+            (b"-o object.o", "unsupported compiler output/dependency flag"),
+            (b"-B/toolchain", "unsupported compiler tool-selection flag"),
+            (b"-specs=other.specs", "unsupported compiler tool-selection flag"),
+            (b"--specs=other.specs", "unsupported compiler tool-selection flag"),
+            (b"-wrapper=wrapper", "unsupported compiler tool-selection flag"),
+            (b"-xlanguage", "unsupported compiler tool-selection flag"),
+            (b"--target=other-target", "unsupported compiler tool-selection flag"),
+            (b"-fuse-ld=other-linker", "unsupported compiler tool-selection flag"),
+            (b"-save-temps=objects", "unsupported compiler action/input flag"),
+            (b"--output=object.o", "unsupported compiler output/dependency flag"),
+            (b"--dependency-file=object.d", "unsupported compiler output/dependency flag"),
+            (b"-dependency-file=object.d", "unsupported compiler output/dependency flag"),
+            (b"-DNAME='unterminated", "unmatched quote"),
+            (b"-DNAME=trailing\\", "incomplete escape"),
+            (b'-I ""', "missing its value"),
+        )
+        for contents, diagnostic in cases:
             with self.subTest(contents=contents), tempfile.TemporaryDirectory() as temporary:
-                build_root = Path(temporary) / "idf-build"
+                build_root = (Path(temporary) / "idf-build").resolve()
                 response_path = build_root / "toolchain" / "cflags"
                 response_path.parent.mkdir(parents=True)
                 response_path.write_bytes(contents)
-                with self.assertRaises(ValueError):
+                with self.assertRaisesRegex(ValueError, diagnostic):
                     capture_compiler.expand_idf_cflags_response(
                         [f"@{response_path}"], build_root, Path(temporary),
                     )
@@ -352,6 +368,7 @@ class CompilerExportTests(unittest.TestCase):
             response_path = build_root / "toolchain" / "cflags"
             response_path.parent.mkdir()
             response_path.write_text("-DVALUE=one\n", encoding="utf-8")
+            response_path = response_path.resolve()
             captured_arguments = [f"@{response_path}"]
             expanded, response_files = capture_compiler.expand_idf_cflags_response(
                 captured_arguments, build_root, Path(temporary),

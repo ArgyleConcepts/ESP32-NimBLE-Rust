@@ -570,9 +570,7 @@ fn strip_probe_action_arguments_from(
     if args.iter().any(|argument| {
         argument.starts_with('@')
             && (!allow_approved_response_token
-                || !approved_response_tokens
-                    .iter()
-                    .any(|token| argument.as_str() == *token))
+                || !approved_response_tokens.contains(&argument.as_str()))
     }) {
         return Err(error(
             "compiler arguments contain an unapproved response file; regenerate the CMake context",

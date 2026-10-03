@@ -61,6 +61,10 @@ Each job configures a generic ESP-IDF C3 or S3 fixture with `idf.py`, builds
 only `argyle_nimble_export_context`, and uses the selected SDK GCC/sysroot,
 compiler arguments, include paths, and generated `sdkconfig.h` as inputs to
 the crate's actual Cargo build script and pinned EspClang/libclang generator.
+The generic fixtures explicitly select `CONFIG_LIBC_NEWLIB=y` and verify that
+both `sdkconfig` and `sdkconfig.h` select Newlib with Picolibc disabled. The
+matrix does not support Picolibc's `-specs` arguments or make a claim about
+other C library configurations.
 Both `CONFIG_BT_NIMBLE_CPFD_CAFD` values are configured for each chip; the
 retained binding and manifest evidence must show their expected distinct
 `ble_gatt_cpfd` layouts. The driver also verifies stable unchanged inputs,
@@ -69,7 +73,7 @@ CAFD in-place in one configured `sdkconfig` before restoring it. It mutates and
 restores generated/transitive headers and a captured compiler definition,
 then mutates the SDK-generated `toolchain/cflags` input to verify compiler-probe
 recapture, stale-context rejection, re-export, and restored identity.
-rejects invalid contexts and a reconfigured NimBLE-disabled target, exercises
+It rejects invalid contexts and a reconfigured NimBLE-disabled target, exercises
 missing-tool/header and Clang-parse failures after successful generation, and
 compiles an external Cargo consumer that must fail Rust privacy checks when it
 names a generated type.

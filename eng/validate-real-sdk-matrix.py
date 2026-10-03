@@ -307,6 +307,14 @@ def boolean_config_value(text: str, key: str) -> bool | None:
     return value
 
 
+def config_header_enabled(text: str, key: str) -> bool:
+    return re.search(
+        rf"^[ \t]*#define[ \t]+{re.escape(key)}[ \t]+(?:1|y)(?:[ \t]|$)",
+        text,
+        re.MULTILINE,
+    ) is not None
+
+
 def config_header_boolean(path: Path, key: str, enabled: bool) -> bytes:
     original = path.read_bytes()
     text = original.decode("utf-8")
@@ -335,6 +343,7 @@ def make_fixture(project: Path, root: Path, chip: str, cafd: bool) -> None:
     )
     (project / "sdkconfig.defaults").write_text(
         f'CONFIG_IDF_TARGET="{target}"\n'
+        "CONFIG_LIBC_NEWLIB=y\n"
         "CONFIG_BT_ENABLED=y\n"
         "CONFIG_BT_NIMBLE_ENABLED=y\n"
         f"{CAFD_OPTION}={'y' if cafd else 'n'}\n",
@@ -562,6 +571,8 @@ def acceptance_audit(chip: str) -> list[dict]:
                 f"{chip}-cpfd-cafd-off-actual-configured-compiler",
                 f"{chip}-cpfd-cafd-on-sdk-version",
                 f"{chip}-cpfd-cafd-off-sdk-version",
+                f"{chip}-cpfd-cafd-on-newlib-selection",
+                f"{chip}-cpfd-cafd-off-newlib-selection",
                 f"{chip}-configuration-shape-differs",
             ],
             "requires_external_evidence": [f"{other_job} artifact for {other_chip} on the same PR head"],
@@ -739,14 +750,24 @@ def summarize_generation(
     cpfd_shape = identity["cpfd_shape"]
     sdkconfig = Path(context["configuration"]["sdkconfig"])
     sdkconfig_header = Path(context["configuration"]["generated_headers"][0])
-    config_value = boolean_config_value(sdkconfig.read_text(encoding="utf-8"), CAFD_OPTION)
+    sdkconfig_text = sdkconfig.read_text(encoding="utf-8")
+    header_text = sdkconfig_header.read_text(encoding="utf-8")
+    config_value = boolean_config_value(sdkconfig_text, CAFD_OPTION)
+    runner.check(
+        f"{chip}-{config_names(enabled)}-newlib-selection",
+        boolean_config_value(sdkconfig_text, "CONFIG_LIBC_NEWLIB") is True
+        and boolean_config_value(sdkconfig_text, "CONFIG_LIBC_PICOLIBC") is False
+        and config_header_enabled(header_text, "CONFIG_LIBC_NEWLIB")
+        and not config_header_enabled(header_text, "CONFIG_LIBC_PICOLIBC"),
+        "configured sdkconfig and generated sdkconfig.h select Newlib and do not select Picolibc",
+        context_path.name,
+    )
     runner.check(
         f"{chip}-{config_names(enabled)}-sdkconfig",
         config_value is enabled,
         f"{CAFD_OPTION} is {'enabled' if enabled else 'disabled'} in the configured sdkconfig",
         context_path.name,
     )
-    header_text = sdkconfig_header.read_text(encoding="utf-8")
     header_value = re.search(
         rf"^#define\s+{re.escape(CAFD_OPTION)}\s+(?:1|y)\s*$",
         header_text,

@@ -13,7 +13,9 @@ The Azure-only [C3/S3 generation matrix](CI.md#azure-validation) exercises this
 entrypoint against the pinned ESP-IDF 6.1 commit and the actual configured
 headers/compiler context. Each chip runs `CONFIG_BT_NIMBLE_CPFD_CAFD` enabled
 and disabled to prove the selected declaration layout changes with the
-consumer configuration, then checks input mutations and failure cleanup.
+consumer configuration, then checks input mutations and failure cleanup. Its
+generic fixtures explicitly select `CONFIG_LIBC_NEWLIB=y`; the matrix does not
+claim support for Picolibc's GCC `-specs` options or arbitrary response files.
 Matrix Cargo commands run natively on the macOS host to exercise `build.rs`;
 this does not compile Rust for the ESP target or verify ABI, firmware linking,
 hardware, or BLE behavior. Full target compile/link evidence belongs to
