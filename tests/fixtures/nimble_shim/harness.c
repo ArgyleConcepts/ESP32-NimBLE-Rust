@@ -190,6 +190,8 @@ test_callback_setters(void)
 static void
 test_sdk_error_alias(void)
 {
+    assert(BLE_HS_FOREVER == INT32_MAX);
+    assert(ARGYLE_NIMBLE_HS_FOREVER == BLE_HS_FOREVER);
     assert(BLE_ERR_REM_USER_CONN_TERM == 19);
     assert(ARGYLE_NIMBLE_ERR_REM_USER_CONN_TERM == 19);
     assert(ARGYLE_NIMBLE_ERR_REM_USER_CONN_TERM == BLE_ERR_REM_USER_CONN_TERM);

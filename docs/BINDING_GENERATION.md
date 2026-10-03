@@ -147,6 +147,9 @@ diagnostics or emitted machine code rather than the declaration AST it parses:
 optimization flags in its [optimization options](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/Optimize-Options.html)
 and the volatile-bitfield and padding-initialization flags in its
 [code-generation options](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/Code-Gen-Options.html).
+For the S3 context, bindgen also omits the exact captured `-mlongcalls` option:
+GCC documents it as an assembler call-instruction selection option, so it does
+not change the declarations bindgen parses ([Xtensa options](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/Xtensa-Options.html)).
 The context's raw/effective compiler arguments remain unchanged, and the
 selected-GCC shim syntax check uses the original consumer options. ABI, record
 layout, preprocessing, and include options are forwarded unchanged. No other

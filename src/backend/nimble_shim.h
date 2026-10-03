@@ -32,6 +32,8 @@
 /* `BLE_ERR_REM_USER_CONN_TERM` is a variant of a broad named SDK enum.
  * Bindgen exposes only this audited value through the narrow anonymous enum. */
 enum {
+    /* Preserve the SDK macro's configured integer value without hardcoding it. */
+    ARGYLE_NIMBLE_HS_FOREVER = BLE_HS_FOREVER,
     ARGYLE_NIMBLE_ERR_REM_USER_CONN_TERM = BLE_ERR_REM_USER_CONN_TERM
 };
 

@@ -22,7 +22,7 @@ const SHIM_HEADER: &str = "src/backend/nimble_shim.h";
 const SHIM_SOURCE: &str = "src/backend/nimble_shim.c";
 const PROBE_SOURCE: &str = "argyle-nimble/context_probe.c";
 
-/// GCC options observed in ESP-IDF 6.1 C3 generation that affect diagnostics
+/// GCC options observed in ESP-IDF 6.1 C3/S3 generation that affect diagnostics
 /// or emitted machine code, but not the C declaration AST parsed by bindgen.
 /// Keep this list exact: ABI, layout, target, preprocessor, and include flags
 /// must continue to reach Clang unchanged.
@@ -34,7 +34,10 @@ const BINDGEN_IRRELEVANT_GCC_OPTIONS: &[&str] = &[
     "-fzero-init-padding-bits=all",
     "-fno-malloc-dce",
 ];
+// ESP-IDF 6.1 adds this C3 GCC tuning choice; it does not affect declarations.
 const C3_BINDGEN_IRRELEVANT_GCC_OPTIONS: &[&str] = &["-mtune=esp-base"];
+// ESP-IDF 6.1 adds this S3 Xtensa assembler choice; it does not affect the AST.
+const S3_BINDGEN_IRRELEVANT_GCC_OPTIONS: &[&str] = &["-mlongcalls"];
 
 /// Exact public NimBLE and private shim declarations required by the initial
 /// peripheral-server backend. Keep this list explicit and review every
@@ -99,7 +102,7 @@ pub const REQUIRED_TYPES: &[&str] = &[
 
 /// Constants used to construct the supported peripheral-server configuration.
 pub const REQUIRED_VARIABLES: &[&str] = &[
-    "BLE_HS_FOREVER",
+    "ARGYLE_NIMBLE_HS_FOREVER",
     "BLE_HS_ADV_F_DISC_GEN",
     "BLE_HS_ADV_F_BREDR_UNSUP",
     "ARGYLE_NIMBLE_ERR_REM_USER_CONN_TERM",
@@ -529,6 +532,8 @@ pub(crate) fn compiler_arguments(
         if BINDGEN_IRRELEVANT_GCC_OPTIONS.contains(&arg.as_str())
             || (context.chip == "esp32c3"
                 && C3_BINDGEN_IRRELEVANT_GCC_OPTIONS.contains(&arg.as_str()))
+            || (context.chip == "esp32s3"
+                && S3_BINDGEN_IRRELEVANT_GCC_OPTIONS.contains(&arg.as_str()))
         {
             index += 1;
             continue;

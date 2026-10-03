@@ -335,6 +335,7 @@ fn c3_bindgen_translation_omits_only_exact_tune_and_codegen_switches() {
         "-fno-tree-switch-conversion".into(),
         "-fzero-init-padding-bits=all".into(),
         "-fno-malloc-dce".into(),
+        "-mlongcalls".into(),
         "-fpack-struct=2".into(),
         "-fshort-enums".into(),
         "-fvisibility=hidden".into(),
@@ -369,6 +370,7 @@ fn c3_bindgen_translation_omits_only_exact_tune_and_codegen_switches() {
         "-fpack-struct=2",
         "-fshort-enums",
         "-fvisibility=hidden",
+        "-mlongcalls",
     ] {
         assert!(arguments.iter().any(|argument| argument == preserved));
     }
@@ -388,19 +390,21 @@ fn c3_bindgen_translation_omits_only_exact_tune_and_codegen_switches() {
 }
 
 #[test]
-fn s3_bindgen_drops_only_the_shared_codegen_switches() {
+fn s3_bindgen_drops_shared_and_xtensa_assembler_switches() {
     let fixture = Fixture::new();
     let mut context = fixture.context.clone();
     context.chip = "esp32s3".into();
     context.architecture = "xtensa".into();
     context.compiler_arguments.extend([
         "-mcpu=esp32s3".into(),
+        "-mtune=esp-base".into(),
         "-Wno-old-style-declaration".into(),
         "-fno-shrink-wrap".into(),
         "-fstrict-volatile-bitfields".into(),
         "-fno-tree-switch-conversion".into(),
         "-fzero-init-padding-bits=all".into(),
         "-fno-malloc-dce".into(),
+        "-mlongcalls".into(),
         "-fpack-struct=2".into(),
     ]);
     context.response_files.clear();
@@ -414,7 +418,9 @@ fn s3_bindgen_drops_only_the_shared_codegen_switches() {
             .unwrap();
 
     assert!(arguments.contains(&"-mcpu=esp32s3".to_owned()));
+    assert!(arguments.contains(&"-mtune=esp-base".to_owned()));
     assert!(arguments.contains(&"-fpack-struct=2".to_owned()));
+    assert!(!arguments.contains(&"-mlongcalls".to_owned()));
     for gcc_only in [
         "-Wno-old-style-declaration",
         "-fno-shrink-wrap",
@@ -1185,12 +1191,18 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
         let allowlist = Allowlist {
             functions: &["fixture_required"],
             types: &["fixture_payload_t"],
-            variables: &["FIXTURE_MODE", "FIXTURE_ERROR_ALIAS"],
+            variables: &[
+                "FIXTURE_MODE",
+                "FIXTURE_ERROR_ALIAS",
+                "FIXTURE_TIMEOUT_ALIAS",
+            ],
             opaque_types: &[],
             blocked_types: &[],
         };
         let required_variables = if case == "named-enum-alias" {
             &["FIXTURE_MODE", "FIXTURE_ERROR_ALIAS"][..]
+        } else if case == "macro-backed-enum-alias" {
+            &["FIXTURE_MODE", "FIXTURE_TIMEOUT_ALIAS"][..]
         } else {
             &["FIXTURE_MODE"][..]
         };
@@ -1227,13 +1239,20 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
             )
         };
         match case.as_str() {
-            "valid" | "named-enum-alias" | "nested-transitive-dependencies" => {
+            "valid"
+            | "named-enum-alias"
+            | "macro-backed-enum-alias"
+            | "nested-transitive-dependencies" => {
                 let generated = generated.unwrap();
                 assert!(!generated.contains("fixture_private"));
                 if case == "named-enum-alias" {
                     assert!(generated.contains("FIXTURE_ERROR_ALIAS"));
                     assert!(!generated.contains("FIXTURE_REM_USER_CONN_TERM"));
                     assert!(!generated.contains("FIXTURE_UNRELATED_ERROR"));
+                }
+                if case == "macro-backed-enum-alias" {
+                    assert!(generated.contains("FIXTURE_TIMEOUT_ALIAS"));
+                    assert!(!generated.contains("FIXTURE_TIMEOUT()"));
                 }
                 fs::write(output, generated).unwrap();
             }
@@ -1278,6 +1297,10 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
         (
             "named-enum-alias",
             "typedef struct { unsigned short count; } fixture_payload_t;\nint fixture_required(fixture_payload_t *value);\nenum fixture_error_codes { FIXTURE_REM_USER_CONN_TERM = 0x13, FIXTURE_UNRELATED_ERROR = 0x14 };\nenum { FIXTURE_ERROR_ALIAS = FIXTURE_REM_USER_CONN_TERM, FIXTURE_MODE = 7 };\n",
+        ),
+        (
+            "macro-backed-enum-alias",
+            "#include <stdint.h>\n#define FIXTURE_TIMEOUT() ((int32_t)INT32_MAX)\ntypedef struct { unsigned short count; } fixture_payload_t;\nint fixture_required(fixture_payload_t *value);\nenum { FIXTURE_TIMEOUT_ALIAS = FIXTURE_TIMEOUT(), FIXTURE_MODE = 7 };\n",
         ),
         (
             "syntax-error",
@@ -1352,7 +1375,10 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
             "isolated generic host bindgen fixture `{case}` failed: {}",
             String::from_utf8_lossy(&result.stderr)
         );
-        if case != "valid" && case != "named-enum-alias" && case != "nested-transitive-dependencies"
+        if case != "valid"
+            && case != "named-enum-alias"
+            && case != "macro-backed-enum-alias"
+            && case != "nested-transitive-dependencies"
         {
             assert!(!output.exists(), "failed `{case}` fixture published output");
             continue;
@@ -1366,6 +1392,10 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
             assert!(generated.contains("FIXTURE_ERROR_ALIAS"));
             assert!(!generated.contains("FIXTURE_REM_USER_CONN_TERM"));
             assert!(!generated.contains("FIXTURE_UNRELATED_ERROR"));
+        }
+        if case == "macro-backed-enum-alias" {
+            assert!(generated.contains("FIXTURE_TIMEOUT_ALIAS"));
+            assert!(!generated.contains("FIXTURE_TIMEOUT()"));
         }
         if case == "nested-transitive-dependencies" {
             let dependencies = fs::read_to_string(&dependency_output).unwrap();
