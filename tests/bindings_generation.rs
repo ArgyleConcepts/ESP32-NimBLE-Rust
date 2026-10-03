@@ -30,6 +30,31 @@ struct Fixture {
     context: EspBuildContext,
 }
 
+fn generated_integer_const(source: &str, name: &str) -> i64 {
+    let file = syn::parse_file(source).expect("generated bindings should parse as Rust");
+    let constant = file.items.iter().find_map(|item| match item {
+        syn::Item::Const(constant) if constant.ident == name => Some(constant),
+        _ => None,
+    });
+    let constant = constant.unwrap_or_else(|| panic!("generated const {name} is missing"));
+    let syn::Expr::Lit(expression) = &constant.expr else {
+        panic!("generated const {name} is not a literal");
+    };
+    let syn::Lit::Int(value) = &expression.lit else {
+        panic!("generated const {name} is not an integer literal");
+    };
+    value
+        .base10_parse::<i64>()
+        .unwrap_or_else(|error| panic!("generated const {name} is not a decimal integer: {error}"))
+}
+
+fn generated_const_present(source: &str, name: &str) -> bool {
+    let file = syn::parse_file(source).expect("generated bindings should parse as Rust");
+    file.items
+        .iter()
+        .any(|item| matches!(item, syn::Item::Const(constant) if constant.ident == name))
+}
+
 fn c3_compiler_target() -> bindings::CompilerTarget {
     bindings::CompilerTarget {
         bindgen_target: "riscv32-esp-unknown-elf".into(),
@@ -405,6 +430,7 @@ fn s3_bindgen_drops_shared_and_xtensa_assembler_switches() {
         "-fzero-init-padding-bits=all".into(),
         "-fno-malloc-dce".into(),
         "-mlongcalls".into(),
+        "-mno-longcalls".into(),
         "-fpack-struct=2".into(),
     ]);
     context.response_files.clear();
@@ -420,6 +446,7 @@ fn s3_bindgen_drops_shared_and_xtensa_assembler_switches() {
     assert!(arguments.contains(&"-mcpu=esp32s3".to_owned()));
     assert!(arguments.contains(&"-mtune=esp-base".to_owned()));
     assert!(arguments.contains(&"-fpack-struct=2".to_owned()));
+    assert!(arguments.contains(&"-mno-longcalls".to_owned()));
     assert!(!arguments.contains(&"-mlongcalls".to_owned()));
     for gcc_only in [
         "-Wno-old-style-declaration",
@@ -1252,7 +1279,11 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
                 }
                 if case == "macro-backed-enum-alias" {
                     assert!(generated.contains("FIXTURE_TIMEOUT_ALIAS"));
-                    assert!(!generated.contains("FIXTURE_TIMEOUT()"));
+                    assert_eq!(
+                        generated_integer_const(&generated, "FIXTURE_TIMEOUT_ALIAS"),
+                        2147483647
+                    );
+                    assert!(!generated_const_present(&generated, "FIXTURE_TIMEOUT"));
                 }
                 fs::write(output, generated).unwrap();
             }
@@ -1300,7 +1331,7 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
         ),
         (
             "macro-backed-enum-alias",
-            "#include <stdint.h>\n#define FIXTURE_TIMEOUT() ((int32_t)INT32_MAX)\ntypedef struct { unsigned short count; } fixture_payload_t;\nint fixture_required(fixture_payload_t *value);\nenum { FIXTURE_TIMEOUT_ALIAS = FIXTURE_TIMEOUT(), FIXTURE_MODE = 7 };\n",
+            "#include <stdint.h>\n#define FIXTURE_TIMEOUT ((int32_t)INT32_MAX)\ntypedef struct { unsigned short count; } fixture_payload_t;\nint fixture_required(fixture_payload_t *value);\nenum { FIXTURE_TIMEOUT_ALIAS = FIXTURE_TIMEOUT, FIXTURE_MODE = 7 };\n",
         ),
         (
             "syntax-error",
@@ -1395,7 +1426,11 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
         }
         if case == "macro-backed-enum-alias" {
             assert!(generated.contains("FIXTURE_TIMEOUT_ALIAS"));
-            assert!(!generated.contains("FIXTURE_TIMEOUT()"));
+            assert_eq!(
+                generated_integer_const(&generated, "FIXTURE_TIMEOUT_ALIAS"),
+                2147483647
+            );
+            assert!(!generated_const_present(&generated, "FIXTURE_TIMEOUT"));
         }
         if case == "nested-transitive-dependencies" {
             let dependencies = fs::read_to_string(&dependency_output).unwrap();
