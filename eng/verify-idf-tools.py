@@ -74,6 +74,25 @@ def verify(lock_path, metadata_path, idf_root):
     return lock
 
 
+def verify_tool_output_version(lock, metadata, name, output):
+    pin = lock["tools"].get(name)
+    tool = next((item for item in metadata["tools"] if item["name"] == name), None)
+    if pin is None or tool is None:
+        raise ValueError("tool missing from committed lock or pinned SDK metadata: {}".format(name))
+    pattern = tool.get("version_regex")
+    if not isinstance(pattern, str) or not pattern:
+        raise ValueError("pinned SDK metadata has no version regex for {}".format(name))
+    match = re.search(pattern, output)
+    if match is None or match.lastindex is None:
+        raise ValueError("{} output did not match the pinned SDK version regex".format(name))
+    reported = match.group(1)
+    if reported != pin["version"]:
+        raise ValueError(
+            "{} reports {}, expected pinned package {}".format(name, reported, pin["version"])
+        )
+    return reported
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lock", required=True, type=Path)
@@ -84,6 +103,8 @@ def main():
                         help="print name@version arguments after successful verification")
     output.add_argument("--emit-targets", action="store_true",
                         help="print the comma-separated IDF target list")
+    output.add_argument("--verify-tool-output", nargs=2, metavar=("TOOL", "OUTPUT"),
+                        help="verify a tool's full version output using pinned SDK metadata")
     args = parser.parse_args()
 
     try:
@@ -97,6 +118,16 @@ def main():
             print("{}@{}".format(name, pin["version"]))
     elif args.emit_targets:
         print(",".join(lock["idf"]["targets"]))
+    elif args.verify_tool_output:
+        try:
+            name, output = args.verify_tool_output
+            reported = verify_tool_output_version(lock, json.loads(
+                Path(args.metadata).read_text(encoding="utf-8")
+            ), name, output)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError) as error:
+            print("ESP-IDF tool output verification failed: {}".format(error), file=sys.stderr)
+            return 1
+        print("{} reports pinned package {}".format(name, reported))
     else:
         print("ESP-IDF tool pins match both official macOS package hashes")
     return 0

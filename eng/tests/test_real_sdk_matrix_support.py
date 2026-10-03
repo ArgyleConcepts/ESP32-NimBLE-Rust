@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -22,6 +23,10 @@ def load_script(name: str, path: Path):
 
 matrix = load_script("real_sdk_matrix", ROOT / "eng/validate-real-sdk-matrix.py")
 tool_pins = load_script("verify_idf_tools", ROOT / "eng/verify-idf-tools.py")
+cmake_regressions = load_script(
+    "cmake_export_regressions",
+    ROOT / "eng/test/fixture/run_cmake_export_regressions.py",
+)
 
 
 class IdfPinVerificationTests(unittest.TestCase):
@@ -55,7 +60,10 @@ class IdfPinVerificationTests(unittest.TestCase):
                 "macos": {"sha256": pin["sha256"]["macos"]},
                 "macos-arm64": {"sha256": pin["sha256"]["macos-arm64"]},
             }
-            tools.append({"name": name, "versions": [version]})
+            tool = {"name": name, "versions": [version]}
+            if name == "esp-clang":
+                tool["version_regex"] = r"\([^\s]+\s+([0-9a-zA-Z\.\-_]+)\)"
+            tools.append(tool)
         self.metadata_path.write_text(json.dumps({"tools": tools}), encoding="utf-8")
 
     def verify(self):
@@ -84,6 +92,17 @@ class IdfPinVerificationTests(unittest.TestCase):
         self.metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "expected one"):
             self.verify()
+
+    def test_reported_tool_version_uses_the_pinned_sdk_regex_and_exact_release(self):
+        metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+        output = "clang version 21.1.3 (https://github.com/espressif/llvm-project esp-21.1.3_20260408)"
+        self.assertEqual(
+            tool_pins.verify_tool_output_version(self.lock, metadata, "esp-clang", output),
+            self.lock["tools"]["esp-clang"]["version"],
+        )
+        wrong = output.replace("esp-21.1.3_20260408", "esp-21.1.3_20260409")
+        with self.assertRaisesRegex(ValueError, "expected pinned package"):
+            tool_pins.verify_tool_output_version(self.lock, metadata, "esp-clang", wrong)
 
 
 class MatrixReportAndDiagnosticTests(unittest.TestCase):
@@ -122,6 +141,75 @@ class MatrixReportAndDiagnosticTests(unittest.TestCase):
             "compiler failed while parsing an unrelated header",
             ["compiler failed", "ble_gatt.h"],
         ))
+
+    def test_cmake_diagnostic_matching_ignores_wrapping_whitespace(self):
+        wrapped = (
+            "CMake Error at exporter.cmake:42 (message):\n"
+            "  Build-context export must be called from the consumer target's defining\n"
+            "  CMake source and binary directory\n"
+        )
+        expected = "must be called from the consumer target's defining CMake source and binary directory"
+        self.assertTrue(cmake_regressions.diagnostic_contains(wrapped, expected))
+        self.assertFalse(cmake_regressions.diagnostic_contains(wrapped, "a different failure"))
+
+
+class GeneratedSourceInspectionTests(unittest.TestCase):
+    def test_token_spaced_cpfd_fields_and_excluded_function_are_recognized(self):
+        source = (
+            "pub struct ble_gatt_cpfd {\n"
+            "pub format_ : i8 , pub exponent : i8 , pub unit : u16 ,\n"
+            "pub name_space : u8 , pub description : * const i8 ,\n"
+            "}\n"
+            "pub fn ble_gap_connect ( peer : i32 ) ;\n"
+        )
+        body = matrix.type_body(source, "ble_gatt_cpfd")
+        fields = set(re.findall(r"\bpub\s+([A-Za-z_][A-Za-z0-9_]*)\s*:", body))
+        normalized = {field.removesuffix("_") if field == "format_" else field for field in fields}
+        self.assertEqual(normalized, matrix.CPFD_FIELDS)
+        self.assertTrue(matrix.public_function_present(source, "ble_gap_connect"))
+        self.assertFalse(matrix.public_function_present(source, "ble_gap_pair"))
+
+    def test_sdkconfig_boolean_helpers_handle_enabled_and_disabled_values(self):
+        text = (
+            "CONFIG_BT_NIMBLE_ENABLED=y\n"
+            "# CONFIG_BT_NIMBLE_CPFD_CAFD is not set\n"
+        )
+        self.assertTrue(matrix.boolean_config_value(text, "CONFIG_BT_NIMBLE_ENABLED"))
+        self.assertFalse(matrix.boolean_config_value(text, "CONFIG_BT_NIMBLE_CPFD_CAFD"))
+        enabled = matrix.replace_boolean_config(text, "CONFIG_BT_NIMBLE_CPFD_CAFD", True)
+        self.assertTrue(matrix.boolean_config_value(enabled, "CONFIG_BT_NIMBLE_CPFD_CAFD"))
+        disabled = matrix.replace_boolean_config(enabled, "CONFIG_BT_NIMBLE_ENABLED", False)
+        self.assertFalse(matrix.boolean_config_value(disabled, "CONFIG_BT_NIMBLE_ENABLED"))
+
+    def test_acceptance_audit_requires_recorded_or_named_external_evidence(self):
+        criteria = matrix.acceptance_audit("esp32c3")
+        recorded = {
+            check
+            for criterion in criteria
+            for check in criterion["verified_in_job"]
+        }
+        with self.assertRaisesRegex(matrix.MatrixError, "no in-job or external evidence"):
+            missing = [dict(item) for item in criteria]
+            missing[0]["verified_in_job"] = []
+            missing[0]["requires_external_evidence"] = []
+            matrix.validate_acceptance_audit(missing, recorded)
+        with self.assertRaisesRegex(matrix.MatrixError, "unrecorded checks"):
+            missing_ref = [dict(item) for item in criteria]
+            missing_ref[0]["verified_in_job"] = ["missing"]
+            matrix.validate_acceptance_audit(missing_ref, recorded)
+        with self.assertRaisesRegex(matrix.MatrixError, "malformed external evidence"):
+            malformed = [dict(item) for item in criteria]
+            malformed[0]["requires_external_evidence"] = [" "]
+            matrix.validate_acceptance_audit(malformed, recorded)
+        matrix.validate_acceptance_audit(criteria, recorded)
+
+    def test_acceptance_audit_names_all_task_and_parent_criteria(self):
+        criteria = matrix.acceptance_audit("esp32s3")
+        self.assertEqual({item["id"] for item in criteria}, matrix.ACCEPTANCE_IDS)
+        self.assertIn(
+            "C3BindingGeneration artifact for esp32c3 on the same PR head",
+            matrix.acceptance_audit("esp32s3")[0]["requires_external_evidence"],
+        )
 
     def test_expected_failure_command_rejects_partial_diagnostic_match(self):
         with tempfile.TemporaryDirectory() as directory:

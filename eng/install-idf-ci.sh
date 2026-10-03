@@ -193,10 +193,11 @@ exported_libclang_dir=$(canonical_path "${ESP_CLANG_LIBS_PATH:-/missing}")
   printf 'Unexpected Ninja version\n' >&2
   exit 1
 }
-[[ "$("$clang" --version | head -n 1)" == 'clang version 21.1.3'* ]] || {
-  printf 'Unexpected EspClang version\n' >&2
-  exit 1
-}
+clang_version=$("$clang" --version)
+printf 'Pinned EspClang --version output:\n%s\n' "$clang_version"
+"$python_bin" "$script_dir/verify-idf-tools.py" \
+  --lock "$lock" --metadata "$metadata" --idf-root "$idf_path" \
+  --verify-tool-output esp-clang "$clang_version"
 [[ "$("$xtensa_gcc" --version)" == *'(crosstool-NG esp-15.2.0_20251204)'* ]] || {
   printf 'Unexpected Xtensa GCC version\n' >&2
   exit 1

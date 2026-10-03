@@ -208,6 +208,7 @@ missing-header failure paths, argv preservation, output protection, and shim
 wrapper behavior against controlled stubs.
 That fixture is SDK-free evidence about generator mechanics only; it does not
 claim an ESP target ABI, real NimBLE header compatibility, or hardware behavior.
-Genuine C3/S3 configured header-generation fixtures and configuration mutation
-checks belong to NIMBLERS-24. Full consumer firmware compilation/linking remains
+The configured C3/S3 fixtures and configuration-mutation checks run in the
+NIMBLERS-24 Azure matrix described above. They validate generation inputs and
+private output only. Full consumer firmware compilation/linking remains
 separate work under NIMBLERS-7.

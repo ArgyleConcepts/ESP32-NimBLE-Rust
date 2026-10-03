@@ -9,6 +9,7 @@ the context probe and exporter target. It never builds the firmware image.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -85,6 +86,24 @@ def read_json(path: Path) -> dict:
     return value
 
 
+def tree_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    for item in sorted(path.rglob("*"), key=lambda entry: entry.as_posix()):
+        relative = item.relative_to(path).as_posix().encode("utf-8")
+        digest.update(relative)
+        if item.is_symlink():
+            digest.update(b"link\0")
+            digest.update(os.readlink(item).encode("utf-8"))
+        elif item.is_file():
+            digest.update(b"file\0")
+            digest.update(item.read_bytes())
+    return digest.hexdigest()
+
+
+def diagnostic_contains(output: str, expected: str) -> bool:
+    return " ".join(expected.split()) in " ".join(output.split())
+
+
 def run_step(
     name: str,
     command: list[str],
@@ -123,6 +142,7 @@ def run_step(
 
 def assert_positive_context(
     build_dir: Path,
+    case_source: Path,
     expected_chip: str,
     expected_compiler: Path,
     seed_sdkconfig: Path,
@@ -166,7 +186,7 @@ def assert_positive_context(
     if any("ARGYLE_DIRECTORY_LEAK" in argument for argument in arguments):
         raise ValueError("a directory compile option added after consumer creation leaked into the probe")
 
-    expected_include = (FIXTURE / "components" / "export_consumer" / "transitive include").resolve()
+    expected_include = (case_source / "components" / "export_consumer" / "transitive include").resolve()
     includes = compiler.get("includes", [])
     if not any(Path(item.get("path", "")).resolve() == expected_include for item in includes):
         raise ValueError("transitive configuration-specific include directory was absent from the probe")
@@ -190,6 +210,7 @@ def assert_positive_context(
 
 def configure_case(
     case: str,
+    case_source: Path,
     case_build: Path,
     copied_sdkconfig: Path,
     args: argparse.Namespace,
@@ -197,7 +218,7 @@ def configure_case(
 ) -> tuple[int, float, str]:
     command = [
         args.cmake,
-        "-S", str(FIXTURE),
+        "-S", str(case_source),
         "-B", str(case_build),
         "-G", args.generator,
         f"-DIDF_TARGET={args.chip}",
@@ -208,7 +229,7 @@ def configure_case(
         "-DIDF_CCACHE_ENABLE=0",
     ]
     return run_step(
-        "configure", command, ROOT, environment,
+        "configure", command, case_source, environment,
         case_build.parent / "configure.log", args.timeout_seconds,
     )
 
@@ -223,6 +244,7 @@ def run_case(
     started = time.monotonic()
     case_build = build_root / args.chip / case
     case_reports = reports_root / args.chip / case
+    case_source = build_root.parent / "cmake-regression-src" / args.chip / case
     case_reports.mkdir(parents=True, exist_ok=True)
     result = {
         "name": case,
@@ -232,10 +254,12 @@ def run_case(
     }
     try:
         case_build.mkdir(parents=True, exist_ok=False)
+        case_source.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(FIXTURE, case_source)
         copied_sdkconfig = case_build / "sdkconfig"
         shutil.copyfile(args.sdkconfig, copied_sdkconfig)
         status, configure_seconds, output = configure_case(
-            case, case_build, copied_sdkconfig, args, environment
+            case, case_source, case_build, copied_sdkconfig, args, environment
         )
         configure_log = case_build.parent / "configure.log"
         shutil.copyfile(configure_log, case_reports / "configure.log")
@@ -269,6 +293,7 @@ def run_case(
             try:
                 assert_positive_context(
                     case_build,
+                    case_source,
                     args.chip,
                     args.compiler,
                     copied_sdkconfig.resolve(strict=True),
@@ -286,7 +311,7 @@ def run_case(
         expected = EXPECTED_NEGATIVES[case]
         if status == 0:
             result["failure"] = "negative CMake configuration unexpectedly succeeded"
-        elif expected not in output:
+        elif not diagnostic_contains(output, expected):
             result["failure"] = f"configuration failed without the expected diagnostic: {expected}"
         else:
             result["status"] = 0
@@ -385,8 +410,22 @@ def main() -> int:
     environment["IDF_CCACHE_ENABLE"] = "0"
 
     results = []
+    fixture_digest_before = tree_digest(FIXTURE)
     for case in (POSITIVE_CASE, *EXPECTED_NEGATIVES.keys()):
         results.append(run_case(case, args.build_root, args.reports, args, environment))
+    fixture_digest_after = tree_digest(FIXTURE)
+    fixture_unchanged = fixture_digest_after == fixture_digest_before
+    results.append({
+        "name": "source_fixture_unchanged",
+        "status": int(not fixture_unchanged),
+        "seconds": 0.0,
+        "log_directory": str(args.reports / args.chip),
+        "evidence": {
+            "before_sha256": fixture_digest_before,
+            "after_sha256": fixture_digest_after,
+        },
+        **({"failure": "tracked source fixture changed during SDK configure/build"} if not fixture_unchanged else {}),
+    })
     write_reports(results, args.reports, args.chip)
     failed = [result for result in results if result["status"] != 0]
     print(f"CMake exporter regressions for {args.chip}: {len(results) - len(failed)}/{len(results)} passed")

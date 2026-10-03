@@ -64,10 +64,13 @@ the crate's actual Cargo build script and pinned EspClang/libclang generator.
 Both `CONFIG_BT_NIMBLE_CPFD_CAFD` values are configured for each chip; the
 retained binding and manifest evidence must show their expected distinct
 `ble_gatt_cpfd` layouts. The driver also verifies stable unchanged inputs,
-mutates/restores generated and transitive headers and a captured compiler
-definition, rejects invalid contexts and disabled NimBLE, exercises missing
-tool/header failures and stale-output cleanup, and compiles an external Cargo
-consumer that must fail Rust privacy checks when it names a generated type.
+reuses the same Cargo output directory across OFF/ON/OFF contexts, and changes
+CAFD in-place in one configured `sdkconfig` before restoring it. It mutates and
+restores generated/transitive headers and a captured compiler definition,
+rejects invalid contexts and a reconfigured NimBLE-disabled target, exercises
+missing-tool/header and Clang-parse failures after successful generation, and
+compiles an external Cargo consumer that must fail Rust privacy checks when it
+names a generated type.
 Cargo sources are fetched once before the matrix and all later Cargo work is
 offline; registry source and Git-checkout digests are compared before and
 after. The package file list, tracked-source digest, build-context JSON,
@@ -85,13 +88,23 @@ context capture; native-host Cargo execution does not validate the ESP target
 ABI. A complete firmware Cargo/`idf.py` compile-and-link remains NIMBLERS-7,
 and no hardware, BLE interoperability, or publication claim is made.
 
+To reproduce a pull-request result, open Pipeline 35 above and queue or rerun
+the reviewed branch/commit with maintainer access to its protected resources.
+Run `HostValidation`, `C3BindingGeneration`, and `S3BindingGeneration` on the
+self-hosted `macOS` pool; do not install the SDK or run project builds locally.
+Confirm Azure's `system.pullRequest.sourceCommitId` matches the intended PR
+head, then download the `host-validation`, `esp32c3-binding-generation`, and
+`esp32s3-binding-generation` artifacts. Inspect each matrix report's
+`generation_states`, `acceptance_audit`, and retained command logs together
+with `generation-matrix.xml` before treating generation as verified.
+
 Current checks are CI-helper regression tests, shell syntax, rustfmt, Clippy,
 host compilation, Cargo unit/integration tests, doctests, rustdoc with warnings
 denied, package identity/publication guard, packaged license/docs, and relative
 Markdown links. Checks continue after a command failure so diagnostics from
 other commands are available, and any failed command fails validation.
 
-The Rust integration tests validate the private context contract and mode
+The SDK-free Rust integration tests validate the private context contract and mode
 selection with SDK-free filesystem fixtures, exercise Cargo binding-output
 identity and transaction failure paths, private binding generation with
 generic host C fixtures, and compile the copied private C shim
@@ -101,11 +114,11 @@ stack interoperability. The Python tests
 exercise context export/capture token handling as well as CI failure propagation,
 missing executables, diagnostic retention, report encoding, unexpected
 exceptions/interrupts, inherited configuration, exact-case tracked-file links,
-and invalid package contracts. Genuine C3/S3 binding generation and target
-configuration checks are later matrix work; no hardware verification is claimed.
-The configured C3/S3 matrix and real CMake exporter regressions are recorded in
-the `esp32c3-binding-generation` and `esp32s3-binding-generation` artifacts.
-They do not replace the SDK-free host tests or make target ABI/firmware claims.
+and invalid package contracts. Separate configured C3/S3 jobs and real CMake
+exporter regressions produce the `esp32c3-binding-generation` and
+`esp32s3-binding-generation` artifacts. Both kinds of checks remain necessary:
+the configured generation jobs do not replace SDK-free host tests or establish
+target ABI, firmware-link, hardware, or BLE-interoperability evidence.
 
 ## Reports, artifacts, and isolation
 

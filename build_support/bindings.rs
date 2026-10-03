@@ -888,7 +888,8 @@ pub(crate) fn validate_toolchain(toolchain: &EspClangToolchain) -> Result<(), Bi
         || !reports_exact_clang_version(&String::from_utf8_lossy(&version.stdout))
     {
         return Err(error(&format!(
-            "selected clang does not report Espressif version {ESP_CLANG_VERSION}"
+            "selected clang does not report Espressif version {ESP_CLANG_VERSION}; reported output: {}",
+            String::from_utf8_lossy(&version.stdout).trim()
         )));
     }
 
@@ -939,7 +940,8 @@ fn verify_loaded_clang_identity() -> Result<(), BindingError> {
         Ok(())
     } else {
         Err(error(&format!(
-            "the loaded libclang does not report exact Espressif release {ESP_CLANG_VERSION}"
+            "the loaded libclang does not report exact Espressif release {ESP_CLANG_VERSION}; reported version: {}",
+            text.as_deref().unwrap_or("<unavailable>")
         )))
     }
 }
