@@ -126,10 +126,25 @@ def tree_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def tracked_tree_digest(root: Path) -> str:
+def readonly_git_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Prevent Git's optional index refresh and discard inherited Git selectors."""
+    selected = {
+        key: value for key, value in environment.items() if not key.startswith("GIT_")
+    }
+    selected.update({
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_COUNT": "0",
+    })
+    return selected
+
+
+def tracked_tree_digest(root: Path, environment: dict[str, str]) -> str:
     result = subprocess.run(
         ["git", "ls-files", "-z"], cwd=root, check=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=environment,
     )
     digest = hashlib.sha256()
     for name in sorted(filter(None, result.stdout.decode().split("\0"))):
@@ -1001,6 +1016,13 @@ def matrix(
     idf_root = Path(args.idf_path).resolve(strict=True)
     tools_root = Path(args.idf_tools_path).resolve(strict=True)
     job_root = Path(args.job_root).resolve(strict=True)
+    common_env = readonly_git_environment(os.environ)
+    common_env.update({
+        "IDF_PATH": str(idf_root),
+        "IDF_TOOLS_PATH": str(tools_root),
+        "ARGYLE_NIMBLE_ROOT": str(root),
+        "IDF_TARGET": chip,
+    })
     fixture_root = job_root / "idf-fixtures"
     build_root = job_root / "idf-build"
     cargo_root = job_root / "cargo-target"
@@ -1024,7 +1046,7 @@ def matrix(
 
     idf_revision = subprocess.run(
         ["git", "-C", str(idf_root), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, env=common_env,
     ).stdout.strip().lower()
     runner.check(
         f"{chip}-pinned-idf-revision",
@@ -1035,7 +1057,7 @@ def matrix(
     nimble_root = idf_root / "components/bt/host/nimble/nimble"
     nimble_revision = subprocess.run(
         ["git", "-C", str(nimble_root), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, env=common_env,
     ).stdout.strip().lower()
     runner.check(
         f"{chip}-pinned-nimble-revision",
@@ -1067,14 +1089,7 @@ def matrix(
     for path in (compiler, clang, libclang):
         runner.check(f"{chip}-tool-present-{path.name}", path.is_file(), f"selected tool exists: {path.name}")
 
-    common_env = dict(os.environ)
-    common_env.update({
-        "IDF_PATH": str(idf_root),
-        "IDF_TOOLS_PATH": str(tools_root),
-        "ARGYLE_NIMBLE_ROOT": str(root),
-        "IDF_TARGET": chip,
-    })
-    base_tracked_digest = tracked_tree_digest(root)
+    base_tracked_digest = tracked_tree_digest(root, common_env)
     if not common_env.get("CARGO_HOME"):
         raise MatrixError("isolated CARGO_HOME is required for source immutability evidence")
     cargo_home = Path(common_env["CARGO_HOME"])
@@ -2095,7 +2110,7 @@ def matrix(
         encoding="utf-8",
     )
 
-    final_tracked_digest = tracked_tree_digest(root)
+    final_tracked_digest = tracked_tree_digest(root, common_env)
     runner.check(
         f"{chip}-tracked-source-tree-unchanged",
         final_tracked_digest == base_tracked_digest,
@@ -2103,7 +2118,7 @@ def matrix(
     )
     status = subprocess.run(
         ["git", "status", "--porcelain", "--untracked-files=all"],
-        cwd=root, check=True, capture_output=True, text=True,
+        cwd=root, check=True, capture_output=True, text=True, env=common_env,
     ).stdout
     runner.check(
         f"{chip}-checkout-clean-after-matrix",

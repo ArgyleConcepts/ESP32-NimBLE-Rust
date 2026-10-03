@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -106,6 +107,28 @@ class IdfPinVerificationTests(unittest.TestCase):
 
 
 class MatrixReportAndDiagnosticTests(unittest.TestCase):
+    def test_readonly_git_environment_disables_nested_optional_index_refresh(self):
+        inherited = {
+            "PATH": os.environ.get("PATH", ""),
+            "GIT_OPTIONAL_LOCKS": "1",
+            "GIT_DIR": "/inherited/repository",
+            "GIT_CONFIG_GLOBAL": "/inherited/gitconfig",
+            "KEEP_FOR_CHILD": "yes",
+        }
+        selected = matrix.readonly_git_environment(inherited)
+
+        self.assertEqual(selected["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertNotIn("GIT_DIR", selected)
+        self.assertEqual(selected["KEEP_FOR_CHILD"], "yes")
+        child = subprocess.run(
+            [sys.executable, "-c", "import os; print(os.environ['GIT_OPTIONAL_LOCKS'])"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=selected,
+        )
+        self.assertEqual(child.stdout.strip(), "0")
+
     def test_matrix_tool_paths_select_the_exact_chip_driver_in_the_pinned_packages(self):
         tools_root = Path("/isolated/idf-tools")
         c3 = matrix.expected_matrix_tool_paths(tools_root, "esp32c3")
