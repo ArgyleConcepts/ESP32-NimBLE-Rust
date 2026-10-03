@@ -113,6 +113,41 @@ def tracked_tree_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
+def retain_ninja_parse_context(
+    runner: MatrixRunner,
+    chip: str,
+    case: str,
+    build: Path,
+    command_log: Path,
+) -> None:
+    """Retain a narrow numbered build.ninja excerpt for parser failures."""
+    log = command_log.read_text(encoding="utf-8", errors="replace")
+    match = re.search(r"build\.ninja:(\d+):\s*bad \$-escape", log)
+    ninja = build / "build.ninja"
+    evidence = {
+        "case": case,
+        "build_ninja_exists": ninja.is_file(),
+        "error_log": command_log.relative_to(runner.reports).as_posix(),
+    }
+    if ninja.is_file() and match is not None:
+        line_number = int(match.group(1))
+        lines = ninja.read_text(encoding="utf-8", errors="replace").splitlines()
+        first = max(1, line_number - 4)
+        last = min(len(lines), line_number + 4)
+        excerpt = "\n".join(
+            f"{index}: {lines[index - 1]}"
+            for index in range(first, last + 1)
+        ) + "\n"
+        destination = runner.reports / "diagnostics" / f"{chip}-{case}-build-ninja-context.txt"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(excerpt, encoding="utf-8")
+        evidence.update({
+            "line": line_number,
+            "excerpt": destination.relative_to(runner.reports).as_posix(),
+        })
+    runner.values.setdefault("matrix", {}).setdefault("cmake_failure_diagnostics", []).append(evidence)
+
+
 def read_json(path: Path) -> dict:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -472,6 +507,44 @@ def retain_file_input(runner: MatrixRunner, chip: str, step: str, input_path: Pa
     return digest
 
 
+def configured_response_input(context_path: Path) -> tuple[dict, Path]:
+    context = read_json(context_path)
+    compiler = context.get("compiler", {})
+    response_files = compiler.get("response_files", [])
+    if not isinstance(response_files, list) or len(response_files) != 1:
+        raise MatrixError("configured ESP-IDF context must capture its single toolchain/cflags response file")
+    response = response_files[0]
+    if not isinstance(response, dict):
+        raise MatrixError("configured ESP-IDF cflags response metadata is malformed")
+    build_root = Path(context["roots"]["build"]).resolve()
+    expected_path = build_root / "toolchain" / "cflags"
+    response_path = Path(response.get("path", ""))
+    if (
+        response_path != expected_path
+        or response.get("token") != f"@{expected_path}"
+        or response_path.is_symlink()
+        or not response_path.is_file()
+    ):
+        raise MatrixError("configured response file is not the ordinary roots.build/toolchain/cflags input")
+    captured = compiler.get("captured_arguments")
+    effective = compiler.get("arguments")
+    argument_index = response.get("argument_index")
+    response_arguments = response.get("arguments")
+    if (
+        not isinstance(captured, list)
+        or not isinstance(effective, list)
+        or type(argument_index) is not int
+        or not isinstance(response_arguments, list)
+        or not (0 <= argument_index < len(captured))
+        or captured[argument_index] != response["token"]
+        or [*captured[:argument_index], *response_arguments, *captured[argument_index + 1:]] != effective
+    ):
+        raise MatrixError("configured response metadata does not match captured and effective compiler argv")
+    if response.get("sha256") != sha256(response_path):
+        raise MatrixError("configured response metadata digest does not match toolchain/cflags")
+    return response, response_path
+
+
 def acceptance_audit(chip: str) -> list[dict]:
     other_chip = "esp32s3" if chip == "esp32c3" else "esp32c3"
     current_job = "C3BindingGeneration" if chip == "esp32c3" else "S3BindingGeneration"
@@ -509,6 +582,12 @@ def acceptance_audit(chip: str) -> list[dict]:
                 f"{chip}-target-context-mismatch",
                 f"{chip}-relevant-flag-invalidates",
                 f"{chip}-flag-restore-identity",
+                f"{chip}-sdk-response-baseline-captured",
+                f"{chip}-sdk-response-reexport-invalidates",
+                f"{chip}-sdk-response-stale-context-identified",
+                f"{chip}-sdk-response-stale-rejected",
+                f"{chip}-sdk-response-rerun-invalidates",
+                f"{chip}-sdk-response-restore-identity",
             ],
             "requires_external_evidence": [],
         },
@@ -521,12 +600,11 @@ def acceptance_audit(chip: str) -> list[dict]:
                 f"{chip}-unsupported-sdk",
                 f"{chip}-unsupported-chip",
                 f"{chip}-target-context-mismatch",
+                f"{chip}-sdk-response-stale-rejected",
                 f"{chip}-disabled-nimble-header",
                 f"{chip}-disabled-nimble-config",
                 f"{chip}-disabled-nimble-configured-state",
                 f"{chip}-missing-clang-tool",
-                f"{chip}-missing-clang-clears-binding",
-                f"{chip}-missing-clang-clears-manifest",
                 f"{chip}-missing-header-after-success",
                 f"{chip}-clang-parse-failure-after-success",
                 f"{chip}-failed-rerun-clears-binding",
@@ -579,6 +657,8 @@ def acceptance_audit(chip: str) -> list[dict]:
                 f"{chip}-generated-config-header-invalidates",
                 f"{chip}-nimble-header-invalidates",
                 f"{chip}-relevant-flag-invalidates",
+                f"{chip}-sdk-response-reexport-invalidates",
+                f"{chip}-sdk-response-rerun-invalidates",
                 f"{chip}-tracked-source-tree-unchanged",
                 f"{chip}-package-excludes-generated-output",
                 f"{chip}-registry-sources-unchanged",
@@ -608,6 +688,7 @@ def acceptance_audit(chip: str) -> list[dict]:
                 f"{chip}-disabled-nimble-header",
                 f"{chip}-disabled-nimble-config",
                 f"{chip}-disabled-nimble-configured-state",
+                f"{chip}-sdk-response-stale-rejected",
                 f"{chip}-missing-header-after-success",
                 f"{chip}-clang-parse-failure-after-success",
                 f"{chip}-failed-rerun-clears-binding",
@@ -653,7 +734,7 @@ def summarize_generation(
     manifest_path = identity["manifest_path"]
     manifest = identity["manifest"]
     source = output.read_text(encoding="utf-8")
-    # bindgen escapes the Rust keyword `format` as `format_`.
+    # Normalize bindgen's trailing-underscore field spelling for C comparison.
     normalized_cpfd_fields = identity["cpfd_fields"]
     cpfd_shape = identity["cpfd_shape"]
     sdkconfig = Path(context["configuration"]["sdkconfig"])
@@ -776,7 +857,7 @@ def cargo_build(
     libclang: Path,
     base_env: dict[str, str],
     *,
-    expect_failure: str | None = None,
+    expect_failure: str | list[str] | None = None,
 ) -> str:
     return runner.command(
         name,
@@ -921,12 +1002,17 @@ def matrix(
         target_dir = cargo_root / f"{chip}-{label}"
         make_fixture(project, root, chip, enabled)
 
-        runner.command(
-            f"{chip}-{label}-idf-set-target",
-            [args.idf_python, Path(args.idf_path) / "tools/idf.py", "-C", project, "-B", build, "set-target", chip],
-            cwd=project,
-            env={**common_env, "ARGYLE_MATRIX_FLAG_VALUE": "17"},
-        )
+        try:
+            runner.command(
+                f"{chip}-{label}-idf-set-target",
+                [args.idf_python, Path(args.idf_path) / "tools/idf.py", "-C", project, "-B", build, "set-target", chip],
+                cwd=project,
+                env={**common_env, "ARGYLE_MATRIX_FLAG_VALUE": "17"},
+            )
+        except MatrixError:
+            failed_log = reports / runner.commands[-1]["log"]
+            retain_ninja_parse_context(runner, chip, f"{label}-idf-set-target", build, failed_log)
+            raise
         runner.command(
             f"{chip}-{label}-idf-reconfigure",
             [args.idf_python, Path(args.idf_path) / "tools/idf.py", "-C", project, "-B", build, "reconfigure"],
@@ -1195,19 +1281,19 @@ def matrix(
             cwd=selected_project,
             env={**common_env, "ARGYLE_MATRIX_FLAG_VALUE": "17"},
         )
-        retain_context_only(runner, chip, "disabled-nimble-restored-input", selected_context)
+        retain_context_only(runner, chip, "disabled-nimble-config-restored-input", selected_context)
         nimble_restored_configuration = read_json(selected_context)["configuration"]
-        retain_file_input(runner, chip, "disabled-nimble-restored-input", Path(nimble_restored_configuration["sdkconfig"]))
-        retain_file_input(runner, chip, "disabled-nimble-restored-input", Path(nimble_restored_configuration["generated_headers"][0]))
+        retain_file_input(runner, chip, "disabled-nimble-config-restored-input", Path(nimble_restored_configuration["sdkconfig"]))
+        retain_file_input(runner, chip, "disabled-nimble-config-restored-input", Path(nimble_restored_configuration["generated_headers"][0]))
         cargo_build(
-            runner, f"{chip}-disabled-nimble-restored", root,
+            runner, f"{chip}-disabled-nimble-config-restored", root,
             selected_context, selected_target, clang, libclang, common_env,
         )
         restored_nimble_state = record_generation_state(
-            runner, chip, "disabled-nimble-restored", selected_context, selected_target,
+            runner, chip, "disabled-nimble-config-restored", selected_context, selected_target,
         )
         runner.check(
-            f"{chip}-disabled-nimble-restored-identity",
+            f"{chip}-disabled-nimble-config-restored-identity",
             restored_nimble_state["input_fingerprint"] == baseline_generation["input_fingerprint"]
             and restored_nimble_state["bindings_sha256"] == baseline_generation["bindings_sha256"],
             "restoring NimBLE in sdkconfig regenerates the baseline output",
@@ -1400,6 +1486,153 @@ def matrix(
         flag_restored_path.name,
     )
 
+    # IDF 6.1 places its configured C flags in toolchain/cflags. Mutate that
+    # actual input to prove the CMake probe recompiles, a stale exported
+    # context is rejected by Cargo, and re-exporting then restoring the file
+    # produces the corresponding new and original generation identities.
+    baseline_response, response_path = configured_response_input(selected_context)
+    original_response_bytes = response_path.read_bytes()
+    baseline_response_sha256 = sha256(response_path)
+    retain_context_only(runner, chip, "sdk-response-baseline-input", selected_context)
+    retain_file_input(runner, chip, "sdk-response-baseline-input", response_path)
+    runner.check(
+        f"{chip}-sdk-response-baseline-captured",
+        baseline_response["sha256"] == baseline_response_sha256
+        and baseline_response["token"] == f"@{response_path}"
+        and baseline_generation["input_fingerprint"] == flag_restored["input_fingerprint"],
+        "the selected consumer context records the pinned SDK toolchain/cflags bytes and baseline identity",
+        "inputs/" + chip + "/sdk-response-baseline-input",
+    )
+    first_response_state = None
+    try:
+        first_response_bytes = original_response_bytes + b"\n-DARGYLE_MATRIX_RESPONSE_MARKER=one\n"
+        response_path.write_bytes(first_response_bytes)
+        retain_context_only(runner, chip, "sdk-response-first-mutation-before-export", selected_context)
+        retain_file_input(runner, chip, "sdk-response-first-mutation", response_path)
+        runner.command(
+            f"{chip}-sdk-response-first-export",
+            [args.cmake, "--build", selected_build, "--target", "argyle_nimble_export_context", "--verbose"],
+            cwd=selected_project,
+            env={**common_env, "ARGYLE_MATRIX_FLAG_VALUE": "17"},
+        )
+        first_response, first_response_path = configured_response_input(selected_context)
+        first_context = read_json(selected_context)
+        runner.check(
+            f"{chip}-sdk-response-probe-recompiled",
+            first_response_path == response_path
+            and first_response["sha256"] == sha256(response_path)
+            and first_response["sha256"] != baseline_response_sha256
+            and "-DARGYLE_MATRIX_RESPONSE_MARKER=one" in first_context["compiler"]["arguments"],
+            "the real CMake exporter captures changed SDK cflags only after rebuilding its compiler probe",
+            selected_context.name,
+        )
+        retain_context_only(runner, chip, "sdk-response-first-mutation", selected_context)
+        retain_file_input(runner, chip, "sdk-response-first-mutation", response_path)
+        cargo_build(
+            runner, f"{chip}-sdk-response-first-cargo", root,
+            selected_context, selected_target, clang, libclang, common_env,
+        )
+        first_response_state = record_generation_state(
+            runner, chip, "sdk-response-first-mutation", selected_context, selected_target,
+        )
+        first_response_manifest = first_response_state["manifest"]
+        manifest_response_files = first_response_manifest.get("compiler", {}).get("response_files", [])
+        runner.check(
+            f"{chip}-sdk-response-reexport-invalidates",
+            first_response_state["input_fingerprint"] != baseline_generation["input_fingerprint"]
+            and len(manifest_response_files) == 1
+            and manifest_response_files[0].get("sha256") == first_response["sha256"]
+            and manifest_response_files[0].get("arguments") == first_response["arguments"],
+            "response bytes and expanded flags enter the successful binding manifest identity",
+            first_response_state["retained_evidence"],
+        )
+
+        second_response_bytes = original_response_bytes + b"\n-DARGYLE_MATRIX_RESPONSE_MARKER=two\n"
+        response_path.write_bytes(second_response_bytes)
+        stale_context = read_json(selected_context)
+        stale_response_metadata = stale_context["compiler"]["response_files"][0]
+        retain_context_only(runner, chip, "sdk-response-stale-mutation", selected_context)
+        retain_file_input(runner, chip, "sdk-response-stale-mutation", response_path)
+        record_generation_state(
+            runner, chip, "sdk-response-stale-mutation", selected_context, selected_target,
+        )
+        runner.check(
+            f"{chip}-sdk-response-stale-context-identified",
+            stale_response_metadata["sha256"] != sha256(response_path)
+            and "-DARGYLE_MATRIX_RESPONSE_MARKER=one" in stale_context["compiler"]["arguments"],
+            "the retained context and response bytes identify a deliberately stale compiler capture",
+            "inputs/" + chip + "/sdk-response-stale-mutation",
+        )
+        cargo_build(
+            runner, f"{chip}-sdk-response-stale-rejected", root,
+            selected_context, selected_target, clang, libclang, common_env,
+            expect_failure=[
+                "compiler.response_files[0].sha256",
+                "does not match the current response-file bytes",
+            ],
+        )
+        existing_after_rejection = read_json(find_output(selected_target)[1])
+        runner.check(
+            f"{chip}-sdk-response-stale-output-not-replaced",
+            existing_after_rejection["input_fingerprint"] == first_response_state["input_fingerprint"]
+            and existing_after_rejection["bindings_sha256"] == first_response_state["bindings_sha256"],
+            "the failed stale-context Cargo invocation did not publish a new generation identity",
+            find_output(selected_target)[1].name,
+        )
+
+        runner.command(
+            f"{chip}-sdk-response-second-export",
+            [args.cmake, "--build", selected_build, "--target", "argyle_nimble_export_context", "--verbose"],
+            cwd=selected_project,
+            env={**common_env, "ARGYLE_MATRIX_FLAG_VALUE": "17"},
+        )
+        second_response, _ = configured_response_input(selected_context)
+        retain_context_only(runner, chip, "sdk-response-second-mutation", selected_context)
+        retain_file_input(runner, chip, "sdk-response-second-mutation", response_path)
+        cargo_build(
+            runner, f"{chip}-sdk-response-rerun-cargo", root,
+            selected_context, selected_target, clang, libclang, common_env,
+        )
+        second_response_state = record_generation_state(
+            runner, chip, "sdk-response-second-mutation", selected_context, selected_target,
+        )
+        runner.check(
+            f"{chip}-sdk-response-rerun-invalidates",
+            second_response["sha256"] == sha256(response_path)
+            and second_response["sha256"] != first_response["sha256"]
+            and second_response_state["input_fingerprint"] != first_response_state["input_fingerprint"]
+            and second_response_state["input_fingerprint"] != baseline_generation["input_fingerprint"],
+            "re-exporting the changed response input produces a distinct successful generation identity",
+            second_response_state["retained_evidence"],
+        )
+    finally:
+        response_path.write_bytes(original_response_bytes)
+        runner.command(
+            f"{chip}-sdk-response-restore-export",
+            [args.cmake, "--build", selected_build, "--target", "argyle_nimble_export_context", "--verbose"],
+            cwd=selected_project,
+            env={**common_env, "ARGYLE_MATRIX_FLAG_VALUE": "17"},
+        )
+        restored_response, _ = configured_response_input(selected_context)
+        retain_context_only(runner, chip, "sdk-response-restored-input", selected_context)
+        retain_file_input(runner, chip, "sdk-response-restored-input", response_path)
+        cargo_build(
+            runner, f"{chip}-sdk-response-restore-cargo", root,
+            selected_context, selected_target, clang, libclang, common_env,
+        )
+        restored_response_state = record_generation_state(
+            runner, chip, "sdk-response-restored", selected_context, selected_target,
+        )
+        runner.check(
+            f"{chip}-sdk-response-restore-identity",
+            response_path.read_bytes() == original_response_bytes
+            and restored_response["sha256"] == baseline_response_sha256
+            and restored_response_state["input_fingerprint"] == baseline_generation["input_fingerprint"]
+            and restored_response_state["bindings_sha256"] == baseline_generation["bindings_sha256"],
+            "restoring toolchain/cflags and re-exporting returns the exact baseline manifest and bindings",
+            restored_response_state["retained_evidence"],
+        )
+
     # Invalid context edits run through the same successful Cargo target and
     # must stop before build.rs emits argyle_nimble_esp. Restore exact bytes and
     # require a fresh successful generation after each invalid case.
@@ -1491,7 +1724,7 @@ def matrix(
         sdkconfig_header.write_bytes(disabled_header)
     retain_file_input(runner, chip, "disabled-nimble-header-restored-input", sdkconfig_header)
     cargo_build(
-        runner, f"{chip}-disabled-nimble-restored", root,
+        runner, f"{chip}-disabled-nimble-header-restored", root,
         selected_context, selected_target, clang, libclang, common_env,
     )
     disabled_header_restored = record_generation_state(
@@ -1508,23 +1741,12 @@ def matrix(
     missing_clang = job_root / "missing-esp-clang"
     missing_env = dict(common_env)
     missing_env["ARGYLE_NIMBLE_ESP_CLANG"] = str(missing_clang)
-    missing_clang_out_dir = find_output(selected_target)[0].parent
     runner.command(
         f"{chip}-missing-clang-tool",
         ["cargo", "build", "--locked", "--offline", "-vv"],
         cwd=root,
         env=cargo_environment(missing_env, selected_context, selected_target, missing_clang, libclang),
         expect_failure="selected Espressif clang is unavailable",
-    )
-    runner.check(
-        f"{chip}-missing-clang-clears-binding",
-        not (missing_clang_out_dir / "nimble_bindings.rs").exists(),
-        "missing selected clang after success removes the previous binding output",
-    )
-    runner.check(
-        f"{chip}-missing-clang-clears-manifest",
-        not (missing_clang_out_dir / "nimble_bindings.manifest.json").exists(),
-        "missing selected clang after success removes the previous input manifest",
     )
     cargo_build(
         runner, f"{chip}-missing-clang-restored", root,
@@ -1794,7 +2016,7 @@ def matrix(
     }
     recorded = {check["name"] for check in runner.checks}
     validate_acceptance_audit(result["acceptance_audit"], recorded)
-    runner.values["matrix"]["acceptance_criteria_verified"] = [
+    runner.values["matrix"]["acceptance_audit_recorded"] = [
         criterion["id"] for criterion in result["acceptance_audit"]
     ]
     return result

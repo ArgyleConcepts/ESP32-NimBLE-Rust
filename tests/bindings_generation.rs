@@ -6,7 +6,10 @@ mod bindings;
 mod context;
 
 use bindings::{Allowlist, OutputLocation};
-use context::{DefineEvent, DefineOperation, EspBuildContext, IncludeKind, IncludePath};
+use context::{
+    CompilerResponseFile, DefineEvent, DefineOperation, EspBuildContext, IncludeKind, IncludePath,
+};
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,6 +35,8 @@ impl Fixture {
             "argyle nimble bindings {} {sequence}",
             std::process::id()
         ));
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let sdk_root = root.join("ESP IDF 6.1");
         let build_root = root.join("consumer build");
         let sysroot = root.join("toolchain sysroot");
@@ -44,6 +49,7 @@ impl Fixture {
         let sdkconfig = root.join("consumer config/sdkconfig");
         let sdkconfig_header = root.join("generated/sdkconfig.h");
         let version_header = sdk_root.join("version/esp_idf_version.h");
+        let response_path = build_root.join("toolchain/cflags");
         let probe_source = build_root.join("argyle-nimble/context_probe.c");
         let compiler = root.join("toolchain bin/selected C compiler");
 
@@ -64,6 +70,7 @@ impl Fixture {
             version_header.parent().unwrap().to_path_buf(),
             probe_source.parent().unwrap().to_path_buf(),
             compiler.parent().unwrap().to_path_buf(),
+            response_path.parent().unwrap().to_path_buf(),
         ];
         for directory in directories {
             fs::create_dir_all(directory).unwrap();
@@ -102,6 +109,12 @@ impl Fixture {
             "--sysroot".to_owned(),
             "../toolchain sysroot".to_owned(),
         ]);
+        let response_contents =
+            b"-march=rv32imc_zicsr_zifencei -mabi=ilp32 -DSTART_BEFORE_ACTION=1";
+        fs::write(&response_path, response_contents).unwrap();
+        let response_token = format!("@{}", response_path.display());
+        let mut captured_compiler_arguments = vec![response_token.clone()];
+        captured_compiler_arguments.extend(compiler_arguments.iter().skip(3).cloned());
 
         Self {
             root,
@@ -118,6 +131,18 @@ impl Fixture {
                 working_directory,
                 build_configuration: "Debug".into(),
                 compiler_arguments,
+                captured_compiler_arguments,
+                response_files: vec![CompilerResponseFile {
+                    argument_index: 0,
+                    token: response_token,
+                    path: response_path,
+                    sha256: format!("{:x}", Sha256::digest(response_contents)),
+                    arguments: vec![
+                        "-march=rv32imc_zicsr_zifencei".into(),
+                        "-mabi=ilp32".into(),
+                        "-DSTART_BEFORE_ACTION=1".into(),
+                    ],
+                }],
                 includes: vec![
                     IncludePath {
                         kind: IncludeKind::Normal,
@@ -430,6 +455,24 @@ fn output_authority_allows_cargo_dirs_in_build_and_include_roots() {
     };
     assert!(bindings::validate_output(&fixture.context, &accepted, &header).is_ok());
 
+    let response_parent = fixture.context.response_files[0]
+        .path
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let rejected_response_output = OutputLocation {
+        directory: response_parent.clone(),
+        authorized_root: response_parent,
+        crate_root: fixture.root.join("source crate"),
+        forbidden_roots: Vec::new(),
+    };
+    assert!(
+        bindings::validate_output(&fixture.context, &rejected_response_output, &header)
+            .unwrap_err()
+            .to_string()
+            .contains("overlaps a protected source, SDK, header, or Cargo registry path")
+    );
+
     let sdk_output = fixture.context.sdk_root.join("accidental output");
     fs::create_dir_all(&sdk_output).unwrap();
     let rejected = OutputLocation {
@@ -636,8 +679,17 @@ fn exact_clang_version_and_explicit_tool_selection_fail_closed() {
     assert!(bindings::reports_exact_clang_version(
         "clang version 21.1.3 (Espressif build)\n"
     ));
+    assert!(bindings::reports_exact_clang_version(
+        "Espressif clang version 21.1.3 (https://github.com/espressif/llvm-project esp-21.1.3_20260408)\n"
+    ));
+    assert!(!bindings::reports_exact_clang_version(
+        "OtherVendor clang version 21.1.3\n"
+    ));
     assert!(!bindings::reports_exact_clang_version(
         "clang version 21.1.30\n"
+    ));
+    assert!(!bindings::reports_exact_clang_version(
+        "Espressif clang version 21.1.3.1\n"
     ));
     assert!(!bindings::reports_exact_clang_version(
         "clang version 21.1\n"
@@ -746,14 +798,20 @@ fn shim_syntax_check_forwards_consumer_flags_without_probe_actions() {
 
     bindings::validate_shim_with_consumer_compiler(&fixture.context).unwrap();
     let captured = fs::read_to_string(argument_log).unwrap();
-    assert!(captured.contains("-march=rv32imc_zicsr_zifencei\n"));
-    assert!(captured.contains("-mabi=ilp32\n"));
+    assert!(captured.contains(&format!("{}\n", fixture.context.response_files[0].token)));
+    let response_contents = fs::read_to_string(&fixture.context.response_files[0].path).unwrap();
+    assert_eq!(
+        response_contents,
+        "-march=rv32imc_zicsr_zifencei -mabi=ilp32 -DSTART_BEFORE_ACTION=1"
+    );
     assert!(captured.contains("-DVALUE=with spaces \n"));
     assert!(captured.contains(&format!(
         "-I\n{}\n",
         fixture.context.includes[0].path.display()
     )));
     assert!(captured.contains("-fsyntax-only\n"));
+    assert!(!captured.contains("-march=rv32imc_zicsr_zifencei\n"));
+    assert!(!captured.contains("-mabi=ilp32\n"));
     assert!(captured.contains("-x\nc\n"));
     assert!(captured.contains("src/backend/nimble_shim.c\n"));
     assert!(!captured.contains("-c\n"));

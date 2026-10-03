@@ -548,16 +548,34 @@ fn validate_declared_sysroot(
 pub(crate) fn strip_probe_action_arguments(
     context: &EspBuildContext,
 ) -> Result<Vec<(usize, String)>, BindingError> {
+    strip_probe_action_arguments_from(context, &context.compiler_arguments, false)
+}
+
+fn strip_probe_action_arguments_from(
+    context: &EspBuildContext,
+    args: &[String],
+    allow_approved_response_token: bool,
+) -> Result<Vec<(usize, String)>, BindingError> {
     let mut result = Vec::new();
     let mut index = 0;
     let mut found_compile = false;
     let mut found_source = false;
     let mut found_output = false;
     let mut dependency_mode = false;
-    let args = &context.compiler_arguments[..];
-    if args.iter().any(|argument| argument.starts_with('@')) {
+    let approved_response_tokens = context
+        .response_files
+        .iter()
+        .map(|response| response.token.as_str())
+        .collect::<Vec<_>>();
+    if args.iter().any(|argument| {
+        argument.starts_with('@')
+            && (!allow_approved_response_token
+                || !approved_response_tokens
+                    .iter()
+                    .any(|token| argument.as_str() == *token))
+    }) {
         return Err(error(
-            "captured compiler arguments contain a response file; regenerate the CMake context with tokenized arguments",
+            "compiler arguments contain an unapproved response file; regenerate the CMake context",
         ));
     }
     while index < args.len() {
@@ -688,10 +706,18 @@ pub(crate) fn validate_shim_with_consumer_compiler(
             "private NimBLE C shim source is missing; restore src/backend/nimble_shim.c",
         ));
     }
-    let arguments = strip_probe_action_arguments(context)?
-        .into_iter()
-        .map(|(_, argument)| argument)
-        .collect::<Vec<_>>();
+    context
+        .verify_response_files_unchanged()
+        .map_err(|context_error| {
+            error(&format!(
+                "SDK response file changed or failed validation before the C compiler check: {context_error}"
+            ))
+        })?;
+    let arguments =
+        strip_probe_action_arguments_from(context, &context.captured_compiler_arguments, true)?
+            .into_iter()
+            .map(|(_, argument)| argument)
+            .collect::<Vec<_>>();
     let result = Command::new(&context.compiler)
         .args(arguments)
         .arg("-fsyntax-only")
@@ -716,6 +742,13 @@ pub(crate) fn validate_shim_with_consumer_compiler(
         };
         return Err(error(&message));
     }
+    context
+        .verify_response_files_unchanged()
+        .map_err(|context_error| {
+            error(&format!(
+                "SDK response file changed during the C compiler check: {context_error}"
+            ))
+        })?;
     Ok(())
 }
 
@@ -910,8 +943,14 @@ pub(crate) fn validate_toolchain(toolchain: &EspClangToolchain) -> Result<(), Bi
 
 pub(crate) fn reports_exact_clang_version(output: &str) -> bool {
     let mut fields = output.lines().next().unwrap_or_default().split_whitespace();
-    fields.next() == Some("clang")
-        && fields.next() == Some("version")
+    let first = fields.next();
+    let (clang, version_marker) = if first == Some("Espressif") {
+        (fields.next(), fields.next())
+    } else {
+        (first, fields.next())
+    };
+    clang == Some("clang")
+        && version_marker == Some("version")
         && fields.next() == Some(ESP_CLANG_VERSION)
 }
 
@@ -1081,6 +1120,12 @@ fn validate_output_inner(
         context.version_header.clone(),
     ]);
     forbidden.extend(context.generated_headers.iter().cloned());
+    forbidden.extend(
+        context
+            .response_files
+            .iter()
+            .map(|response| response.path.clone()),
+    );
     for source_root in [
         "src",
         "build_support",
@@ -1117,7 +1162,12 @@ fn validate_output_inner(
     .into_iter()
     .chain(context.generated_headers.iter().cloned())
     .chain([context.sdkconfig.clone(), context.version_header.clone()])
-    {
+    .chain(
+        context
+            .response_files
+            .iter()
+            .map(|response| response.path.clone()),
+    ) {
         let canonical = protected_file.canonicalize().map_err(|_| {
             error("a protected shim, SDK configuration, or generated header is unavailable")
         })?;

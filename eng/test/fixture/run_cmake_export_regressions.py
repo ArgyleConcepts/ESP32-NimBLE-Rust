@@ -183,6 +183,8 @@ def assert_positive_context(
         raise ValueError("late Release IPO setting did not reach the compiled probe")
     if "-DARGYLE_TRANSITIVE_OPTION=1" not in arguments:
         raise ValueError("transitive configuration-specific compile option was absent from the probe")
+    if "-DARGYLE_LEGACY_FLAGS=1" not in arguments:
+        raise ValueError("late target COMPILE_FLAGS value was absent from the probe")
     if any("ARGYLE_DIRECTORY_LEAK" in argument for argument in arguments):
         raise ValueError("a directory compile option added after consumer creation leaked into the probe")
 
@@ -198,6 +200,7 @@ def assert_positive_context(
         "C_STANDARD=11",
         "C_STANDARD_REQUIRED=ON",
         "C_EXTENSIONS=OFF",
+        "COMPILE_FLAGS=-DARGYLE_LEGACY_FLAGS=1",
         "POSITION_INDEPENDENT_CODE=ON",
         "INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON",
         "probe_links_consumer=OFF",

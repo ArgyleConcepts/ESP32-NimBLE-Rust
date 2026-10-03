@@ -100,12 +100,15 @@ back; CODEOWNERS had no reported errors on either base. Force-push/deletion poli
 was inspected without attempting destructive operations. The non-owner review
 requirement was verified through configuration, not by impersonating a contributor.
 
-Each implementation includes its own tests. The later Phase 1 matrix
-integrates compile-pass/fail, unit/property, lifecycle, concurrency,
-fault-injection, FFI, and C3/S3 compile/link checks. Require 90% line coverage of
-host-testable handwritten framework code with documented generated/target-only
-exclusions. These checks do not establish hardware verification. Package readiness
-also requires compiling a fresh external consumer through Azure.
+Each implementation includes its own tests. The NIMBLERS-24 Azure matrix
+exercises configured C3/S3 binding generation, compiler/header/configuration
+mutation, lifecycle failures, and private-surface rejection. SDK-free host
+validation remains separate, and neither matrix establishes ESP target ABI or
+firmware compile/link evidence; those checks belong to NIMBLERS-7. Require 90%
+line coverage of host-testable handwritten framework code with documented
+generated/target-only exclusions. These checks do not establish hardware
+verification. Package readiness also requires compiling a fresh external
+consumer through Azure.
 
 ## Security and releases
 

@@ -26,10 +26,21 @@ the ESP-IDF repository root before its commit is recorded. It creates the
 small C probe with the selected compiler and exports the context to
 `<BUILD_DIR>/argyle-nimble/build-context-v1.json`. The probe captures compiler
 arguments as an argv array and records its working directory only after the
-compiler succeeds. A failed invocation clears any previous capture. The exporter
-rejects compiler response files because their contents are not an argv array.
-It does not parse `compile_commands.json`, split command strings, inspect a
-global SDK installation, or inspect inherited environment values.
+compiler succeeds. A failed invocation clears any previous capture. ESP-IDF
+6.1 places configured C flags in the single generated
+`<BUILD_DIR>/toolchain/cflags` response file. The launcher accepts only that
+ordinary file at its canonical build-root path, parses the pinned
+[GCC 15.2 response-file syntax](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/Overall-Options.html#Overall-Options),
+and rejects nested files and action, output, input, or
+tool-selection overrides. It hashes and parses the file before compiling with
+the original argv, then verifies that its bytes did not change before writing
+the capture. The exporter rechecks the hash and ordered tokens. The probe object
+depends on `toolchain/cflags`, so a later response-file edit must run the real
+selected-compiler probe again before a new context can be exported. The context
+retains both the raw captured argv and the ordered effective argv with the
+response tokens expanded. It does not parse `compile_commands.json`, split
+command strings, inspect a global SDK installation, or inspect inherited
+environment values.
 
 For reliable capture, call the exporter from the consumer target's defining
 CMake source and binary directory. It rejects nonempty `RULE_LAUNCH_COMPILE`
@@ -60,7 +71,8 @@ The emitted contract preserves these values:
 | `roots.sdk`, `roots.build` | Active ESP-IDF and CMake build roots. |
 | `target.chip`, `target.architecture` | Active ESP-IDF target and target-architecture build properties. |
 | `compiler.path`, `compiler.sysroot`, `compiler.working_directory` | The selected compiler invocation and its effective sysroot. Relative sysroot arguments are resolved from the captured working directory. |
-| `compiler.arguments` | Every compiler argument after the executable, preserved in order and with its original boundaries. |
+| `compiler.arguments` | Effective ordered compiler arguments after the single approved IDF `toolchain/cflags` response token has been replaced by parsed tokens. |
+| `compiler.captured_arguments`, `compiler.response_files` | Raw argv with the exact response token and its canonical path, SHA-256 digest, parsed tokens, and argv index. Other or nested response files are rejected. |
 | `compiler.includes`, `compiler.defines` | Ordered include and define/undefine events derived from the authoritative argv, with argument indexes that are checked against it. |
 | `compiler.implicit_includes` | Ordered implicit include directories reported by CMake for the selected compiler. |
 | `compiler.build_configuration` | The selected single-config name; an empty string is retained when CMake has no named configuration. Multi-config generators are rejected. |

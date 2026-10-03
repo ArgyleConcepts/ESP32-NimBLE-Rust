@@ -8,6 +8,8 @@ import re
 import subprocess
 import sys
 
+import capture_compiler
+
 
 INCLUDE_OPTIONS = (
     ("-isystem", "system"),
@@ -71,7 +73,7 @@ def compile_events(arguments: list[str], working_directory: str) -> tuple[list[d
     while index < len(arguments):
         argument = arguments[index]
         if argument.startswith("@"):
-            fail("compiler.arguments", "contains a response-file reference; CMake must provide tokenized arguments")
+            fail("compiler.arguments", "contains an unexpanded response-file reference")
 
         include_option = next(
             ((option, kind) for option, kind in INCLUDE_OPTIONS if argument == option),
@@ -175,7 +177,7 @@ def query_sysroot(compiler: str, arguments: list[str], working_directory: str) -
     return str(path)
 
 
-def read_capture(path: str) -> tuple[str, list[str], str]:
+def read_capture(path: str, build_root: str) -> tuple[str, list[str], list[str], list[dict], str]:
     try:
         captured = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
@@ -184,14 +186,37 @@ def read_capture(path: str) -> tuple[str, list[str], str]:
         fail("compiler.arguments", "the configured C compiler capture must be a JSON object")
     compiler = captured.get("compiler")
     arguments = captured.get("arguments")
+    captured_arguments = captured.get("captured_arguments", arguments)
+    response_files = captured.get("response_files", [])
     working_directory = captured.get("working_directory")
-    if not isinstance(compiler, str) or not compiler or not isinstance(arguments, list) or not all(isinstance(item, str) for item in arguments):
+    if (
+        not isinstance(compiler, str) or not compiler
+        or not isinstance(arguments, list) or not all(isinstance(item, str) for item in arguments)
+        or not isinstance(captured_arguments, list)
+        or not all(isinstance(item, str) for item in captured_arguments)
+        or not isinstance(response_files, list)
+    ):
         fail("compiler.arguments", "the C compiler capture does not contain a compiler and an argument array")
     if not isinstance(working_directory, str):
         fail("compiler.working_directory", "is missing from the successful compiler capture")
     if type(captured.get("status")) is not int or captured["status"] != 0:
         fail("compiler.arguments", "the compiler probe did not complete successfully")
-    return compiler, arguments, absolute_directory(working_directory, "compiler.working_directory")
+    working_directory = absolute_directory(working_directory, "compiler.working_directory")
+    try:
+        effective_arguments, current_response_files = capture_compiler.expand_idf_cflags_response(
+            captured_arguments, Path(build_root), Path(working_directory),
+        )
+    except (OSError, ValueError) as error:
+        fail(
+            "compiler.response_files",
+            f"could not validate the configured ESP-IDF response input; rebuild the exporter target: {error}",
+        )
+    if arguments != effective_arguments or response_files != current_response_files:
+        fail(
+            "compiler.response_files",
+            "the captured response-file hash or ordered tokens changed after probe compilation; rebuild the exporter target",
+        )
+    return compiler, arguments, captured_arguments, response_files, working_directory
 
 
 def main() -> int:
@@ -230,7 +255,9 @@ def main() -> int:
     else:
         fail("target", "configured ESP-IDF chip/architecture is unsupported or mismatched")
 
-    compiler, arguments, working_directory = read_capture(args.compiler_capture)
+    compiler, arguments, captured_arguments, response_files, working_directory = read_capture(
+        args.compiler_capture, build_root,
+    )
     compiler = absolute_file(compiler, "compiler.path")
     includes, defines = compile_events(arguments, working_directory)
     sysroot = query_sysroot(compiler, arguments, working_directory)
@@ -249,6 +276,8 @@ def main() -> int:
             "sysroot": sysroot,
             "working_directory": working_directory,
             "arguments": arguments,
+            "captured_arguments": captured_arguments,
+            "response_files": response_files,
             "includes": includes,
             "implicit_includes": implicit_includes,
             "defines": defines,

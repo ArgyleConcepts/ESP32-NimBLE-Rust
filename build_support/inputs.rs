@@ -65,6 +65,12 @@ pub(crate) fn esp_generation_watch_inputs(
         crate_root.join("src/backend/nimble_shim.c"),
     ];
     files.extend(context.generated_headers.iter().cloned());
+    files.extend(
+        context
+            .response_files
+            .iter()
+            .map(|response| response.path.clone()),
+    );
     files.extend(sdk_git_paths.iter().cloned());
 
     GenerationWatchInputs { directories, files }

@@ -5,6 +5,7 @@ mod context;
 
 use context::{BuildContext, DefineOperation, IncludeKind};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,14 +28,26 @@ impl Fixture {
             sequence,
             chip
         ));
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let sdk_root = root.join("ESP IDF 6.1");
         let build_root = root.join("consumer build");
+        let response_path = build_root.join("toolchain/cflags");
         let sysroot = root.join("toolchain sysroot");
         let include_one = root.join("include paths/first");
         let include_two = root.join("include paths/second ");
-        for directory in [&sdk_root, &build_root, &sysroot, &include_one, &include_two] {
+        for directory in [
+            &sdk_root,
+            &build_root,
+            &sysroot,
+            &include_one,
+            &include_two,
+            response_path.parent().unwrap(),
+        ] {
             fs::create_dir_all(directory).unwrap();
         }
+        let response_contents = b"-march=fixture-abi";
+        fs::write(&response_path, response_contents).unwrap();
 
         let compiler = root.join("toolchain bin/selected C compiler");
         fs::create_dir_all(compiler.parent().unwrap()).unwrap();
@@ -90,6 +103,9 @@ impl Fixture {
             "--sysroot".to_owned(),
             "../toolchain sysroot".to_owned(),
         ];
+        let response_token = format!("@{}", response_path.display());
+        let mut captured_args = vec![response_token.clone()];
+        captured_args.extend(compiler_args.iter().skip(1).cloned());
         let value = json!({
             "schema_version": 1,
             "sdk": {
@@ -108,6 +124,14 @@ impl Fixture {
                 "working_directory": build_root.clone(),
                 "build_configuration": "Debug",
                 "arguments": compiler_args.clone(),
+                "captured_arguments": captured_args,
+                "response_files": [{
+                    "argument_index": 0,
+                    "token": response_token,
+                    "path": response_path,
+                    "sha256": format!("{:x}", Sha256::digest(response_contents)),
+                    "arguments": ["-march=fixture-abi"]
+                }],
                 "includes": [
                     {"kind": "normal", "path": include_one.clone(), "argument_index": 1},
                     {"kind": "system", "path": include_two.clone(), "argument_index": 3}
@@ -144,6 +168,41 @@ impl Fixture {
 
     fn path(&self, relative: impl AsRef<Path>) -> PathBuf {
         self.root.join(relative)
+    }
+
+    fn set_effective_arguments(&self, value: &mut Value, arguments: Vec<String>) {
+        let response_path = self.path("consumer build/toolchain/cflags");
+        let response_token = format!("@{}", response_path.display());
+        let response_contents = b"";
+        fs::write(&response_path, response_contents).unwrap();
+        let mut captured = arguments.clone();
+        let argument_index = captured.len();
+        captured.push(response_token.clone());
+        value["compiler"]["arguments"] = json!(arguments);
+        value["compiler"]["captured_arguments"] = json!(captured);
+        value["compiler"]["response_files"] = json!([{
+            "argument_index": argument_index,
+            "token": response_token,
+            "path": response_path,
+            "sha256": format!("{:x}", Sha256::digest(response_contents)),
+            "arguments": []
+        }]);
+    }
+
+    fn set_response_arguments(&self, value: &mut Value, arguments: Vec<String>) {
+        let response_path = self.path("consumer build/toolchain/cflags");
+        let contents = arguments.join(" ");
+        fs::write(&response_path, contents.as_bytes()).unwrap();
+        let response_token = format!("@{}", response_path.display());
+        value["compiler"]["arguments"] = json!(arguments);
+        value["compiler"]["captured_arguments"] = json!([response_token.clone()]);
+        value["compiler"]["response_files"] = json!([{
+            "argument_index": 0,
+            "token": response_token,
+            "path": response_path,
+            "sha256": format!("{:x}", Sha256::digest(contents.as_bytes())),
+            "arguments": arguments
+        }]);
     }
 }
 
@@ -183,6 +242,279 @@ fn c3_and_s3_contexts_preserve_argument_boundaries_and_order() {
         assert_eq!(parsed.defines[0].value, "NAME=value with spaces ");
         assert_eq!(parsed.defines[1].operation, DefineOperation::Undefine);
     }
+}
+
+#[test]
+fn pinned_idf_cflags_response_is_hashed_and_spliced_into_effective_argv() {
+    let fixture = Fixture::new("esp32c3");
+    let parsed = context::parse_context_file(&fixture.contract).unwrap();
+    let response = &parsed.response_files[0];
+    assert_eq!(
+        response.path,
+        fixture.path("consumer build/toolchain/cflags")
+    );
+    assert_eq!(response.argument_index, 0);
+    assert_eq!(response.token, format!("@{}", response.path.display()));
+    assert_eq!(response.arguments, ["-march=fixture-abi"]);
+    assert_eq!(parsed.compiler_arguments, fixture.compiler_args);
+    assert_eq!(parsed.captured_compiler_arguments[0], response.token);
+    parsed.verify_response_files_unchanged().unwrap();
+}
+
+#[test]
+fn legacy_no_response_contexts_remain_valid_when_argv_has_no_at_token() {
+    let fixture = Fixture::new("esp32c3");
+    let mut value = fixture.read();
+    value["compiler"]
+        .as_object_mut()
+        .unwrap()
+        .remove("captured_arguments");
+    value["compiler"]
+        .as_object_mut()
+        .unwrap()
+        .remove("response_files");
+    fixture.write(&value);
+
+    let parsed = context::parse_context_file(&fixture.contract).unwrap();
+    assert_eq!(
+        parsed.captured_compiler_arguments,
+        parsed.compiler_arguments
+    );
+    assert!(parsed.response_files.is_empty());
+}
+
+#[test]
+fn gcc_response_tokenizer_preserves_quote_groups_and_backslash_escapes() {
+    let fixture = Fixture::new("esp32c3");
+    let response_path = fixture.path("consumer build/toolchain/cflags");
+    let contents = br#"-march=fixture-abi -fmacro-prefix-map=src\ path=dest -fdebug-prefix-map='single path'=out -fmacro-prefix-map="double path"=out2"#;
+    fs::write(&response_path, contents).unwrap();
+    let response_arguments = vec![
+        "-march=fixture-abi".to_owned(),
+        "-fmacro-prefix-map=src path=dest".to_owned(),
+        "-fdebug-prefix-map=single path=out".to_owned(),
+        "-fmacro-prefix-map=double path=out2".to_owned(),
+    ];
+    let mut effective = response_arguments.clone();
+    effective.extend(fixture.compiler_args.iter().skip(1).cloned());
+    let response_token = format!("@{}", response_path.display());
+    let mut value = fixture.read();
+    value["compiler"]["arguments"] = json!(effective);
+    value["compiler"]["captured_arguments"][0] = json!(response_token);
+    value["compiler"]["response_files"][0]["sha256"] =
+        json!(format!("{:x}", Sha256::digest(contents)));
+    value["compiler"]["response_files"][0]["arguments"] = json!(response_arguments);
+    for event in value["compiler"]["includes"].as_array_mut().unwrap() {
+        let index = event["argument_index"].as_u64().unwrap();
+        event["argument_index"] = json!(index + 3);
+    }
+    for event in value["compiler"]["defines"].as_array_mut().unwrap() {
+        let index = event["argument_index"].as_u64().unwrap();
+        event["argument_index"] = json!(index + 3);
+    }
+    fixture.write(&value);
+
+    let parsed = context::parse_context_file(&fixture.contract).unwrap();
+    assert_eq!(
+        parsed.response_files[0].arguments[1],
+        "-fmacro-prefix-map=src path=dest"
+    );
+    assert_eq!(
+        parsed.response_files[0].arguments[2],
+        "-fdebug-prefix-map=single path=out"
+    );
+    assert_eq!(
+        parsed.response_files[0].arguments[3],
+        "-fmacro-prefix-map=double path=out2"
+    );
+}
+
+#[test]
+fn gcc_response_tokenizer_rejects_nul_and_only_splits_ascii_whitespace() {
+    let malformed_contents: [&[u8]; 3] =
+        [b"-march=ok \0tail", b"'-march=\0ok'", b"-march=ok\\\0tail"];
+    for contents in malformed_contents {
+        let fixture = Fixture::new("esp32c3");
+        fs::write(fixture.path("consumer build/toolchain/cflags"), contents).unwrap();
+        let mut value = fixture.read();
+        value["compiler"]["response_files"][0]["sha256"] =
+            json!(format!("{:x}", Sha256::digest(contents)));
+        fixture.write(&value);
+        let error = context::parse_context_file(&fixture.contract).unwrap_err();
+        assert!(error.to_string().contains("NUL byte"));
+    }
+
+    let fixture = Fixture::new("esp32c3");
+    let unicode_space_flag = "-fmacro-prefix-map=a\u{00a0}b=out";
+    let contents = unicode_space_flag.as_bytes();
+    fs::write(fixture.path("consumer build/toolchain/cflags"), contents).unwrap();
+    let mut value = fixture.read();
+    value["compiler"]["arguments"][0] = json!(unicode_space_flag);
+    value["compiler"]["response_files"][0]["sha256"] =
+        json!(format!("{:x}", Sha256::digest(contents)));
+    value["compiler"]["response_files"][0]["arguments"] = json!([unicode_space_flag]);
+    fixture.write(&value);
+
+    let parsed = context::parse_context_file(&fixture.contract).unwrap();
+    assert_eq!(parsed.response_files[0].arguments, [unicode_space_flag]);
+}
+
+#[test]
+fn response_file_changes_and_unsafe_references_fail_closed() {
+    {
+        let fixture = Fixture::new("esp32c3");
+        fs::remove_file(fixture.path("consumer build/toolchain/cflags")).unwrap();
+        let error = context::parse_context_file(&fixture.contract).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("generated ESP-IDF toolchain/cflags"));
+    }
+    {
+        let fixture = Fixture::new("esp32c3");
+        let path = fixture.path("consumer build/toolchain/cflags");
+        let malformed = b"-march='unterminated";
+        fs::write(&path, malformed).unwrap();
+        let mut value = fixture.read();
+        value["compiler"]["response_files"][0]["sha256"] =
+            json!(format!("{:x}", Sha256::digest(malformed)));
+        fixture.write(&value);
+        let error = context::parse_context_file(&fixture.contract).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unmatched GCC response-file quote"));
+    }
+    {
+        let fixture = Fixture::new("esp32c3");
+        let mut value = fixture.read();
+        let outside = fixture.path("outside/cflags");
+        value["compiler"]["response_files"][0]["path"] = json!(outside);
+        value["compiler"]["response_files"][0]["token"] = json!(format!("@{}", outside.display()));
+        value["compiler"]["captured_arguments"][0] = json!(format!("@{}", outside.display()));
+        fixture.write(&value);
+        let error = context::parse_context_file(&fixture.contract).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("normalized roots.build/toolchain/cflags"));
+    }
+    {
+        let fixture = Fixture::new("esp32c3");
+        let nested = b"-march=fixture-abi @extra.rsp";
+        fs::write(fixture.path("consumer build/toolchain/cflags"), nested).unwrap();
+        let mut value = fixture.read();
+        value["compiler"]["response_files"][0]["sha256"] =
+            json!(format!("{:x}", Sha256::digest(nested)));
+        value["compiler"]["response_files"][0]["arguments"] =
+            json!(["-march=fixture-abi", "@extra.rsp"]);
+        fixture.write(&value);
+        let error = context::parse_context_file(&fixture.contract).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("nested or additional response-file"));
+    }
+    {
+        let fixture = Fixture::new("esp32c3");
+        let mut value = fixture.read();
+        value["compiler"]["captured_arguments"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("@extra.rsp"));
+        fixture.write(&value);
+        let error = context::parse_context_file(&fixture.contract).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("exactly the metadata-approved SDK @cflags token"));
+    }
+    {
+        let fixture = Fixture::new("esp32c3");
+        fs::write(
+            fixture.path("consumer build/toolchain/cflags"),
+            b"-march=mutated-abi",
+        )
+        .unwrap();
+        let error = context::parse_context_file(&fixture.contract).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the current response-file bytes"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn response_file_symlinks_are_rejected_even_when_the_target_is_inside_the_build_tree() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new("esp32c3");
+    let response_path = fixture.path("consumer build/toolchain/cflags");
+    let target = fixture.path("consumer build/toolchain/other flags");
+    fs::write(&target, b"-march=fixture-abi").unwrap();
+    fs::remove_file(&response_path).unwrap();
+    symlink(&target, &response_path).unwrap();
+
+    let error = context::parse_context_file(&fixture.contract).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("ordinary non-symlink regular response file"));
+}
+
+#[test]
+fn cflags_response_rejects_compile_output_dependency_and_tool_override_options() {
+    for (flag, diagnostic) in [
+        ("-c", "compile action"),
+        ("-oobject.o", "compile action"),
+        ("-MFdeps.d", "compile action"),
+        ("-M", "compile action"),
+        ("-MM", "compile action"),
+        ("-fsyntax-only", "compile action"),
+        ("-save-temps=obj", "compile action"),
+        ("--output=object.o", "compile action"),
+        ("--dependency-file=deps.d", "compile action"),
+        ("-dependency-file=deps.d", "compile action"),
+        ("--", "compile action"),
+        ("-", "compile action"),
+        ("nimble_shim.c", "positional source operand"),
+        ("-Bcustom-toolchain", "toolchain/language override"),
+        ("-specs=custom.specs", "toolchain/language override"),
+        ("--specs=custom.specs", "toolchain/language override"),
+        ("-fplugin=custom.so", "toolchain/language override"),
+        ("-wrapper=custom-wrapper", "toolchain/language override"),
+        ("-fuse-ld=lld", "toolchain/language override"),
+        ("-xc++", "toolchain/language override"),
+        ("--target=other-target", "toolchain/language override"),
+    ] {
+        let fixture = Fixture::new("esp32c3");
+        let mut value = fixture.read();
+        value["compiler"]["includes"] = json!([]);
+        value["compiler"]["defines"] = json!([]);
+        fixture.set_response_arguments(&mut value, vec![flag.to_owned()]);
+        fixture.write(&value);
+        let error = context::parse_context_file(&fixture.contract).unwrap_err();
+        assert!(
+            error.to_string().contains(diagnostic),
+            "flag {flag}: {error}"
+        );
+    }
+}
+
+#[test]
+fn cflags_response_rejects_an_empty_separate_option_operand() {
+    let fixture = Fixture::new("esp32c3");
+    let contents = b"-I \"\"";
+    fs::write(fixture.path("consumer build/toolchain/cflags"), contents).unwrap();
+    let mut value = fixture.read();
+    value["compiler"]["includes"] = json!([]);
+    value["compiler"]["defines"] = json!([]);
+    value["compiler"]["arguments"] = json!(["-I", ""]);
+    let response_token = value["compiler"]["response_files"][0]["token"].clone();
+    value["compiler"]["captured_arguments"] = json!([response_token]);
+    value["compiler"]["response_files"][0]["sha256"] =
+        json!(format!("{:x}", Sha256::digest(contents)));
+    value["compiler"]["response_files"][0]["arguments"] = json!(["-I", ""]);
+    fixture.write(&value);
+
+    let error = context::parse_context_file(&fixture.contract).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("empty operand for a GCC compiler option"));
 }
 
 #[test]
@@ -390,21 +722,21 @@ fn missing_files_and_malformed_compiler_arguments_fail_with_field_guidance() {
     {
         let fixture = Fixture::new("esp32c3");
         let mut value = fixture.read();
-        value["compiler"]["arguments"] = json!(["@compile response.rsp"]);
         value["compiler"]["includes"] = json!([]);
         value["compiler"]["defines"] = json!([]);
+        fixture.set_effective_arguments(&mut value, vec!["@compile response.rsp".to_owned()]);
         fixture.write(&value);
         assert!(context::parse_context_file(&fixture.contract)
             .unwrap_err()
             .to_string()
-            .contains("response-file reference"));
+            .contains("exactly the metadata-approved SDK @cflags token"));
     }
     {
         let fixture = Fixture::new("esp32c3");
         let mut value = fixture.read();
-        value["compiler"]["arguments"] = json!(["-I"]);
         value["compiler"]["includes"] = json!([]);
         value["compiler"]["defines"] = json!([]);
+        fixture.set_effective_arguments(&mut value, vec!["-I".to_owned()]);
         fixture.write(&value);
         assert!(context::parse_context_file(&fixture.contract)
             .unwrap_err()
@@ -424,9 +756,9 @@ fn missing_files_and_malformed_compiler_arguments_fail_with_field_guidance() {
     {
         let fixture = Fixture::new("esp32c3");
         let mut value = fixture.read();
-        value["compiler"]["arguments"] = json!(["-D"]);
         value["compiler"]["includes"] = json!([]);
         value["compiler"]["defines"] = json!([]);
+        fixture.set_effective_arguments(&mut value, vec!["-D".to_owned()]);
         fixture.write(&value);
         assert!(context::parse_context_file(&fixture.contract)
             .unwrap_err()
@@ -438,7 +770,7 @@ fn missing_files_and_malformed_compiler_arguments_fail_with_field_guidance() {
         let mut value = fixture.read();
         let mut arguments = fixture.compiler_args.clone();
         arguments.truncate(arguments.len() - 1);
-        value["compiler"]["arguments"] = json!(arguments);
+        fixture.set_effective_arguments(&mut value, arguments);
         fixture.write(&value);
         assert!(context::parse_context_file(&fixture.contract)
             .unwrap_err()
@@ -450,7 +782,7 @@ fn missing_files_and_malformed_compiler_arguments_fail_with_field_guidance() {
         let mut value = fixture.read();
         let mut arguments = fixture.compiler_args.clone();
         *arguments.last_mut().unwrap() = String::new();
-        value["compiler"]["arguments"] = json!(arguments);
+        fixture.set_effective_arguments(&mut value, arguments);
         fixture.write(&value);
         assert!(context::parse_context_file(&fixture.contract)
             .unwrap_err()
@@ -475,7 +807,7 @@ fn declared_sysroot_must_match_the_explicit_argument() {
     let mut arguments = fixture.compiler_args.clone();
     arguments.truncate(arguments.len() - 2);
     arguments.push("--sysroot=".to_owned());
-    value["compiler"]["arguments"] = json!(arguments);
+    fixture.set_effective_arguments(&mut value, arguments);
     fixture.write(&value);
     assert!(context::parse_context_file(&fixture.contract)
         .unwrap_err()
@@ -492,7 +824,7 @@ fn declared_sysroot_must_match_the_explicit_argument() {
             .to_string_lossy()
             .into_owned(),
     ]);
-    value["compiler"]["arguments"] = json!(arguments);
+    fixture.set_effective_arguments(&mut value, arguments);
     fixture.write(&value);
     assert!(context::parse_context_file(&fixture.contract)
         .unwrap_err()

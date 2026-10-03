@@ -1,5 +1,6 @@
 """Unit tests for token-preserving build-context export helpers."""
 
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -208,6 +209,8 @@ class CompilerExportTests(unittest.TestCase):
             written = json.loads(capture.read_text(encoding="utf-8"))
             self.assertEqual(written["compiler"], compiler_argv[0])
             self.assertEqual(written["arguments"], compiler_argv[1:])
+            self.assertEqual(written["captured_arguments"], compiler_argv[1:])
+            self.assertEqual(written["response_files"], [])
             self.assertEqual(written["working_directory"], str(Path.cwd()))
             self.assertEqual(written["status"], 0)
 
@@ -235,6 +238,142 @@ class CompilerExportTests(unittest.TestCase):
 
             run.assert_not_called()
             self.assertFalse(capture.exists())
+
+    def test_gcc_response_capture_preserves_raw_argv_and_records_expanded_input(self):
+        with tempfile.TemporaryDirectory(prefix="argyle response capture ") as temporary:
+            build_root = Path(temporary) / "idf-build"
+            capture = build_root / "argyle-nimble" / "compiler-capture.json"
+            capture.parent.mkdir(parents=True)
+            response_path = build_root / "toolchain" / "cflags"
+            response_path.parent.mkdir()
+            response_contents = b'-DNAME="two words" -I"include path" -DVALUE=foo\\ bar\n'
+            response_path.write_bytes(response_contents)
+            object_path = build_root / "CMakeFiles/probe.o"
+            raw_argv = ["/compiler", "-c", f"@{response_path}", "probe.c", "-o", str(object_path)]
+            with (
+                mock.patch.object(
+                    capture_compiler.sys,
+                    "argv",
+                    ["capture_compiler.py", str(capture), *raw_argv],
+                ),
+                mock.patch.object(capture_compiler.subprocess, "run", return_value=mock.Mock(returncode=0)) as run,
+            ):
+                self.assertEqual(capture_compiler.main(), 0)
+
+            run.assert_called_once_with(raw_argv, check=False)
+            written = json.loads(capture.read_text(encoding="utf-8"))
+            self.assertEqual(written["captured_arguments"], raw_argv[1:])
+            self.assertEqual(
+                written["arguments"],
+                ["-c", "-DNAME=two words", "-Iinclude path", "-DVALUE=foo bar", "probe.c", "-o", str(object_path)],
+            )
+            self.assertEqual(len(written["response_files"]), 1)
+            response = written["response_files"][0]
+            self.assertEqual(response["argument_index"], 1)
+            self.assertEqual(response["token"], f"@{response_path}")
+            self.assertEqual(response["path"], str(response_path))
+            self.assertEqual(response["arguments"], ["-DNAME=two words", "-Iinclude path", "-DVALUE=foo bar"])
+            self.assertEqual(response["sha256"], hashlib.sha256(response_contents).hexdigest())
+
+    def test_response_file_mutation_during_probe_does_not_publish_capture(self):
+        with tempfile.TemporaryDirectory(prefix="argyle response race ") as temporary:
+            build_root = Path(temporary) / "idf-build"
+            capture = build_root / "argyle-nimble" / "compiler-capture.json"
+            capture.parent.mkdir(parents=True)
+            response_path = build_root / "toolchain" / "cflags"
+            response_path.parent.mkdir()
+            response_path.write_text("-DVALUE=before\n", encoding="utf-8")
+
+            def mutate_response(*_args, **_kwargs):
+                response_path.write_text("-DVALUE=after\n", encoding="utf-8")
+                return mock.Mock(returncode=0)
+
+            with (
+                mock.patch.object(
+                    capture_compiler.sys,
+                    "argv",
+                    ["capture_compiler.py", str(capture), "/compiler", f"@{response_path}"],
+                ),
+                mock.patch.object(capture_compiler.subprocess, "run", side_effect=mutate_response),
+            ):
+                self.assertEqual(capture_compiler.main(), 2)
+
+            self.assertFalse(capture.exists())
+
+    def test_gcc_response_parser_rejects_unsafe_or_malformed_contents(self):
+        for contents in (
+            b"@nested.rsp", b"-c", b"-o object.o", b"-B/toolchain",
+            b"-specs=other.specs", b"--specs=other.specs", b"-wrapper=wrapper", b"-xlanguage",
+            b"--target=other-target", b"-fuse-ld=other-linker",
+            b"-save-temps=objects", b"--output=object.o", b"--dependency-file=object.d",
+            b"-dependency-file=object.d",
+            b"-DNAME='unterminated", b"-DNAME=trailing\\",
+            b'-I ""',
+        ):
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as temporary:
+                build_root = Path(temporary) / "idf-build"
+                response_path = build_root / "toolchain" / "cflags"
+                response_path.parent.mkdir(parents=True)
+                response_path.write_bytes(contents)
+                with self.assertRaises(ValueError):
+                    capture_compiler.expand_idf_cflags_response(
+                        [f"@{response_path}"], build_root, Path(temporary),
+                    )
+
+    def test_gcc_response_parser_uses_ascii_separators_and_rejects_any_nul(self):
+        parsed = capture_compiler._tokenize_gcc_response(
+            "-DNAME=left\u00a0right -DQUOTED='left\u00a0right'".encode("utf-8")
+        )
+        self.assertEqual(
+            parsed,
+            ["-DNAME=left\u00a0right", "-DQUOTED=left\u00a0right"],
+        )
+        for contents in (b"-DNAME='quoted\0nul'", b"-DNAME=escaped\\\0nul"):
+            with self.subTest(contents=contents), self.assertRaisesRegex(ValueError, "NUL byte"):
+                capture_compiler._tokenize_gcc_response(contents)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            build_root = Path(temporary) / "idf-build"
+            expected = build_root / "toolchain" / "cflags"
+            expected.parent.mkdir(parents=True)
+            expected.write_text("-DVALUE=1\n", encoding="utf-8")
+            other_response = Path(temporary) / "custom.rsp"
+            other_response.write_text("-DVALUE=2\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "exact configured ESP-IDF toolchain/cflags path"):
+                capture_compiler.expand_idf_cflags_response(
+                    [f"@{other_response}"], build_root, Path(temporary),
+                )
+
+    def test_exporter_rejects_response_hash_or_token_mismatch(self):
+        with tempfile.TemporaryDirectory(prefix="argyle response export ") as temporary:
+            build_root = Path(temporary) / "idf-build"
+            capture_path = build_root / "argyle-nimble" / "compiler-capture.json"
+            capture_path.parent.mkdir(parents=True)
+            response_path = build_root / "toolchain" / "cflags"
+            response_path.parent.mkdir()
+            response_path.write_text("-DVALUE=one\n", encoding="utf-8")
+            captured_arguments = [f"@{response_path}"]
+            expanded, response_files = capture_compiler.expand_idf_cflags_response(
+                captured_arguments, build_root, Path(temporary),
+            )
+            record = {
+                "compiler": "/compiler",
+                "arguments": expanded,
+                "captured_arguments": captured_arguments,
+                "response_files": response_files,
+                "working_directory": str(temporary),
+                "status": 0,
+            }
+            capture_path.write_text(json.dumps(record), encoding="utf-8")
+            response_path.write_text("-DVALUE=two\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "hash or ordered tokens changed"):
+                export_build_context.read_capture(str(capture_path), str(build_root))
+
+            response_path.write_text("-DVALUE=one\n", encoding="utf-8")
+            record["response_files"][0]["arguments"] = ["-DVALUE=forged"]
+            capture_path.write_text(json.dumps(record), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "hash or ordered tokens changed"):
+                export_build_context.read_capture(str(capture_path), str(build_root))
 
 
 if __name__ == "__main__":

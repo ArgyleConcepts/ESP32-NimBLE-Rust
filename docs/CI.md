@@ -67,6 +67,8 @@ retained binding and manifest evidence must show their expected distinct
 reuses the same Cargo output directory across OFF/ON/OFF contexts, and changes
 CAFD in-place in one configured `sdkconfig` before restoring it. It mutates and
 restores generated/transitive headers and a captured compiler definition,
+then mutates the SDK-generated `toolchain/cflags` input to verify compiler-probe
+recapture, stale-context rejection, re-export, and restored identity.
 rejects invalid contexts and a reconfigured NimBLE-disabled target, exercises
 missing-tool/header and Clang-parse failures after successful generation, and
 compiles an external Cargo consumer that must fail Rust privacy checks when it

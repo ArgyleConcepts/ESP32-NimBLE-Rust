@@ -139,6 +139,12 @@ fn run() -> Result<(), String> {
     output_location
         .forbidden_roots
         .push(context.compiler.clone());
+    output_location.forbidden_roots.extend(
+        context
+            .response_files
+            .iter()
+            .map(|response| response.path.clone()),
+    );
     let shim_header = manifest_dir.join("src/backend/nimble_shim.h");
     bindings::validate_cargo_output(&context, &output_location, &shim_header)
         .map_err(|error| error.to_string())?;
@@ -252,6 +258,13 @@ fn run() -> Result<(), String> {
             Ok(())
         },
         |generated| {
+            context
+                .verify_response_files_unchanged()
+                .map_err(|error| {
+                    format!(
+                        "SDK response file changed during ESP binding generation; discard this context and re-export: {error}"
+                    )
+                })?;
             let headers = resolved_headers.borrow();
             let mut header_inputs = Vec::new();
             let mut header_parent_directories = Vec::new();
@@ -271,11 +284,21 @@ fn run() -> Result<(), String> {
                 emit_watch(&out_dir.join(lifecycle::RERUN_SENTINEL))?;
             }
             header_inputs.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
-            let config_inputs = std::iter::once(&context.sdkconfig)
+            let mut config_inputs = std::iter::once(&context.sdkconfig)
                 .chain(context.generated_headers.iter())
                 .chain(std::iter::once(&context.version_header))
                 .map(|path| canonical_content_identity(path))
                 .collect::<Result<Vec<_>, _>>()?;
+            for response in &context.response_files {
+                let identity = canonical_content_identity(&response.path)?;
+                if identity["sha256"].as_str() != Some(response.sha256.as_str()) {
+                    return Err(
+                        "SDK response file changed while binding generation identity was being assembled; re-export the CMake context"
+                            .to_owned(),
+                    );
+                }
+                config_inputs.push(identity);
+            }
             let ordered_search_paths = include_paths
                 .iter()
                 .map(|path| {
@@ -336,6 +359,12 @@ fn run() -> Result<(), String> {
                             .chain(std::iter::once(&context.version_header))
                             .cloned(),
                     );
+                    paths.extend(
+                        context
+                            .response_files
+                            .iter()
+                            .map(|response| response.path.clone()),
+                    );
                     paths.sort();
                     paths.dedup();
                     lifecycle::path_resolution_identities(&paths)?
@@ -354,6 +383,14 @@ fn run() -> Result<(), String> {
                     "working_directory": context.working_directory.display().to_string(),
                     "build_configuration": context.build_configuration,
                     "arguments": context.compiler_arguments,
+                    "captured_arguments": context.captured_compiler_arguments,
+                    "response_files": context.response_files.iter().map(|response| json!({
+                        "argument_index": response.argument_index,
+                        "token": response.token,
+                        "path": response.path.display().to_string(),
+                        "sha256": response.sha256,
+                        "arguments": response.arguments,
+                    })).collect::<Vec<_>>(),
                     "translated_clang_target": bindgen_target,
                     "bindgen_arguments": bindgen_arguments,
                     "ordered_include_search_paths": ordered_search_paths,

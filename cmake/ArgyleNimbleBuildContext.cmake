@@ -75,7 +75,7 @@ function(_argyle_nimble_copy_scalar_compile_properties consumer probe)
     get_target_property(_argyle_consumer_binary_dir "${consumer}" BINARY_DIR)
     get_directory_property(_argyle_consumer_build_type DIRECTORY "${_argyle_consumer_binary_dir}"
         DEFINITION CMAKE_BUILD_TYPE)
-    foreach(_argyle_property IN ITEMS C_STANDARD C_STANDARD_REQUIRED C_EXTENSIONS
+    foreach(_argyle_property IN ITEMS COMPILE_FLAGS C_STANDARD C_STANDARD_REQUIRED C_EXTENSIONS
         POSITION_INDEPENDENT_CODE C_VISIBILITY_PRESET INTERPROCEDURAL_OPTIMIZATION)
         get_property(_argyle_property_set TARGET "${consumer}" PROPERTY "${_argyle_property}" SET)
         if(_argyle_property_set)
@@ -261,6 +261,27 @@ function(argyle_nimble_export_build_context)
 
     set(_argyle_probe_source "${_argyle_context_dir}/context_probe.c")
     file(WRITE "${_argyle_probe_source}" "int argyle_nimble_context_probe(void) { return 0; }\n")
+    if(DEFINED IDF_TOOLCHAIN_BUILD_DIR)
+        set(_argyle_toolchain_build_dir "${IDF_TOOLCHAIN_BUILD_DIR}")
+    else()
+        get_property(_argyle_toolchain_build_dir CACHE IDF_TOOLCHAIN_BUILD_DIR PROPERTY VALUE)
+    endif()
+    if(NOT _argyle_toolchain_build_dir OR NOT IS_DIRECTORY "${_argyle_toolchain_build_dir}")
+        message(FATAL_ERROR
+            "ESP-IDF toolchain response-file directory is unavailable; rerun CMake with the configured ESP-IDF toolchain")
+    endif()
+    get_filename_component(_argyle_toolchain_build_dir "${_argyle_toolchain_build_dir}" REALPATH)
+    get_filename_component(_argyle_expected_toolchain_build_dir "${_argyle_build_dir}/toolchain" REALPATH)
+    if(NOT "${_argyle_toolchain_build_dir}" STREQUAL "${_argyle_expected_toolchain_build_dir}"
+        OR NOT EXISTS "${_argyle_toolchain_build_dir}/cflags")
+        message(FATAL_ERROR
+            "ESP-IDF toolchain response files must be generated under the configured build directory's toolchain/cflags path")
+    endif()
+    # IDF 6.1 stores CMAKE_C_FLAGS in this response file. Make the compiler
+    # probe depend on its contents so a changed file triggers a real GCC
+    # invocation and replaces the capture only after that invocation succeeds.
+    set_property(SOURCE "${_argyle_probe_source}" APPEND PROPERTY OBJECT_DEPENDS
+        "${_argyle_toolchain_build_dir}/cflags")
     set(_argyle_probe_target "argyle_nimble_context_probe")
     set(_argyle_export_target "argyle_nimble_export_context")
     if(TARGET "${_argyle_probe_target}" OR TARGET "${_argyle_export_target}")
@@ -295,11 +316,6 @@ function(argyle_nimble_export_build_context)
     # top-level CMake can finish configuring the consumer first.
     _argyle_nimble_copy_scalar_compile_properties(
         "${ARG_CONSUMER_TARGET}" "${_argyle_probe_target}")
-
-    # COMPILE_FLAGS is a legacy string property which CMake evaluates when
-    # constructing its compiler invocation; leave its tokenization to CMake.
-    set_property(TARGET "${_argyle_probe_target}" PROPERTY COMPILE_FLAGS
-        "$<TARGET_GENEX_EVAL:${ARG_CONSUMER_TARGET},$<TARGET_PROPERTY:${ARG_CONSUMER_TARGET},COMPILE_FLAGS>>")
 
     set_property(TARGET "${_argyle_probe_target}" PROPERTY
         C_COMPILER_LAUNCHER

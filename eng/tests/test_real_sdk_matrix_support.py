@@ -95,7 +95,7 @@ class IdfPinVerificationTests(unittest.TestCase):
 
     def test_reported_tool_version_uses_the_pinned_sdk_regex_and_exact_release(self):
         metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
-        output = "clang version 21.1.3 (https://github.com/espressif/llvm-project esp-21.1.3_20260408)"
+        output = "Espressif clang version 21.1.3 (https://github.com/espressif/llvm-project esp-21.1.3_20260408)"
         self.assertEqual(
             tool_pins.verify_tool_output_version(self.lock, metadata, "esp-clang", output),
             self.lock["tools"]["esp-clang"]["version"],
@@ -106,6 +106,32 @@ class IdfPinVerificationTests(unittest.TestCase):
 
 
 class MatrixReportAndDiagnosticTests(unittest.TestCase):
+    def test_ninja_failure_retains_the_referenced_build_file_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reports = root / "reports"
+            runner = matrix.MatrixRunner(root, reports)
+            runner.values["matrix"] = {"chip": "esp32c3"}
+            build = root / "idf-build"
+            build.mkdir()
+            (build / "build.ninja").write_text(
+                "line one\nline two\nline three\nline four\nline five\nline six\n",
+                encoding="utf-8",
+            )
+            log = reports / "logs/set-target.log"
+            log.parent.mkdir(parents=True)
+            log.write_text("ninja: error: build.ninja:5: bad $-escape\n", encoding="utf-8")
+
+            matrix.retain_ninja_parse_context(
+                runner, "esp32c3", "cpfd-cafd-on-idf-set-target", build, log,
+            )
+
+            retained = runner.values["matrix"]["cmake_failure_diagnostics"][0]
+            excerpt = (reports / retained["excerpt"]).read_text(encoding="utf-8")
+            self.assertEqual(retained["line"], 5)
+            self.assertIn("5: line five", excerpt)
+            self.assertEqual(retained["error_log"], "logs/set-target.log")
+
     def test_failed_report_keeps_partial_values_checks_and_command_logs(self):
         with tempfile.TemporaryDirectory() as directory:
             reports = Path(directory) / "reports"
@@ -225,15 +251,25 @@ class GeneratedSourceInspectionTests(unittest.TestCase):
                 )
 
     def test_acceptance_audit_rejects_missing_check_names(self):
-        criteria = [{"criterion": "fixture criterion", "checks": ["present", "missing"]}]
+        criteria = matrix.acceptance_audit("esp32c3")
+        recorded = {
+            check
+            for criterion in criteria
+            for check in criterion["verified_in_job"]
+        }
+        missing = criteria[0]["verified_in_job"][0]
+        recorded.remove(missing)
         with self.assertRaisesRegex(matrix.MatrixError, "missing"):
-            matrix.validate_acceptance_audit(criteria, {"present"})
+            matrix.validate_acceptance_audit(criteria, recorded)
 
     def test_acceptance_audit_accepts_recorded_check_names(self):
-        matrix.validate_acceptance_audit(
-            [{"criterion": "fixture criterion", "checks": ["present"]}],
-            {"present"},
-        )
+        criteria = matrix.acceptance_audit("esp32c3")
+        recorded = {
+            check
+            for criterion in criteria
+            for check in criterion["verified_in_job"]
+        }
+        matrix.validate_acceptance_audit(criteria, recorded)
 
 
 if __name__ == "__main__":

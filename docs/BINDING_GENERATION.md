@@ -46,7 +46,15 @@ inherited selector changes output identity and reruns validation.
 Rerun inputs include the raw context JSON, sdkconfig and generated headers,
 shim sources, selected compiler/tool files, SDK Git metadata and submodule
 revisions, all resolved transitive headers reported by bindgen, and the
-ordered include/sysroot/resource-directory search roots. Cargo recursively
+ordered include/sysroot/resource-directory search roots. The configured IDF
+6.1 `roots.build/toolchain/cflags` file is the only supported response file.
+The context records its raw `@file` argv token, parsed ordered flags, canonical
+path, and SHA-256; the build script reparses and rehashes the current bytes,
+watches that file, and includes its content identity in the manifest. A changed
+file invalidates Cargo generation and requires rebuilding the CMake exporter
+target so its selected-GCC probe can refresh the capture. Nested, additional,
+symlinked, or non-IDF response files and response-file action/output/tool
+overrides fail closed. Cargo recursively
 observes a watched directory, so ordinary include roots detect both edits and
 newly added shadow headers. Selected path aliases and their canonical
 resolutions are recorded in the private manifest. The parent directories of
@@ -78,11 +86,12 @@ repeatedly; the watch avoids recursively scanning the SDK's Git object database.
 
 The selector must name Espressif's `esp-clang` and `libclang` package
 `esp-21.1.3_20260408`. Generation checks the clang executable's reported
-version and the actually loaded libclang version, and requires `LIBCLANG_PATH`
-to identify the same canonical library file. A preloaded different libclang,
-generic host LLVM, or a different package release fails explicitly. The
-generator does not mutate process environment variables; callers that need a
-different library must use an isolated process.
+version (`clang version 21.1.3` or the pinned vendor banner
+`Espressif clang version 21.1.3`) and the actually loaded libclang version,
+and requires `LIBCLANG_PATH` to identify the same canonical library file. A
+preloaded different libclang, generic host LLVM, or a different package release
+fails explicitly. The generator does not mutate process environment variables;
+callers that need a different library must use an isolated process.
 
 The CMake context's compiler executable, working directory, ordered argv,
 sysroot, include events, and implicit include directories are authoritative.
@@ -108,14 +117,17 @@ captured `-march` and `-mabi` values. The closed target mapping is:
 | ESP32-C3 / `riscv32` | `riscv32-esp-elf` | `riscv32-esp-unknown-elf` |
 | ESP32-S3 / `xtensa` | `xtensa-esp-elf` or `xtensa-esp32s3-elf` | `xtensa-esp-unknown-elf` with `-mcpu=esp32s3` |
 
-The generator does not broadly translate GCC-specific options. If the selected
-Clang rejects a captured option or cannot parse a selected consumer header,
+The generator does not broadly translate GCC-specific options. The single
+approved IDF response file is expanded and validated by the context exporter;
+bindgen receives its parsed semantic flags while the selected-GCC shim check
+uses the raw argv with that same approved response token. If the selected Clang
+rejects a captured option or cannot parse a selected consumer header,
 generation fails with a diagnostic to inspect the configured compiler context.
-Response files and nonempty `BINDGEN_EXTRA_CLANG_ARGS*`, `CPATH`,
+Other response files and nonempty `BINDGEN_EXTRA_CLANG_ARGS*`, `CPATH`,
 `C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH`, or `OBJC_INCLUDE_PATH` overrides are
 rejected because those variables can add unrecorded headers. The consumer
 compiler subprocesses also remove the include-path variables defensively.
-Neither response files nor environment overrides are split or applied
+No unrecorded response files or environment overrides are split or applied
 implicitly. Bindgen and syntax-parser diagnostics are retained in concise
 failure messages.
 
