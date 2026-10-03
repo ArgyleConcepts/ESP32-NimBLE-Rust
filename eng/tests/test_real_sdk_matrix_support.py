@@ -214,16 +214,63 @@ class GeneratedSourceInspectionTests(unittest.TestCase):
             "pub name_space: u8, pub description: *const i8,}"
         )
         opaque_address = "pub struct ble_gatt_cpfd { pub _address: u8, }"
+        opaque_blob = "pub struct ble_gatt_cpfd { pub _bindgen_opaque_blob: [u8; 0], }"
         unexpected = "pub struct ble_gatt_cpfd { pub _unexpected: u8, }"
+        unexpected_double_underscore = (
+            "pub struct ble_gatt_cpfd { pub __bindgen_opaque_blob: [u8; 0], }"
+        )
 
         self.assertEqual(
             matrix.cpfd_layout(complete),
             (sorted(matrix.CPFD_FIELDS), "complete"),
         )
         self.assertEqual(matrix.cpfd_layout(opaque_address), ([], "opaque"))
+        self.assertEqual(matrix.cpfd_layout(opaque_blob), ([], "opaque"))
         self.assertEqual(
             matrix.cpfd_layout(unexpected), (["_unexpected"], "opaque"),
         )
+        self.assertEqual(
+            matrix.cpfd_layout(unexpected_double_underscore),
+            (["__bindgen_opaque_blob"], "opaque"),
+        )
+
+    def test_generated_files_are_retained_before_shape_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reports = root / "reports"
+            runner = matrix.MatrixRunner(root, reports)
+            context = root / "build-context-v1.json"
+            context.write_text("{}\n", encoding="utf-8")
+            output_dir = (
+                root / "target/debug/build/argyle-nimble-fixture/out"
+            )
+            output_dir.mkdir(parents=True)
+            output = output_dir / "nimble_bindings.rs"
+            output.write_text("pub struct unexpected {}\n", encoding="utf-8")
+            manifest = output_dir / "nimble_bindings.manifest.json"
+            manifest.write_text(
+                json.dumps({"input_fingerprint": "inputs", "bindings_sha256": "bindings"}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(matrix.MatrixError, "ble_gatt_cpfd"):
+                matrix.retain_generation_evidence(
+                    runner, "esp32c3", "cpfd-cafd-off", context, root / "target",
+                )
+
+            retained = reports / "inputs/esp32c3/cpfd-cafd-off"
+            self.assertEqual(
+                (retained / "nimble_bindings.rs").read_text(encoding="utf-8"),
+                output.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                (retained / "nimble_bindings.manifest.json").read_text(encoding="utf-8"),
+                manifest.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                (retained / "build-context-v1.json").read_text(encoding="utf-8"),
+                context.read_text(encoding="utf-8"),
+            )
 
     def test_token_spaced_cpfd_fields_and_excluded_function_are_recognized(self):
         source = (

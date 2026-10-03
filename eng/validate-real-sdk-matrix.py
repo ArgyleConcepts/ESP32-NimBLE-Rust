@@ -30,7 +30,7 @@ CLANG_RELEASE = "21.1.3_20260408"
 GCC_RELEASE = "esp-15.2.0_20251204"
 CAFD_OPTION = "CONFIG_BT_NIMBLE_CPFD_CAFD"
 CPFD_FIELDS = {"format", "exponent", "unit", "name_space", "description"}
-CPFD_OPAQUE_MARKERS = {"_unused", "__bindgen_opaque_blob", "_address"}
+CPFD_OPAQUE_MARKERS = {"_unused", "_bindgen_opaque_blob", "_address"}
 ACCEPTANCE_IDS = {
     *(f"NIMBLERS-24-AC{number}" for number in range(1, 7)),
     *(f"NIMBLERS-6-AC{number}" for number in range(1, 6)),
