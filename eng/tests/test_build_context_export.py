@@ -2,7 +2,10 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -17,6 +20,28 @@ import export_build_context
 
 
 class CompilerExportTests(unittest.TestCase):
+    def test_exporter_entrypoint_does_not_write_import_bytecode(self):
+        with tempfile.TemporaryDirectory(prefix="argyle exporter bytecode ") as temporary:
+            cmake = Path(temporary) / "cmake"
+            cmake.mkdir()
+            for name in ("capture_compiler.py", "export_build_context.py"):
+                shutil.copy2(ROOT / "cmake" / name, cmake / name)
+            environment = dict(os.environ)
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+
+            result = subprocess.run(
+                [sys.executable, str(cmake / "export_build_context.py"), "--help"],
+                cwd=cmake,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse((cmake / "__pycache__").exists())
+
     def test_compile_events_preserve_separate_arguments_and_spaces(self):
         with tempfile.TemporaryDirectory(prefix="argyle includes ") as temporary:
             root = Path(temporary)

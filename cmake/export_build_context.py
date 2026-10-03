@@ -9,6 +9,9 @@ import stat
 import subprocess
 import sys
 
+# CMake imports this sibling from the source tree; do not leave package cache files.
+sys.dont_write_bytecode = True
+
 import capture_compiler
 
 

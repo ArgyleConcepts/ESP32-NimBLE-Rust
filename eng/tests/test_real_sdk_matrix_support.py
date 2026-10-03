@@ -107,7 +107,7 @@ class IdfPinVerificationTests(unittest.TestCase):
 
 
 class MatrixReportAndDiagnosticTests(unittest.TestCase):
-    def test_readonly_git_environment_disables_nested_optional_index_refresh(self):
+    def test_matrix_environment_prevents_git_refresh_and_source_pyc_files(self):
         inherited = {
             "PATH": os.environ.get("PATH", ""),
             "GIT_OPTIONAL_LOCKS": "1",
@@ -115,11 +115,12 @@ class MatrixReportAndDiagnosticTests(unittest.TestCase):
             "GIT_CONFIG_GLOBAL": "/inherited/gitconfig",
             "KEEP_FOR_CHILD": "yes",
         }
-        selected = matrix.readonly_git_environment(inherited)
+        selected = matrix.matrix_subprocess_environment(inherited)
 
         self.assertEqual(selected["GIT_OPTIONAL_LOCKS"], "0")
         self.assertNotIn("GIT_DIR", selected)
         self.assertEqual(selected["KEEP_FOR_CHILD"], "yes")
+        self.assertEqual(selected["PYTHONDONTWRITEBYTECODE"], "1")
         child = subprocess.run(
             [sys.executable, "-c", "import os; print(os.environ['GIT_OPTIONAL_LOCKS'])"],
             check=True,
@@ -128,6 +129,19 @@ class MatrixReportAndDiagnosticTests(unittest.TestCase):
             env=selected,
         )
         self.assertEqual(child.stdout.strip(), "0")
+
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory) / "matrix_bytecode_probe.py"
+            module.write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(
+                [sys.executable, "-c", "import matrix_bytecode_probe"],
+                cwd=directory,
+                env={**selected, "PYTHONPATH": directory},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertFalse((Path(directory) / "__pycache__").exists())
 
     def test_matrix_tool_paths_select_the_exact_chip_driver_in_the_pinned_packages(self):
         tools_root = Path("/isolated/idf-tools")

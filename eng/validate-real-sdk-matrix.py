@@ -126,8 +126,8 @@ def tree_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def readonly_git_environment(environment: dict[str, str]) -> dict[str, str]:
-    """Prevent Git's optional index refresh and discard inherited Git selectors."""
+def matrix_subprocess_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Prevent helper subprocesses from refreshing Git or writing source pyc files."""
     selected = {
         key: value for key, value in environment.items() if not key.startswith("GIT_")
     }
@@ -136,6 +136,7 @@ def readonly_git_environment(environment: dict[str, str]) -> dict[str, str]:
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_COUNT": "0",
+        "PYTHONDONTWRITEBYTECODE": "1",
     })
     return selected
 
@@ -736,6 +737,7 @@ def acceptance_audit(chip: str) -> list[dict]:
                 f"{chip}-tracked-source-tree-unchanged",
                 f"{chip}-checkout-clean-after-matrix",
                 f"{chip}-package-excludes-generated-output",
+                f"{chip}-package-excludes-python-bytecode",
                 f"{chip}-registry-sources-unchanged",
                 f"{chip}-cpfd-cafd-on-output-boundary-nimble_bindings.rs",
                 f"{chip}-cpfd-cafd-on-output-boundary-nimble_bindings.manifest.json",
@@ -774,6 +776,7 @@ def acceptance_audit(chip: str) -> list[dict]:
                 f"{chip}-sdk-response-rerun-invalidates",
                 f"{chip}-tracked-source-tree-unchanged",
                 f"{chip}-package-excludes-generated-output",
+                f"{chip}-package-excludes-python-bytecode",
                 f"{chip}-registry-sources-unchanged",
             ],
             "requires_external_evidence": [],
@@ -1016,7 +1019,7 @@ def matrix(
     idf_root = Path(args.idf_path).resolve(strict=True)
     tools_root = Path(args.idf_tools_path).resolve(strict=True)
     job_root = Path(args.job_root).resolve(strict=True)
-    common_env = readonly_git_environment(os.environ)
+    common_env = matrix_subprocess_environment(os.environ)
     common_env.update({
         "IDF_PATH": str(idf_root),
         "IDF_TOOLS_PATH": str(tools_root),
@@ -2082,19 +2085,57 @@ def matrix(
         "the dependency generated real configured bindings before privacy rejection",
     )
 
-    package = runner.command(
-        f"{chip}-package-source-list",
-        ["cargo", "package", "--list", "--locked", "--offline"],
-        cwd=root,
-        env=common_env,
-    )
-    runner.check(
-        f"{chip}-package-excludes-generated-output",
-        "nimble_bindings.rs" not in package and "nimble_bindings.manifest.json" not in package,
-        "Cargo package sources contain no generated binding or manifest snapshot",
-    )
-    package_files = sorted(line.strip() for line in package.splitlines() if line.strip())
-    (reports / "package-list.txt").write_text("\n".join(package_files) + "\n", encoding="utf-8")
+    package_probe = root / "cmake/__pycache__/argyle-matrix-package-probe.pyc"
+    if package_probe.exists() or package_probe.is_symlink():
+        raise MatrixError("the Python bytecode package probe already exists in the checkout")
+    if package_probe.parent.is_symlink():
+        raise MatrixError("the Python bytecode cache directory is a symlink in the checkout")
+    cache_directory_owned = False
+    package_probe_owned = False
+    try:
+        try:
+            package_probe.parent.mkdir()
+            cache_directory_owned = True
+        except FileExistsError:
+            pass
+        if package_probe.parent.is_symlink() or not package_probe.parent.is_dir():
+            raise MatrixError("the Python bytecode cache path is not a directory in the checkout")
+        with package_probe.open("xb") as probe_file:
+            package_probe_owned = True
+            probe_file.write(b"synthetic bytecode package-exclusion probe\n")
+        package = runner.command(
+            f"{chip}-package-source-list",
+            ["cargo", "package", "--list", "--locked", "--offline"],
+            cwd=root,
+            env=common_env,
+        )
+        package_files = sorted(line.strip() for line in package.splitlines() if line.strip())
+        (reports / "package-list.txt").write_text(
+            "\n".join(package_files) + "\n", encoding="utf-8",
+        )
+        runner.check(
+            f"{chip}-package-excludes-generated-output",
+            "nimble_bindings.rs" not in package and "nimble_bindings.manifest.json" not in package,
+            "Cargo package sources contain no generated binding or manifest snapshot",
+        )
+        python_bytecode = [
+            name for name in package_files
+            if "__pycache__" in Path(name).parts or Path(name).suffix in {".pyc", ".pyo"}
+        ]
+        runner.check(
+            f"{chip}-package-excludes-python-bytecode",
+            not python_bytecode and package_probe.relative_to(root).as_posix() not in package_files,
+            "Cargo include-negations exclude Python bytecode even when a cache file exists in cmake",
+            "package-list.txt",
+        )
+    finally:
+        if package_probe_owned:
+            package_probe.unlink(missing_ok=True)
+        if cache_directory_owned:
+            try:
+                package_probe.parent.rmdir()
+            except OSError:
+                pass
 
     registry_after = {
         "registry_src": tree_digest(registry),

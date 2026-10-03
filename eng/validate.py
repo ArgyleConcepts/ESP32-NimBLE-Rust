@@ -36,7 +36,14 @@ def check_package_listing(listing):
         "docs/MAINTAINING.md", "docs/BUILD_CONTEXT.md",
         "docs/BINDING_GENERATION.md",
     }
-    missing = required - set(listing.splitlines())
+    entries = {line.strip() for line in listing.splitlines() if line.strip()}
+    python_cache = sorted(
+        name for name in entries
+        if "__pycache__" in Path(name).parts or Path(name).suffix in {".pyc", ".pyo"}
+    )
+    if python_cache:
+        raise ValueError(f"Python bytecode artifacts must be excluded: {python_cache}")
+    missing = required - entries
     if missing:
         raise ValueError(f"Missing package files: {sorted(missing)}")
 
