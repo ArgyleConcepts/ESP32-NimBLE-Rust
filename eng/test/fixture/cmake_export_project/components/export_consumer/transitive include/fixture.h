@@ -1,0 +1,1 @@
+#define ARGYLE_FIXTURE_VALUE 24

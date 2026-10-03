@@ -1,0 +1,152 @@
+"""SDK-free tests for pinned matrix metadata and diagnostic reporting."""
+
+import importlib.util
+import json
+from pathlib import Path
+import os
+import sys
+import tempfile
+import unittest
+
+
+ROOT = Path(__file__).parents[2]
+
+
+def load_script(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+matrix = load_script("real_sdk_matrix", ROOT / "eng/validate-real-sdk-matrix.py")
+tool_pins = load_script("verify_idf_tools", ROOT / "eng/verify-idf-tools.py")
+
+
+class IdfPinVerificationTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temporary.name)
+        self.lock_path = ROOT / "eng/idf-tools.lock.json"
+        self.lock = json.loads(self.lock_path.read_text(encoding="utf-8"))
+        self.idf_root = self.directory / "esp-idf"
+        version_header = self.idf_root / "components/esp_common/include/esp_idf_version.h"
+        version_header.parent.mkdir(parents=True)
+        version_header.write_text(
+            "#define ESP_IDF_VERSION_MAJOR 6\n"
+            "#define ESP_IDF_VERSION_MINOR 1\n"
+            "#define ESP_IDF_VERSION_PATCH 0\n",
+            encoding="utf-8",
+        )
+        self.metadata_path = self.directory / "tools.json"
+        self.write_metadata()
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def write_metadata(self, lock=None):
+        selected = lock or self.lock
+        tools = []
+        for name, pin in selected["tools"].items():
+            version = {
+                "name": pin["version"],
+                "status": "recommended",
+                "macos": {"sha256": pin["sha256"]["macos"]},
+                "macos-arm64": {"sha256": pin["sha256"]["macos-arm64"]},
+            }
+            tools.append({"name": name, "versions": [version]})
+        self.metadata_path.write_text(json.dumps({"tools": tools}), encoding="utf-8")
+
+    def verify(self):
+        return tool_pins.verify(self.lock_path, self.metadata_path, self.idf_root)
+
+    def test_committed_pins_match_both_platform_metadata_hashes(self):
+        self.assertEqual(self.verify()["idf"]["version"], "6.1.0")
+
+    def test_wrong_archive_hash_is_rejected(self):
+        metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+        metadata["tools"][0]["versions"][0]["macos-arm64"]["sha256"] = "0" * 64
+        self.metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "SHA-256 differs"):
+            self.verify()
+
+    def test_missing_archive_hash_is_rejected(self):
+        metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+        del metadata["tools"][0]["versions"][0]["macos"]["sha256"]
+        self.metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "SHA-256 differs"):
+            self.verify()
+
+    def test_wrong_sdk_tool_version_is_rejected(self):
+        metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+        metadata["tools"][0]["versions"][0]["name"] = "moving-version"
+        self.metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "expected one"):
+            self.verify()
+
+
+class MatrixReportAndDiagnosticTests(unittest.TestCase):
+    def test_failed_report_keeps_partial_values_checks_and_command_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            reports = Path(directory) / "reports"
+            runner = matrix.MatrixRunner(Path(directory), reports)
+            runner.values["matrix"] = {"chip": "esp32c3", "configurations_started": ["cpfd-cafd-on"]}
+            runner.check("first-check", True, "completed before a controlled failure")
+            with self.assertRaises(matrix.MatrixError):
+                runner.command(
+                    "failed-command",
+                    [sys.executable, "-c", "print('captured failure diagnostic'); raise SystemExit(9)"],
+                    cwd=Path(directory),
+                    env=os.environ.copy(),
+                    expect_failure="expected but absent",
+                )
+            runner.report({}, "controlled early failure")
+            report = json.loads((reports / "matrix-report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["matrix"]["configurations_started"], ["cpfd-cafd-on"])
+            self.assertEqual(report["checks"][0]["name"], "first-check")
+            self.assertEqual(report["checks"][1]["status"], "failed")
+            self.assertEqual(report["checks"][-1]["name"], "matrix-execution-failed")
+            self.assertEqual(len(report["commands"]), 1)
+            self.assertIn("captured failure diagnostic", (reports / report["commands"][0]["log"]).read_text())
+            self.assertEqual(report["error"], "controlled early failure")
+            suite = matrix.ET.parse(reports / "generation-matrix.xml").getroot()
+            self.assertEqual(suite.get("failures"), "2")
+
+    def test_expected_failure_requires_each_diagnostic_fragment(self):
+        self.assertTrue(matrix.expected_fragments_present(
+            "compiler failed while parsing ble_gatt.h",
+            ["compiler failed", "ble_gatt.h"],
+        ))
+        self.assertFalse(matrix.expected_fragments_present(
+            "compiler failed while parsing an unrelated header",
+            ["compiler failed", "ble_gatt.h"],
+        ))
+
+    def test_expected_failure_command_rejects_partial_diagnostic_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = matrix.MatrixRunner(root, root / "reports")
+            with self.assertRaises(matrix.MatrixError):
+                runner.command(
+                    "wrong-diagnostic",
+                    [sys.executable, "-c", "print('first fragment'); raise SystemExit(1)"],
+                    cwd=root,
+                    env=os.environ.copy(),
+                    expect_failure=["first fragment", "required second fragment"],
+                )
+
+    def test_acceptance_audit_rejects_missing_check_names(self):
+        criteria = [{"criterion": "fixture criterion", "checks": ["present", "missing"]}]
+        with self.assertRaisesRegex(matrix.MatrixError, "missing"):
+            matrix.validate_acceptance_audit(criteria, {"present"})
+
+    def test_acceptance_audit_accepts_recorded_check_names(self):
+        matrix.validate_acceptance_audit(
+            [{"criterion": "fixture criterion", "checks": ["present"]}],
+            {"present"},
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

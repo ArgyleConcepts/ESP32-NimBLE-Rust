@@ -147,7 +147,7 @@ def main():
     reports.mkdir(parents=True, exist_ok=True)
     commands = [
         ("ci-tool-tests", [sys.executable, "-m", "unittest", "discover", "-s", "eng/tests", "-v"]),
-        ("shell-syntax", ["bash", "-c", "bash -n eng/bootstrap-ci.sh && bash -n eng/preflight-ci.sh"]),
+        ("shell-syntax", ["bash", "-c", "bash -n eng/bootstrap-ci.sh && bash -n eng/preflight-ci.sh && bash -n eng/install-idf-ci.sh"]),
         ("format", ["cargo", "fmt", "--all", "--", "--check"]),
         ("clippy", ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"]),
         ("host-build", ["cargo", "build", "--locked"]),

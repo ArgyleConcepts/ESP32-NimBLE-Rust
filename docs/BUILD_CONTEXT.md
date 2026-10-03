@@ -114,8 +114,13 @@ tools. Native host builds and rustdoc resolve to host-only mode without an SDK
 or context file. Either supported ESP target requires a context file; an
 invalid, missing, or mismatched context fails the build and never falls back to
 host mode. An explicit `host` request also rejects any supplied context path.
-The fixture tests validate the contract and diagnostics only; they do not
-compile real ESP-IDF headers or establish target ABI compatibility.
+The host fixture tests validate the contract and diagnostics without an SDK.
+The Azure-only C3/S3 matrix additionally configures the pinned ESP-IDF 6.1 SDK,
+compiles the exporter probe with the selected consumer compiler, and generates
+private bindings from the actual configured headers. This is generation and
+context-capture evidence only; it does not establish target ABI compatibility
+or link a firmware executable. See [Azure validation](CI.md#azure-validation)
+for the retained matrix and CMake regression reports.
 
 The probe copies target-level consumer include, define, compile-option and
 compile-feature properties, plus language standard/extensions, position-
@@ -127,8 +132,8 @@ It does not capture source-specific compiler properties attached only to an
 unrelated application source file. Consumers must put ABI-affecting settings
 needed for NimBLE header generation on the configured target or its interface
 dependencies. The export target does not request the application firmware
-executable link; full Cargo/`idf.py` integration and C3/S3 compile-link
-verification belong to later work.
+executable link; full target Cargo/`idf.py` compile-link verification belongs
+to NIMBLERS-7.
 
 See the [ESP-IDF NimBLE reference](https://docs.espressif.com/projects/esp-idf/en/v6.1/esp32c3/api-reference/bluetooth/nimble/index.html),
 [Cargo build-script reference](https://doc.rust-lang.org/cargo/reference/build-scripts.html),

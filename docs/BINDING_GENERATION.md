@@ -9,6 +9,16 @@ from a global installation, or expose generated declarations as public BLE
 APIs. The package's private `build.rs` calls this generator for ESP targets and
 includes the result only inside `src/backend`.
 
+The Azure-only [C3/S3 generation matrix](CI.md#azure-validation) exercises this
+entrypoint against the pinned ESP-IDF 6.1 commit and the actual configured
+headers/compiler context. Each chip runs `CONFIG_BT_NIMBLE_CPFD_CAFD` enabled
+and disabled to prove the selected declaration layout changes with the
+consumer configuration, then checks input mutations and failure cleanup.
+Matrix Cargo commands run natively on the macOS host to exercise `build.rs`;
+this does not compile Rust for the ESP target or verify ABI, firmware linking,
+hardware, or BLE behavior. Full target compile/link evidence belongs to
+NIMBLERS-7.
+
 ## Cargo selection and invalidation
 
 Cargo selects build mode from `TARGET` and `HOST`, with the optional
