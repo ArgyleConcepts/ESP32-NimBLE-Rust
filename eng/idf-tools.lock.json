@@ -1,0 +1,58 @@
+{
+  "idf": {
+    "repository": "https://github.com/espressif/esp-idf.git",
+    "commit": "fff9895c82d744c7237be8847347bdd1b07c6643",
+    "version": "6.1.0",
+    "nimble_submodule": {
+      "path": "components/bt/host/nimble/nimble",
+      "commit": "139cada0ae932957fa06ba37d17e3c9c2c95c773"
+    },
+    "targets": ["esp32c3", "esp32s3"]
+  },
+  "metadata": "tools/tools.json",
+  "metadata_source": "https://raw.githubusercontent.com/espressif/esp-idf/fff9895c82d744c7237be8847347bdd1b07c6643/tools/tools.json",
+  "tools": {
+    "riscv32-esp-elf": {
+      "version": "esp-15.2.0_20251204",
+      "sha256": {
+        "macos": "6d4709eadf4c66aecb51c0ff9c7b068eefa6ecec37aa7817f172c9f735318e73",
+        "macos-arm64": "0869d1083532c631808543dd802885f02dbe1bb3bd640be0dee827e82ded768d"
+      }
+    },
+    "xtensa-esp-elf": {
+      "version": "esp-15.2.0_20251204",
+      "sha256": {
+        "macos": "96da1fcf01e2ac89819d1e336ca9e27762c35ea120627b89de8fd482f42c54f8",
+        "macos-arm64": "68d3fb1e75c6bb1b88c6a2c74977abd51efd09b560a99149bafdcf403cb21941"
+      }
+    },
+    "esp-clang": {
+      "version": "esp-21.1.3_20260408",
+      "sha256": {
+        "macos": "0096cbd1713b226bb403b19547003918943ec3294481d2a69c1596c9597f1ba5",
+        "macos-arm64": "b04a345c7b4125400e4de78734cece01147e0cc43b57aeef846ef3b8ff57ef7d"
+      }
+    },
+    "esp-clang-libs": {
+      "version": "esp-21.1.3_20260408",
+      "sha256": {
+        "macos": "2e3c51ffa570f7f3ea562686b3fef1a1c07a541096ac291b9bb8bfbac7b82f9c",
+        "macos-arm64": "b524f0f36c6b8897b5dc2a85f66102cc44a2d1dcfdde15fa96796b7c1778b8d3"
+      }
+    },
+    "cmake": {
+      "version": "4.0.3",
+      "sha256": {
+        "macos": "4e85de4daf1c3e82d7dc6b8ba5683972944b466343aeb9c327a742437bb3ce9a",
+        "macos-arm64": "4e85de4daf1c3e82d7dc6b8ba5683972944b466343aeb9c327a742437bb3ce9a"
+      }
+    },
+    "ninja": {
+      "version": "1.12.1",
+      "sha256": {
+        "macos": "89a287444b5b3e98f88a945afa50ce937b8ffd1dcc59c555ad9b1baf855298c9",
+        "macos-arm64": "89a287444b5b3e98f88a945afa50ce937b8ffd1dcc59c555ad9b1baf855298c9"
+      }
+    }
+  }
+}

@@ -9,6 +9,18 @@ from a global installation, or expose generated declarations as public BLE
 APIs. The package's private `build.rs` calls this generator for ESP targets and
 includes the result only inside `src/backend`.
 
+The Azure-only [C3/S3 generation matrix](CI.md#azure-validation) exercises this
+entrypoint against the pinned ESP-IDF 6.1 commit and the actual configured
+headers/compiler context. Each chip runs `CONFIG_BT_NIMBLE_CPFD_CAFD` enabled
+and disabled to prove the selected declaration layout changes with the
+consumer configuration, then checks input mutations and failure cleanup. Its
+generic fixtures explicitly select `CONFIG_LIBC_NEWLIB=y`; the matrix does not
+claim support for Picolibc's GCC `-specs` options or arbitrary response files.
+Matrix Cargo commands run natively on the macOS host to exercise `build.rs`;
+this does not compile Rust for the ESP target or verify ABI, firmware linking,
+hardware, or BLE behavior. Full target compile/link evidence belongs to
+NIMBLERS-7.
+
 ## Cargo selection and invalidation
 
 Cargo selects build mode from `TARGET` and `HOST`, with the optional
@@ -36,7 +48,15 @@ inherited selector changes output identity and reruns validation.
 Rerun inputs include the raw context JSON, sdkconfig and generated headers,
 shim sources, selected compiler/tool files, SDK Git metadata and submodule
 revisions, all resolved transitive headers reported by bindgen, and the
-ordered include/sysroot/resource-directory search roots. Cargo recursively
+ordered include/sysroot/resource-directory search roots. The configured IDF
+6.1 `roots.build/toolchain/cflags` file is the only supported response file.
+The context records its raw `@file` argv token, parsed ordered flags, canonical
+path, and SHA-256; the build script reparses and rehashes the current bytes,
+watches that file, and includes its content identity in the manifest. A changed
+file invalidates Cargo generation and requires rebuilding the CMake exporter
+target so its selected-GCC probe can refresh the capture. Nested, additional,
+symlinked, or non-IDF response files and response-file action/output/tool
+overrides fail closed. Cargo recursively
 observes a watched directory, so ordinary include roots detect both edits and
 newly added shadow headers. Selected path aliases and their canonical
 resolutions are recorded in the private manifest. The parent directories of
@@ -64,15 +84,27 @@ a loose-ref checkout or the pointer for an uninitialized submodule) as dirty
 on each invocation until it appears. Those layouts rerun the build script
 repeatedly; the watch avoids recursively scanning the SDK's Git object database.
 
+The generator preserves explicit include lookup paths even when the selected
+ESP-IDF component declares a directory that is absent for that target. It
+watches the nearest existing parent and records present-versus-missing lookup
+resolution in the manifest, so directory creation or removal changes the
+generation identity. It also watches the selected absent path directly;
+Cargo treats a watched path that does not exist as dirty on each invocation,
+so a still-missing lookup can rerun the ESP build script on each build until
+the path appears. This conservative behavior detects newly available search
+directories and headers. Missing SDK, implicit compiler, configuration, or
+tool inputs still fail validation.
+
 ## Toolchain and compiler inputs
 
 The selector must name Espressif's `esp-clang` and `libclang` package
 `esp-21.1.3_20260408`. Generation checks the clang executable's reported
-version and the actually loaded libclang version, and requires `LIBCLANG_PATH`
-to identify the same canonical library file. A preloaded different libclang,
-generic host LLVM, or a different package release fails explicitly. The
-generator does not mutate process environment variables; callers that need a
-different library must use an isolated process.
+version (`clang version 21.1.3` or the pinned vendor banner
+`Espressif clang version 21.1.3`) and the actually loaded libclang version,
+and requires `LIBCLANG_PATH` to identify the same canonical library file. A
+preloaded different libclang, generic host LLVM, or a different package release
+fails explicitly. The generator does not mutate process environment variables;
+callers that need a different library must use an isolated process.
 
 The CMake context's compiler executable, working directory, ordered argv,
 sysroot, include events, and implicit include directories are authoritative.
@@ -91,21 +123,46 @@ consumer's selected GCC compiler. Bindgen then uses the selected Espressif
 Clang with an explicit target and resource directory, `-nostdinc`, the exact
 recorded include search paths, and the captured semantic flags. It does not
 inject Clang's resource headers ahead of the consumer's includes. C3 requires
-captured `-march` and `-mabi` values. The closed target mapping is:
+captured `-march`; the selected GCC's target-option query must report effective
+ABI `ilp32`. An explicit captured `-mabi` must agree with that result. If the
+consumer flags omit `-mabi`, only the private bindgen argument vector receives
+`-mabi=ilp32`; the exported consumer argv remains unchanged. The closed target
+mapping is:
 
 | ESP-IDF context | Selected C compiler target | Espressif Clang target |
 | --- | --- | --- |
 | ESP32-C3 / `riscv32` | `riscv32-esp-elf` | `riscv32-esp-unknown-elf` |
 | ESP32-S3 / `xtensa` | `xtensa-esp-elf` or `xtensa-esp32s3-elf` | `xtensa-esp-unknown-elf` with `-mcpu=esp32s3` |
 
-The generator does not broadly translate GCC-specific options. If the selected
-Clang rejects a captured option or cannot parse a selected consumer header,
-generation fails with a diagnostic to inspect the configured compiler context.
-Response files and nonempty `BINDGEN_EXTRA_CLANG_ARGS*`, `CPATH`,
+The generator does not broadly translate GCC-specific options. For the pinned
+C3 context, bindgen omits the exact GCC tuning flag `-mtune=esp-base` because
+it changes emitted-code tuning, not the declaration AST parsed here. It is not
+translated to a Clang CPU selector; the captured chip target, `-march`, and
+verified ABI remain authoritative. For both supported chip contexts, bindgen
+omits only these additional exact captured options because they control GCC
+diagnostics or emitted machine code rather than the declaration AST it parses:
+`-Wno-old-style-declaration`, `-fno-shrink-wrap`,
+`-fstrict-volatile-bitfields`, `-fno-tree-switch-conversion`,
+`-fzero-init-padding-bits=all`, and `-fno-malloc-dce`. GCC documents the
+optimization flags in its [optimization options](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/Optimize-Options.html)
+and the volatile-bitfield and padding-initialization flags in its
+[code-generation options](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/Code-Gen-Options.html).
+For the S3 context, bindgen also omits the exact captured `-mlongcalls` option:
+GCC documents it as an assembler call-instruction selection option, so it does
+not change the declarations bindgen parses ([Xtensa options](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/Xtensa-Options.html)).
+The context's raw/effective compiler arguments remain unchanged, and the
+selected-GCC shim syntax check uses the original consumer options. ABI, record
+layout, preprocessing, and include options are forwarded unchanged. No other
+GCC option is filtered or translated; if Clang rejects one, generation fails
+with a diagnostic to inspect the configured compiler context. The single
+approved IDF response file is expanded and validated by the context exporter;
+bindgen receives its parsed ordered flags while the selected-GCC shim check
+uses the raw argv with that same approved response token. Other response files
+and nonempty `BINDGEN_EXTRA_CLANG_ARGS*`, `CPATH`,
 `C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH`, or `OBJC_INCLUDE_PATH` overrides are
 rejected because those variables can add unrecorded headers. The consumer
 compiler subprocesses also remove the include-path variables defensively.
-Neither response files nor environment overrides are split or applied
+No unrecorded response files or environment overrides are split or applied
 implicitly. Bindgen and syntax-parser diagnostics are retained in concise
 failure messages.
 
@@ -148,8 +205,11 @@ ATT access results, connection termination, and ATT channel identification are
 also checked as bindgen roots. The SDK's remote-user-termination reason is a
 variant of a broad named error enum, so the private shim re-exports only that
 value through one anonymous enum constant; unrelated SDK error variants are
-not binding roots. Characteristic property bits (`BLE_GATT_CHR_PROP_*`) and
-GATT server flag bits (`BLE_GATT_CHR_F_*`) remain distinct SDK values.
+not binding roots. The `BLE_HS_FOREVER` macro expands through `INT32_MAX`, so
+the shim similarly aliases its configured value as
+`ARGYLE_NIMBLE_HS_FOREVER` instead of hardcoding a Rust constant. Characteristic
+property bits (`BLE_GATT_CHR_PROP_*`) and GATT server flag bits
+(`BLE_GATT_CHR_F_*`) remain distinct SDK values.
 
 No security manager, bond store, central-role, or arbitrary NimBLE declarations
 are included. Expanding this set requires header-level review and matching
@@ -198,6 +258,7 @@ missing-header failure paths, argv preservation, output protection, and shim
 wrapper behavior against controlled stubs.
 That fixture is SDK-free evidence about generator mechanics only; it does not
 claim an ESP target ABI, real NimBLE header compatibility, or hardware behavior.
-Genuine C3/S3 configured header-generation fixtures and configuration mutation
-checks belong to NIMBLERS-24. Full consumer firmware compilation/linking remains
+The configured C3/S3 fixtures and configuration-mutation checks run in the
+NIMBLERS-24 Azure matrix described above. They validate generation inputs and
+private output only. Full consumer firmware compilation/linking remains
 separate work under NIMBLERS-7.

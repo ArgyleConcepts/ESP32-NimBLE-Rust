@@ -4,9 +4,14 @@
 mod bindings;
 #[path = "../build_support/context.rs"]
 mod context;
+#[path = "../build_support/lifecycle.rs"]
+mod lifecycle;
 
 use bindings::{Allowlist, OutputLocation};
-use context::{DefineEvent, DefineOperation, EspBuildContext, IncludeKind, IncludePath};
+use context::{
+    CompilerResponseFile, DefineEvent, DefineOperation, EspBuildContext, IncludeKind, IncludePath,
+};
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,6 +30,38 @@ struct Fixture {
     context: EspBuildContext,
 }
 
+fn generated_integer_const(source: &str, name: &str) -> i64 {
+    let file = syn::parse_file(source).expect("generated bindings should parse as Rust");
+    let constant = file.items.iter().find_map(|item| match item {
+        syn::Item::Const(constant) if constant.ident == name => Some(constant),
+        _ => None,
+    });
+    let constant = constant.unwrap_or_else(|| panic!("generated const {name} is missing"));
+    let syn::Expr::Lit(expression) = &*constant.expr else {
+        panic!("generated const {name} is not a literal");
+    };
+    let syn::Lit::Int(value) = &expression.lit else {
+        panic!("generated const {name} is not an integer literal");
+    };
+    value
+        .base10_parse::<i64>()
+        .unwrap_or_else(|error| panic!("generated const {name} is not a decimal integer: {error}"))
+}
+
+fn generated_const_present(source: &str, name: &str) -> bool {
+    let file = syn::parse_file(source).expect("generated bindings should parse as Rust");
+    file.items
+        .iter()
+        .any(|item| matches!(item, syn::Item::Const(constant) if constant.ident == name))
+}
+
+fn c3_compiler_target() -> bindings::CompilerTarget {
+    bindings::CompilerTarget {
+        bindgen_target: "riscv32-esp-unknown-elf".into(),
+        effective_abi: Some("ilp32".into()),
+    }
+}
+
 impl Fixture {
     fn new() -> Self {
         let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
@@ -32,6 +69,8 @@ impl Fixture {
             "argyle nimble bindings {} {sequence}",
             std::process::id()
         ));
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let sdk_root = root.join("ESP IDF 6.1");
         let build_root = root.join("consumer build");
         let sysroot = root.join("toolchain sysroot");
@@ -44,6 +83,7 @@ impl Fixture {
         let sdkconfig = root.join("consumer config/sdkconfig");
         let sdkconfig_header = root.join("generated/sdkconfig.h");
         let version_header = sdk_root.join("version/esp_idf_version.h");
+        let response_path = build_root.join("toolchain/cflags");
         let probe_source = build_root.join("argyle-nimble/context_probe.c");
         let compiler = root.join("toolchain bin/selected C compiler");
 
@@ -64,6 +104,7 @@ impl Fixture {
             version_header.parent().unwrap().to_path_buf(),
             probe_source.parent().unwrap().to_path_buf(),
             compiler.parent().unwrap().to_path_buf(),
+            response_path.parent().unwrap().to_path_buf(),
         ];
         for directory in directories {
             fs::create_dir_all(directory).unwrap();
@@ -102,6 +143,16 @@ impl Fixture {
             "--sysroot".to_owned(),
             "../toolchain sysroot".to_owned(),
         ]);
+        let response_contents =
+            b"-march=rv32imc_zicsr_zifencei -mabi=ilp32 -DSTART_BEFORE_ACTION=1";
+        fs::write(&response_path, response_contents).unwrap();
+        let response_token = format!("@{}", response_path.display());
+        let mut captured_compiler_arguments = vec![response_token.clone()];
+        captured_compiler_arguments.extend(compiler_arguments.iter().skip(3).cloned());
+        let include_lookups = vec![
+            lifecycle::resolve_include_lookup(&include_one, &working_directory).unwrap(),
+            lifecycle::resolve_include_lookup(&include_two, &working_directory).unwrap(),
+        ];
 
         Self {
             root,
@@ -118,6 +169,19 @@ impl Fixture {
                 working_directory,
                 build_configuration: "Debug".into(),
                 compiler_arguments,
+                captured_compiler_arguments,
+                response_files: vec![CompilerResponseFile {
+                    argument_index: 0,
+                    token: response_token,
+                    path: response_path,
+                    sha256: format!("{:x}", Sha256::digest(response_contents)),
+                    arguments: vec![
+                        "-march=rv32imc_zicsr_zifencei".into(),
+                        "-mabi=ilp32".into(),
+                        "-DSTART_BEFORE_ACTION=1".into(),
+                    ],
+                }],
+                include_lookups,
                 includes: vec![
                     IncludePath {
                         kind: IncludeKind::Normal,
@@ -167,15 +231,37 @@ fn write_fake_compiler(path: &Path, fail_syntax_check: bool) {
 }
 
 fn write_fake_compiler_for(path: &Path, fail_syntax_check: bool, machine: &str) {
-    let success_script = format!(
-        "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"-dumpmachine\" ]; then echo {machine}; exit 0; fi\ndone\nexit 0\n"
-    );
-    let script = if fail_syntax_check {
-        "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"-fsyntax-only\" ]; then echo 'error: fixture missing SDK member' >&2; exit 19; fi\ndone\nexit 0\n"
-            .to_owned()
+    write_fake_compiler_with_abi(path, fail_syntax_check, machine, "ilp32", false, None);
+}
+
+fn write_fake_compiler_with_abi(
+    path: &Path,
+    fail_syntax_check: bool,
+    machine: &str,
+    effective_abi: &str,
+    fail_abi_query: bool,
+    argument_log: Option<&Path>,
+) {
+    let query_log = argument_log.map_or_else(String::new, |log| {
+        format!("printf '%s\\n' \"$@\" > {}\n", shell_single_quote(log))
+    });
+    let abi_query = if fail_abi_query {
+        "echo 'effective ABI fixture query failed' >&2; exit 23".to_owned()
     } else {
-        success_script
+        format!(
+            "printf '  -mabi=ABI                    {}\\n'\nexit 0",
+            shell_single_quote_value(effective_abi)
+        )
     };
+    let syntax_check = if fail_syntax_check {
+        "if [ \"$arg\" = \"-fsyntax-only\" ]; then echo 'error: fixture missing SDK member' >&2; exit 19; fi\n"
+    } else {
+        ""
+    };
+    let script = format!(
+        "#!/bin/sh\nis_abi_query=0\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"-Q\" ]; then is_abi_query=1; fi\ndone\nif [ \"$is_abi_query\" = \"1\" ]; then\n  {query_log}  {abi_query}\nfi\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"-dumpmachine\" ]; then printf '%s\\n' {}; exit 0; fi\n  {syntax_check}done\nexit 0\n",
+        shell_single_quote_value(machine)
+    );
     fs::write(path, script).unwrap();
     #[cfg(unix)]
     {
@@ -184,13 +270,21 @@ fn write_fake_compiler_for(path: &Path, fail_syntax_check: bool, machine: &str) 
     }
 }
 
+fn shell_single_quote(path: &Path) -> String {
+    shell_single_quote_value(&path.to_string_lossy())
+}
+
+fn shell_single_quote_value(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 #[test]
 fn compiler_arguments_preserve_order_and_original_include_indices() {
     let fixture = Fixture::new();
     let resource_dir = fixture.root.join("selected clang/resource dir");
     fs::create_dir_all(resource_dir.join("include")).unwrap();
     let arguments =
-        bindings::compiler_arguments(&fixture.context, "riscv32-esp-unknown-elf", &resource_dir)
+        bindings::compiler_arguments(&fixture.context, &c3_compiler_target(), &resource_dir)
             .unwrap();
 
     let start = arguments
@@ -255,6 +349,153 @@ fn compiler_arguments_preserve_order_and_original_include_indices() {
 }
 
 #[test]
+fn c3_bindgen_translation_omits_only_exact_tune_and_codegen_switches() {
+    let fixture = Fixture::new();
+    let mut context = fixture.context.clone();
+    let added_arguments = [
+        "-mtune=esp-base".into(),
+        "-Wno-old-style-declaration".into(),
+        "-fno-shrink-wrap".into(),
+        "-fstrict-volatile-bitfields".into(),
+        "-fno-tree-switch-conversion".into(),
+        "-fzero-init-padding-bits=all".into(),
+        "-fno-malloc-dce".into(),
+        "-mlongcalls".into(),
+        "-fpack-struct=2".into(),
+        "-fshort-enums".into(),
+        "-fvisibility=hidden".into(),
+    ];
+    context.compiler_arguments.extend(added_arguments.clone());
+    context.captured_compiler_arguments.extend(added_arguments);
+    let original_arguments = context.compiler_arguments.clone();
+    let arguments = bindings::compiler_arguments(
+        &context,
+        &c3_compiler_target(),
+        &fixture.root.join("clang resource"),
+    )
+    .unwrap();
+
+    assert!(!arguments.contains(&"-mtune=esp-base".to_owned()));
+    assert!(!arguments.contains(&"-mcpu=esp32c3".to_owned()));
+    for gcc_only in [
+        "-mtune=esp-base",
+        "-Wno-old-style-declaration",
+        "-fno-shrink-wrap",
+        "-fstrict-volatile-bitfields",
+        "-fno-tree-switch-conversion",
+        "-fzero-init-padding-bits=all",
+        "-fno-malloc-dce",
+    ] {
+        assert!(!arguments.iter().any(|argument| argument == gcc_only));
+    }
+    for preserved in [
+        "-march=rv32imc_zicsr_zifencei",
+        "-mabi=ilp32",
+        "-DSTART_BEFORE_ACTION=1",
+        "-fpack-struct=2",
+        "-fshort-enums",
+        "-fvisibility=hidden",
+        "-mlongcalls",
+    ] {
+        assert!(arguments.iter().any(|argument| argument == preserved));
+    }
+    assert_eq!(context.compiler_arguments, original_arguments);
+
+    context.compiler_arguments.push("-mtune=other".into());
+    context
+        .captured_compiler_arguments
+        .push("-mtune=other".into());
+    let arguments = bindings::compiler_arguments(
+        &context,
+        &c3_compiler_target(),
+        &fixture.root.join("clang resource"),
+    )
+    .unwrap();
+    assert!(arguments.contains(&"-mtune=other".to_owned()));
+}
+
+#[test]
+fn s3_bindgen_drops_shared_and_xtensa_assembler_switches() {
+    let fixture = Fixture::new();
+    let mut context = fixture.context.clone();
+    context.chip = "esp32s3".into();
+    context.architecture = "xtensa".into();
+    context.compiler_arguments.extend([
+        "-mcpu=esp32s3".into(),
+        "-mtune=esp-base".into(),
+        "-Wno-old-style-declaration".into(),
+        "-fno-shrink-wrap".into(),
+        "-fstrict-volatile-bitfields".into(),
+        "-fno-tree-switch-conversion".into(),
+        "-fzero-init-padding-bits=all".into(),
+        "-fno-malloc-dce".into(),
+        "-mlongcalls".into(),
+        "-mno-longcalls".into(),
+        "-fpack-struct=2".into(),
+    ]);
+    context.response_files.clear();
+    context.captured_compiler_arguments = context.compiler_arguments.clone();
+    let target = bindings::CompilerTarget {
+        bindgen_target: "xtensa-esp-unknown-elf".into(),
+        effective_abi: None,
+    };
+    let arguments =
+        bindings::compiler_arguments(&context, &target, &fixture.root.join("clang resource"))
+            .unwrap();
+
+    assert!(arguments.contains(&"-mcpu=esp32s3".to_owned()));
+    assert!(arguments.contains(&"-mtune=esp-base".to_owned()));
+    assert!(arguments.contains(&"-fpack-struct=2".to_owned()));
+    assert!(arguments.contains(&"-mno-longcalls".to_owned()));
+    assert!(!arguments.contains(&"-mlongcalls".to_owned()));
+    for gcc_only in [
+        "-Wno-old-style-declaration",
+        "-fno-shrink-wrap",
+        "-fstrict-volatile-bitfields",
+        "-fno-tree-switch-conversion",
+        "-fzero-init-padding-bits=all",
+        "-fno-malloc-dce",
+    ] {
+        assert!(!arguments.iter().any(|argument| argument == gcc_only));
+    }
+}
+
+#[test]
+fn bindgen_panic_becomes_a_generation_error() {
+    let fixture = Fixture::new();
+    let out_dir = fixture.root.join("panic output");
+    fs::create_dir_all(&out_dir).unwrap();
+    lifecycle::transactional_publish(
+        &out_dir,
+        |staging| {
+            fs::write(staging.join(lifecycle::GENERATED_FILE), "prior bindings")
+                .map_err(|error| error.to_string())
+        },
+        |_| Ok(b"prior manifest".to_vec()),
+    )
+    .unwrap();
+
+    let result = lifecycle::transactional_publish(
+        &out_dir,
+        |_| {
+            bindings::catch_bindgen_panic::<()>(|| {
+                panic!("fixture libclang panic");
+            })
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        },
+        |_| Ok(b"must not publish".to_vec()),
+    );
+
+    let error = result.unwrap_err();
+    assert!(error.contains("Espressif clang panicked"));
+    assert!(error.contains("fixture libclang panic"));
+    assert!(!out_dir.join(lifecycle::GENERATED_FILE).exists());
+    assert!(!out_dir.join(lifecycle::MANIFEST_FILE).exists());
+    assert!(!out_dir.join(lifecycle::STAGING_DIRECTORY).exists());
+}
+
+#[test]
 fn explicit_sysroot_forms_must_match_the_validated_context() {
     let fixture = Fixture::new();
     let mut inline = fixture.context.clone();
@@ -267,7 +508,7 @@ fn explicit_sysroot_forms_must_match_the_validated_context() {
     inline.compiler_arguments.remove(sysroot_index + 1);
     let arguments = bindings::compiler_arguments(
         &inline,
-        "riscv32-esp-unknown-elf",
+        &c3_compiler_target(),
         &fixture.root.join("clang resource"),
     )
     .unwrap();
@@ -286,7 +527,7 @@ fn explicit_sysroot_forms_must_match_the_validated_context() {
     mismatch.compiler_arguments[operand_index] = wrong_sysroot.display().to_string();
     let error = bindings::compiler_arguments(
         &mismatch,
-        "riscv32-esp-unknown-elf",
+        &c3_compiler_target(),
         &fixture.root.join("clang resource"),
     )
     .unwrap_err();
@@ -299,7 +540,7 @@ fn explicit_sysroot_forms_must_match_the_validated_context() {
     inline_include_mismatch.compiler_arguments[include_index] = "-I/unreviewed".into();
     assert!(bindings::compiler_arguments(
         &inline_include_mismatch,
-        "riscv32-esp-unknown-elf",
+        &c3_compiler_target(),
         &fixture.root.join("clang resource"),
     )
     .unwrap_err()
@@ -430,6 +671,24 @@ fn output_authority_allows_cargo_dirs_in_build_and_include_roots() {
     };
     assert!(bindings::validate_output(&fixture.context, &accepted, &header).is_ok());
 
+    let response_parent = fixture.context.response_files[0]
+        .path
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let rejected_response_output = OutputLocation {
+        directory: response_parent.clone(),
+        authorized_root: response_parent,
+        crate_root: fixture.root.join("source crate"),
+        forbidden_roots: Vec::new(),
+    };
+    assert!(
+        bindings::validate_output(&fixture.context, &rejected_response_output, &header)
+            .unwrap_err()
+            .to_string()
+            .contains("overlaps a protected source, SDK, header, or Cargo registry path")
+    );
+
     let sdk_output = fixture.context.sdk_root.join("accidental output");
     fs::create_dir_all(&sdk_output).unwrap();
     let rejected = OutputLocation {
@@ -444,6 +703,52 @@ fn output_authority_allows_cargo_dirs_in_build_and_include_roots() {
             .to_string()
             .contains("protected source, SDK")
     );
+}
+
+#[test]
+fn output_authority_protects_missing_include_lookups_but_allows_sibling_out() {
+    let fixture = Fixture::new();
+    let header = fixture.root.join("source crate/src/backend/nimble_shim.h");
+    fs::create_dir_all(header.parent().unwrap()).unwrap();
+    fs::write(&header, "/* protected shim */\n").unwrap();
+    fs::write(
+        fixture.root.join("source crate/src/backend/nimble_shim.c"),
+        "/* shim */\n",
+    )
+    .unwrap();
+
+    let lookup_parent = fixture.root.join("compiler lookup tree");
+    fs::create_dir_all(&lookup_parent).unwrap();
+    let selected_lookup = lookup_parent.join("missing headers/nested");
+    let lookup =
+        lifecycle::resolve_include_lookup(&selected_lookup, &fixture.context.working_directory)
+            .unwrap();
+    assert!(lookup.is_missing());
+    let mut context = fixture.context.clone();
+    context.include_lookups.push(lookup);
+
+    let sibling_output = lookup_parent.join("sibling cargo out");
+    fs::create_dir_all(&sibling_output).unwrap();
+    let sibling = OutputLocation {
+        directory: sibling_output.clone(),
+        authorized_root: sibling_output,
+        crate_root: fixture.root.join("source crate"),
+        forbidden_roots: Vec::new(),
+    };
+    assert!(bindings::validate_output(&context, &sibling, &header).is_ok());
+
+    let overlap_output = selected_lookup.join("cargo out");
+    fs::create_dir_all(&overlap_output).unwrap();
+    let overlap = OutputLocation {
+        directory: overlap_output.clone(),
+        authorized_root: overlap_output,
+        crate_root: fixture.root.join("source crate"),
+        forbidden_roots: Vec::new(),
+    };
+    assert!(bindings::validate_output(&context, &overlap, &header)
+        .unwrap_err()
+        .to_string()
+        .contains("overlaps a protected source, SDK, header, or Cargo registry path"));
 }
 
 #[test]
@@ -636,8 +941,17 @@ fn exact_clang_version_and_explicit_tool_selection_fail_closed() {
     assert!(bindings::reports_exact_clang_version(
         "clang version 21.1.3 (Espressif build)\n"
     ));
+    assert!(bindings::reports_exact_clang_version(
+        "Espressif clang version 21.1.3 (https://github.com/espressif/llvm-project esp-21.1.3_20260408)\n"
+    ));
+    assert!(!bindings::reports_exact_clang_version(
+        "OtherVendor clang version 21.1.3\n"
+    ));
     assert!(!bindings::reports_exact_clang_version(
         "clang version 21.1.30\n"
+    ));
+    assert!(!bindings::reports_exact_clang_version(
+        "Espressif clang version 21.1.3.1\n"
     ));
     assert!(!bindings::reports_exact_clang_version(
         "clang version 21.1\n"
@@ -678,21 +992,127 @@ fn exact_clang_version_and_explicit_tool_selection_fail_closed() {
 }
 
 #[test]
-fn compiler_target_translation_is_closed_and_requires_c3_abi_options() {
+fn compiler_target_translation_resolves_and_forwards_effective_c3_abi() {
     let fixture = Fixture::new();
     assert_eq!(
-        bindings::resolve_clang_target(&fixture.context).unwrap(),
-        "riscv32-esp-unknown-elf"
+        bindings::parse_effective_compiler_abi("  -mabi=ABI                    ilp32\n").unwrap(),
+        "ilp32"
+    );
+    assert!(bindings::parse_effective_compiler_abi(
+        "  -mabi=ABI                    ilp32\n  -mabi=ABI                    lp64\n"
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("ambiguous effective `-mabi`"));
+    let explicit = bindings::resolve_clang_target(&fixture.context).unwrap();
+    assert_eq!(explicit.bindgen_target, "riscv32-esp-unknown-elf");
+    assert_eq!(explicit.effective_abi.as_deref(), Some("ilp32"));
+    let explicit_clang_arguments = bindings::compiler_arguments(
+        &fixture.context,
+        &explicit,
+        &fixture.root.join("clang resource"),
+    )
+    .unwrap();
+    assert_eq!(
+        explicit_clang_arguments
+            .iter()
+            .filter(|argument| argument.as_str() == "-mabi=ilp32")
+            .count(),
+        1
     );
 
-    let mut missing_mabi = fixture.context.clone();
-    missing_mabi
+    let argument_log = fixture.root.join("effective ABI query args.txt");
+    let default_abi = context_without_mabi(&fixture.context);
+    write_fake_compiler_with_abi(
+        &default_abi.compiler,
+        false,
+        "riscv32-esp-elf",
+        "ilp32",
+        false,
+        Some(&argument_log),
+    );
+    let derived = bindings::resolve_clang_target(&default_abi).unwrap();
+    assert_eq!(derived.effective_abi.as_deref(), Some("ilp32"));
+    let query_arguments = fs::read_to_string(argument_log).unwrap();
+    assert!(query_arguments
+        .lines()
+        .any(|argument| argument == "-march=rv32imc_zicsr_zifencei"));
+    assert!(query_arguments.lines().any(|argument| argument == "-Q"));
+    assert!(query_arguments
+        .lines()
+        .any(|argument| argument == "--help=target"));
+    for removed in [
+        "-mabi",
+        "-mabi=ilp32",
+        "-c",
+        "argyle-nimble/context_probe.c",
+        "-o",
+        "-MMD",
+        "-MF",
+        "-MT",
+    ] {
+        assert!(!query_arguments.lines().any(|argument| argument == removed));
+    }
+    let clang_arguments =
+        bindings::compiler_arguments(&default_abi, &derived, &fixture.root.join("clang resource"))
+            .unwrap();
+    assert!(clang_arguments
+        .iter()
+        .any(|argument| argument == "-mabi=ilp32"));
+    assert!(!default_abi
         .compiler_arguments
-        .retain(|argument| !argument.starts_with("-mabi"));
-    assert!(bindings::resolve_clang_target(&missing_mabi)
+        .iter()
+        .any(|argument| argument == "-mabi=ilp32"));
+
+    let wrong_abi = context_without_mabi(&fixture.context);
+    write_fake_compiler_with_abi(
+        &wrong_abi.compiler,
+        false,
+        "riscv32-esp-elf",
+        "ilp32e",
+        false,
+        None,
+    );
+    assert!(bindings::resolve_clang_target(&wrong_abi)
         .unwrap_err()
         .to_string()
-        .contains("missing `-mabi`"));
+        .contains("effective ABI `ilp32e`; expected `ilp32`"));
+
+    let failed_query = context_without_mabi(&fixture.context);
+    write_fake_compiler_with_abi(
+        &failed_query.compiler,
+        false,
+        "riscv32-esp-elf",
+        "ilp32",
+        true,
+        None,
+    );
+    let query_error = bindings::resolve_clang_target(&failed_query)
+        .unwrap_err()
+        .to_string();
+    assert!(query_error.contains("rejected the effective ABI query"));
+    assert!(query_error.contains("effective ABI fixture query failed"));
+
+    let mut conflicting_explicit = fixture.context.clone();
+    let mabi_index = conflicting_explicit
+        .compiler_arguments
+        .iter()
+        .position(|argument| argument.starts_with("-mabi="))
+        .unwrap();
+    conflicting_explicit.compiler_arguments[mabi_index] = "-mabi=ilp32e".into();
+    assert!(bindings::resolve_clang_target(&conflicting_explicit)
+        .unwrap_err()
+        .to_string()
+        .contains("conflicts with the supported ESP32-C3 ABI `ilp32`"));
+
+    let mut missing_march = context_without_mabi(&fixture.context);
+    missing_march
+        .compiler_arguments
+        .retain(|argument| !argument.starts_with("-march"));
+    assert!(bindings::resolve_clang_target(&missing_march)
+        .unwrap_err()
+        .to_string()
+        .contains("missing `-march`"));
 
     let mut s3 = fixture.context.clone();
     s3.chip = "esp32s3".into();
@@ -700,10 +1120,9 @@ fn compiler_target_translation_is_closed_and_requires_c3_abi_options() {
     let s3_compiler = fixture.root.join("toolchain bin/selected S3 C compiler");
     write_fake_compiler_for(&s3_compiler, false, "xtensa-esp-elf");
     s3.compiler = s3_compiler;
-    assert_eq!(
-        bindings::resolve_clang_target(&s3).unwrap(),
-        "xtensa-esp-unknown-elf"
-    );
+    let s3_target = bindings::resolve_clang_target(&s3).unwrap();
+    assert_eq!(s3_target.bindgen_target, "xtensa-esp-unknown-elf");
+    assert_eq!(s3_target.effective_abi, None);
     s3.compiler_arguments.push("-mcpu=esp32".into());
     assert!(bindings::resolve_clang_target(&s3)
         .unwrap_err()
@@ -718,6 +1137,26 @@ fn compiler_target_translation_is_closed_and_requires_c3_abi_options() {
         .unwrap_err()
         .to_string()
         .contains("does not match the configured ESP32 chip"));
+}
+
+fn context_without_mabi(context: &EspBuildContext) -> EspBuildContext {
+    let mut context = context.clone();
+    context
+        .compiler_arguments
+        .retain(|argument| !argument.starts_with("-mabi"));
+    context.response_files.clear();
+    context.captured_compiler_arguments = context.compiler_arguments.clone();
+    for include in &mut context.includes {
+        if include.argument_index > 1 {
+            include.argument_index -= 1;
+        }
+    }
+    for define in &mut context.defines {
+        if define.argument_index > 1 {
+            define.argument_index -= 1;
+        }
+    }
+    context
 }
 
 #[test]
@@ -746,14 +1185,20 @@ fn shim_syntax_check_forwards_consumer_flags_without_probe_actions() {
 
     bindings::validate_shim_with_consumer_compiler(&fixture.context).unwrap();
     let captured = fs::read_to_string(argument_log).unwrap();
-    assert!(captured.contains("-march=rv32imc_zicsr_zifencei\n"));
-    assert!(captured.contains("-mabi=ilp32\n"));
+    assert!(captured.contains(&format!("{}\n", fixture.context.response_files[0].token)));
+    let response_contents = fs::read_to_string(&fixture.context.response_files[0].path).unwrap();
+    assert_eq!(
+        response_contents,
+        "-march=rv32imc_zicsr_zifencei -mabi=ilp32 -DSTART_BEFORE_ACTION=1"
+    );
     assert!(captured.contains("-DVALUE=with spaces \n"));
     assert!(captured.contains(&format!(
         "-I\n{}\n",
         fixture.context.includes[0].path.display()
     )));
     assert!(captured.contains("-fsyntax-only\n"));
+    assert!(!captured.contains("-march=rv32imc_zicsr_zifencei\n"));
+    assert!(!captured.contains("-mabi=ilp32\n"));
     assert!(captured.contains("-x\nc\n"));
     assert!(captured.contains("src/backend/nimble_shim.c\n"));
     assert!(!captured.contains("-c\n"));
@@ -773,12 +1218,18 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
         let allowlist = Allowlist {
             functions: &["fixture_required"],
             types: &["fixture_payload_t"],
-            variables: &["FIXTURE_MODE", "FIXTURE_ERROR_ALIAS"],
+            variables: &[
+                "FIXTURE_MODE",
+                "FIXTURE_ERROR_ALIAS",
+                "FIXTURE_TIMEOUT_ALIAS",
+            ],
             opaque_types: &[],
             blocked_types: &[],
         };
         let required_variables = if case == "named-enum-alias" {
             &["FIXTURE_MODE", "FIXTURE_ERROR_ALIAS"][..]
+        } else if case == "macro-backed-enum-alias" {
+            &["FIXTURE_MODE", "FIXTURE_TIMEOUT_ALIAS"][..]
         } else {
             &["FIXTURE_MODE"][..]
         };
@@ -815,13 +1266,24 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
             )
         };
         match case.as_str() {
-            "valid" | "named-enum-alias" | "nested-transitive-dependencies" => {
+            "valid"
+            | "named-enum-alias"
+            | "macro-backed-enum-alias"
+            | "nested-transitive-dependencies" => {
                 let generated = generated.unwrap();
                 assert!(!generated.contains("fixture_private"));
                 if case == "named-enum-alias" {
                     assert!(generated.contains("FIXTURE_ERROR_ALIAS"));
                     assert!(!generated.contains("FIXTURE_REM_USER_CONN_TERM"));
                     assert!(!generated.contains("FIXTURE_UNRELATED_ERROR"));
+                }
+                if case == "macro-backed-enum-alias" {
+                    assert!(generated.contains("FIXTURE_TIMEOUT_ALIAS"));
+                    assert_eq!(
+                        generated_integer_const(&generated, "FIXTURE_TIMEOUT_ALIAS"),
+                        2147483647
+                    );
+                    assert!(!generated_const_present(&generated, "FIXTURE_TIMEOUT"));
                 }
                 fs::write(output, generated).unwrap();
             }
@@ -866,6 +1328,10 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
         (
             "named-enum-alias",
             "typedef struct { unsigned short count; } fixture_payload_t;\nint fixture_required(fixture_payload_t *value);\nenum fixture_error_codes { FIXTURE_REM_USER_CONN_TERM = 0x13, FIXTURE_UNRELATED_ERROR = 0x14 };\nenum { FIXTURE_ERROR_ALIAS = FIXTURE_REM_USER_CONN_TERM, FIXTURE_MODE = 7 };\n",
+        ),
+        (
+            "macro-backed-enum-alias",
+            "#include <stdint.h>\n#define FIXTURE_TIMEOUT ((int32_t)INT32_MAX)\ntypedef struct { unsigned short count; } fixture_payload_t;\nint fixture_required(fixture_payload_t *value);\nenum { FIXTURE_TIMEOUT_ALIAS = FIXTURE_TIMEOUT, FIXTURE_MODE = 7 };\n",
         ),
         (
             "syntax-error",
@@ -940,7 +1406,10 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
             "isolated generic host bindgen fixture `{case}` failed: {}",
             String::from_utf8_lossy(&result.stderr)
         );
-        if case != "valid" && case != "named-enum-alias" && case != "nested-transitive-dependencies"
+        if case != "valid"
+            && case != "named-enum-alias"
+            && case != "macro-backed-enum-alias"
+            && case != "nested-transitive-dependencies"
         {
             assert!(!output.exists(), "failed `{case}` fixture published output");
             continue;
@@ -954,6 +1423,14 @@ fn generic_host_bindgen_fixture_filters_named_enum_variants() {
             assert!(generated.contains("FIXTURE_ERROR_ALIAS"));
             assert!(!generated.contains("FIXTURE_REM_USER_CONN_TERM"));
             assert!(!generated.contains("FIXTURE_UNRELATED_ERROR"));
+        }
+        if case == "macro-backed-enum-alias" {
+            assert!(generated.contains("FIXTURE_TIMEOUT_ALIAS"));
+            assert_eq!(
+                generated_integer_const(&generated, "FIXTURE_TIMEOUT_ALIAS"),
+                2147483647
+            );
+            assert!(!generated_const_present(&generated, "FIXTURE_TIMEOUT"));
         }
         if case == "nested-transitive-dependencies" {
             let dependencies = fs::read_to_string(&dependency_output).unwrap();

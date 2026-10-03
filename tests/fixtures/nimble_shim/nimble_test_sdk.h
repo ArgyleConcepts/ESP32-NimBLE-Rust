@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#define BLE_HS_FOREVER INT32_MAX
+
 typedef void ble_hs_sync_fn(void);
 typedef void ble_hs_reset_fn(int reason);
 

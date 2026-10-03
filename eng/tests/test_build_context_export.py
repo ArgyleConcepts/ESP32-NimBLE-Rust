@@ -1,7 +1,11 @@
 """Unit tests for token-preserving build-context export helpers."""
 
+import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -16,6 +20,28 @@ import export_build_context
 
 
 class CompilerExportTests(unittest.TestCase):
+    def test_exporter_entrypoint_does_not_write_import_bytecode(self):
+        with tempfile.TemporaryDirectory(prefix="argyle exporter bytecode ") as temporary:
+            cmake = Path(temporary) / "cmake"
+            cmake.mkdir()
+            for name in ("capture_compiler.py", "export_build_context.py"):
+                shutil.copy2(ROOT / "cmake" / name, cmake / name)
+            environment = dict(os.environ)
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+
+            result = subprocess.run(
+                [sys.executable, str(cmake / "export_build_context.py"), "--help"],
+                cwd=cmake,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse((cmake / "__pycache__").exists())
+
     def test_compile_events_preserve_separate_arguments_and_spaces(self):
         with tempfile.TemporaryDirectory(prefix="argyle includes ") as temporary:
             root = Path(temporary)
@@ -57,6 +83,65 @@ class CompilerExportTests(unittest.TestCase):
         ]:
             with self.subTest(arguments=arguments), self.assertRaisesRegex(ValueError, message):
                 export_build_context.compile_events(arguments, "/tmp")
+
+    def test_include_lookup_accepts_only_genuine_missing_directories(self):
+        with tempfile.TemporaryDirectory(prefix="argyle include lookup ") as temporary:
+            root = Path(temporary)
+            component = root / "component"
+            component.mkdir()
+            absent = component / "port" / "include"
+            self.assertEqual(
+                export_build_context.validate_include_lookup(str(absent), temporary), "missing"
+            )
+            includes, _ = export_build_context.compile_events([f"-I{absent}"], temporary)
+            self.assertEqual(includes[0]["path"], str(absent))
+
+            absent.mkdir(parents=True)
+            self.assertEqual(
+                export_build_context.validate_include_lookup(str(absent), temporary), "present"
+            )
+
+            existing = component / "existing"
+            existing.mkdir()
+            absent_before_parent = component / "not-created" / ".." / "existing"
+            self.assertEqual(
+                export_build_context.validate_include_lookup(str(absent_before_parent), temporary),
+                "missing",
+            )
+            includes, _ = export_build_context.compile_events(
+                ["-I", str(absent_before_parent)], temporary
+            )
+            self.assertEqual(includes[0]["path"], str(absent_before_parent))
+            (component / "not-created").mkdir()
+            self.assertEqual(
+                export_build_context.validate_include_lookup(str(absent_before_parent), temporary),
+                "present",
+            )
+
+            file_path = root / "not-a-directory"
+            file_path.write_text("file", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "non-directory.*not-a-directory"):
+                export_build_context.validate_include_lookup(str(file_path), temporary)
+            with self.assertRaisesRegex(ValueError, "could not inspect.*not-a-directory"):
+                export_build_context.validate_include_lookup(str(file_path / "include"), temporary)
+            with mock.patch.object(export_build_context.os, "scandir", side_effect=PermissionError):
+                with self.assertRaisesRegex(ValueError, "could not inspect.*component"):
+                    export_build_context.validate_include_lookup(str(component), temporary)
+
+            dangling = component / "dangling"
+            dangling.symlink_to(component / "missing-target")
+            with self.assertRaisesRegex(ValueError, "dangling symlink"):
+                export_build_context.validate_include_lookup(str(dangling), temporary)
+
+            dangling_after_absent = component / "not-created" / ".." / "dangling"
+            (component / "not-created").rmdir()
+            self.assertEqual(
+                export_build_context.validate_include_lookup(str(dangling_after_absent), temporary),
+                "missing",
+            )
+            (component / "not-created").mkdir()
+            with self.assertRaisesRegex(ValueError, "dangling symlink"):
+                export_build_context.validate_include_lookup(str(dangling_after_absent), temporary)
 
     def test_sysroot_rejects_empty_joined_value(self):
         with self.assertRaisesRegex(ValueError, "--sysroot= has an empty sysroot value"):
@@ -173,14 +258,14 @@ class CompilerExportTests(unittest.TestCase):
             capture = Path(temporary) / "capture.json"
             capture.write_text(json.dumps(["compiler", "-I", "include path"]), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "must be a JSON object"):
-                export_build_context.read_capture(str(capture))
+                export_build_context.read_capture(str(capture), temporary)
 
             capture.write_text(
                 json.dumps({"compiler": "/compiler", "arguments": [], "status": 0}),
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "working_directory"):
-                export_build_context.read_capture(str(capture))
+                export_build_context.read_capture(str(capture), temporary)
 
             capture.write_text(
                 json.dumps({
@@ -192,7 +277,7 @@ class CompilerExportTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "did not complete successfully"):
-                export_build_context.read_capture(str(capture))
+                export_build_context.read_capture(str(capture), temporary)
 
     def test_capture_forwards_exact_argv_and_only_writes_after_success(self):
         with tempfile.TemporaryDirectory(prefix="argyle capture with spaces ") as temporary:
@@ -208,6 +293,8 @@ class CompilerExportTests(unittest.TestCase):
             written = json.loads(capture.read_text(encoding="utf-8"))
             self.assertEqual(written["compiler"], compiler_argv[0])
             self.assertEqual(written["arguments"], compiler_argv[1:])
+            self.assertEqual(written["captured_arguments"], compiler_argv[1:])
+            self.assertEqual(written["response_files"], [])
             self.assertEqual(written["working_directory"], str(Path.cwd()))
             self.assertEqual(written["status"], 0)
 
@@ -235,6 +322,165 @@ class CompilerExportTests(unittest.TestCase):
 
             run.assert_not_called()
             self.assertFalse(capture.exists())
+
+    def test_gcc_response_capture_preserves_raw_argv_and_records_expanded_input(self):
+        with tempfile.TemporaryDirectory(prefix="argyle response capture ") as temporary:
+            build_root = Path(temporary) / "idf-build"
+            capture = build_root / "argyle-nimble" / "compiler-capture.json"
+            capture.parent.mkdir(parents=True)
+            response_path = build_root / "toolchain" / "cflags"
+            response_path.parent.mkdir()
+            response_contents = b'-DNAME="two words" -I"include path" -DVALUE=foo\\ bar\n'
+            response_path.write_bytes(response_contents)
+            response_path = response_path.resolve()
+            object_path = build_root / "CMakeFiles/probe.o"
+            raw_argv = ["/compiler", "-c", f"@{response_path}", "probe.c", "-o", str(object_path)]
+            with (
+                mock.patch.object(
+                    capture_compiler.sys,
+                    "argv",
+                    ["capture_compiler.py", str(capture), *raw_argv],
+                ),
+                mock.patch.object(capture_compiler.subprocess, "run", return_value=mock.Mock(returncode=0)) as run,
+            ):
+                self.assertEqual(capture_compiler.main(), 0)
+
+            run.assert_called_once_with(raw_argv, check=False)
+            written = json.loads(capture.read_text(encoding="utf-8"))
+            self.assertEqual(written["captured_arguments"], raw_argv[1:])
+            self.assertEqual(
+                written["arguments"],
+                ["-c", "-DNAME=two words", "-Iinclude path", "-DVALUE=foo bar", "probe.c", "-o", str(object_path)],
+            )
+            self.assertEqual(len(written["response_files"]), 1)
+            response = written["response_files"][0]
+            self.assertEqual(response["argument_index"], 1)
+            self.assertEqual(response["token"], f"@{response_path}")
+            self.assertEqual(response["path"], str(response_path))
+            self.assertEqual(response["arguments"], ["-DNAME=two words", "-Iinclude path", "-DVALUE=foo bar"])
+            self.assertEqual(response["sha256"], hashlib.sha256(response_contents).hexdigest())
+
+    def test_response_file_mutation_during_probe_does_not_publish_capture(self):
+        with tempfile.TemporaryDirectory(prefix="argyle response race ") as temporary:
+            build_root = Path(temporary) / "idf-build"
+            capture = build_root / "argyle-nimble" / "compiler-capture.json"
+            capture.parent.mkdir(parents=True)
+            response_path = build_root / "toolchain" / "cflags"
+            response_path.parent.mkdir()
+            response_path.write_text("-DVALUE=before\n", encoding="utf-8")
+            response_path = response_path.resolve()
+
+            def mutate_response(*_args, **_kwargs):
+                response_path.write_text("-DVALUE=after\n", encoding="utf-8")
+                return mock.Mock(returncode=0)
+
+            with (
+                mock.patch.object(
+                    capture_compiler.sys,
+                    "argv",
+                    ["capture_compiler.py", str(capture), "/compiler", f"@{response_path}"],
+                ),
+                mock.patch.object(
+                    capture_compiler.subprocess, "run", side_effect=mutate_response,
+                ) as run,
+            ):
+                self.assertEqual(capture_compiler.main(), 2)
+
+            run.assert_called_once()
+            self.assertFalse(capture.exists())
+
+    def test_gcc_response_parser_rejects_unsafe_or_malformed_contents(self):
+        cases = (
+            (b"@nested.rsp", "nested or additional response files"),
+            (b"-c", "unsupported compiler action/input flag"),
+            (b"-o object.o", "unsupported compiler output/dependency flag"),
+            (b"-B/toolchain", "unsupported compiler tool-selection flag"),
+            (
+                b"-specs=other.specs",
+                "unsupported compiler tool-selection flag.*CONFIG_LIBC_NEWLIB=y",
+            ),
+            (
+                b"--specs=other.specs",
+                "unsupported compiler tool-selection flag.*CONFIG_LIBC_NEWLIB=y",
+            ),
+            (b"-wrapper=wrapper", "unsupported compiler tool-selection flag"),
+            (b"-xlanguage", "unsupported compiler tool-selection flag"),
+            (b"--target=other-target", "unsupported compiler tool-selection flag"),
+            (b"-fuse-ld=other-linker", "unsupported compiler tool-selection flag"),
+            (b"-save-temps=objects", "unsupported compiler action/input flag"),
+            (b"--output=object.o", "unsupported compiler output/dependency flag"),
+            (b"--dependency-file=object.d", "unsupported compiler output/dependency flag"),
+            (b"-dependency-file=object.d", "unsupported compiler output/dependency flag"),
+            (b"-DNAME='unterminated", "unmatched quote"),
+            (b"-DNAME=trailing\\", "incomplete escape"),
+            (b'-I ""', "missing its value"),
+        )
+        for contents, diagnostic in cases:
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as temporary:
+                build_root = (Path(temporary) / "idf-build").resolve()
+                response_path = build_root / "toolchain" / "cflags"
+                response_path.parent.mkdir(parents=True)
+                response_path.write_bytes(contents)
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    capture_compiler.expand_idf_cflags_response(
+                        [f"@{response_path}"], build_root, Path(temporary),
+                    )
+
+    def test_gcc_response_parser_uses_ascii_separators_and_rejects_any_nul(self):
+        parsed = capture_compiler._tokenize_gcc_response(
+            "-DNAME=left\u00a0right -DQUOTED='left\u00a0right'".encode("utf-8")
+        )
+        self.assertEqual(
+            parsed,
+            ["-DNAME=left\u00a0right", "-DQUOTED=left\u00a0right"],
+        )
+        for contents in (b"-DNAME='quoted\0nul'", b"-DNAME=escaped\\\0nul"):
+            with self.subTest(contents=contents), self.assertRaisesRegex(ValueError, "NUL byte"):
+                capture_compiler._tokenize_gcc_response(contents)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            build_root = Path(temporary) / "idf-build"
+            expected = build_root / "toolchain" / "cflags"
+            expected.parent.mkdir(parents=True)
+            expected.write_text("-DVALUE=1\n", encoding="utf-8")
+            other_response = Path(temporary) / "custom.rsp"
+            other_response.write_text("-DVALUE=2\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "exact configured ESP-IDF toolchain/cflags path"):
+                capture_compiler.expand_idf_cflags_response(
+                    [f"@{other_response}"], build_root, Path(temporary),
+                )
+
+    def test_exporter_rejects_response_hash_or_token_mismatch(self):
+        with tempfile.TemporaryDirectory(prefix="argyle response export ") as temporary:
+            build_root = Path(temporary) / "idf-build"
+            capture_path = build_root / "argyle-nimble" / "compiler-capture.json"
+            capture_path.parent.mkdir(parents=True)
+            response_path = build_root / "toolchain" / "cflags"
+            response_path.parent.mkdir()
+            response_path.write_text("-DVALUE=one\n", encoding="utf-8")
+            response_path = response_path.resolve()
+            captured_arguments = [f"@{response_path}"]
+            expanded, response_files = capture_compiler.expand_idf_cflags_response(
+                captured_arguments, build_root, Path(temporary),
+            )
+            record = {
+                "compiler": "/compiler",
+                "arguments": expanded,
+                "captured_arguments": captured_arguments,
+                "response_files": response_files,
+                "working_directory": str(temporary),
+                "status": 0,
+            }
+            capture_path.write_text(json.dumps(record), encoding="utf-8")
+            response_path.write_text("-DVALUE=two\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "hash or ordered tokens changed"):
+                export_build_context.read_capture(str(capture_path), str(build_root))
+
+            response_path.write_text("-DVALUE=one\n", encoding="utf-8")
+            record["response_files"][0]["arguments"] = ["-DVALUE=forged"]
+            capture_path.write_text(json.dumps(record), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "hash or ordered tokens changed"):
+                export_build_context.read_capture(str(capture_path), str(build_root))
 
 
 if __name__ == "__main__":

@@ -43,13 +43,74 @@ reviewed PR to keep both branches current. This does not publish packages.
 Maintainers rerun the pipeline in Azure; contributors follow the promotion path
 in [MAINTAINING.md](MAINTAINING.md), without running local builds/tests.
 
+The independent `C3BindingGeneration` and `S3BindingGeneration` jobs install
+the exact ESP-IDF **6.1.0** commit recorded in
+[`eng/idf-tools.lock.json`](../eng/idf-tools.lock.json), including its pinned
+NimBLE submodule. They verify the official `tools/tools.json` metadata and
+macOS ARM64/x86-64 SHA-256 values before installing the pinned GCC, EspClang,
+libclang, CMake, and Ninja packages. ESP-IDF's additional target-required GDB,
+ULP, OpenOCD, and ROM ELF packages come from that same checked-in SDK metadata.
+The Python venv follows the pinned SDK's core requirements and constraints;
+resolved Python wheels are not individually hash-locked. Each job gets its own
+BuildID/JobID/attempt tool, SDK, Cargo, Rustup, cache, fixture, and build paths.
+The jobs can serialize on the single self-hosted Mac agent, and share no
+mutable SDK installation or Cargo source cache. Cleanup removes only that
+job's tools directory after artifact publication.
+
+Each job configures a generic ESP-IDF C3 or S3 fixture with `idf.py`, builds
+only `argyle_nimble_export_context`, and uses the selected SDK GCC/sysroot,
+compiler arguments, include paths, and generated `sdkconfig.h` as inputs to
+the crate's actual Cargo build script and pinned EspClang/libclang generator.
+The generic fixtures explicitly select `CONFIG_LIBC_NEWLIB=y` and verify that
+both `sdkconfig` and `sdkconfig.h` select Newlib with Picolibc disabled. The
+matrix does not support Picolibc's `-specs` arguments or make a claim about
+other C library configurations.
+Both `CONFIG_BT_NIMBLE_CPFD_CAFD` values are configured for each chip; the
+retained binding and manifest evidence must show their expected distinct
+`ble_gatt_cpfd` layouts. The driver also verifies stable unchanged inputs,
+reuses the same Cargo output directory across OFF/ON/OFF contexts, and changes
+CAFD in-place in one configured `sdkconfig` before restoring it. It mutates and
+restores generated/transitive headers and a captured compiler definition,
+then mutates the SDK-generated `toolchain/cflags` input to verify compiler-probe
+recapture, stale-context rejection, re-export, and restored identity.
+It rejects invalid contexts and a reconfigured NimBLE-disabled target, exercises
+missing-tool/header and Clang-parse failures after successful generation, and
+compiles an external Cargo consumer that must fail Rust privacy checks when it
+names a generated type.
+Cargo sources are fetched once before the matrix and all later Cargo work is
+offline; registry source and Git-checkout digests are compared before and
+after. The package file list, tracked-source digest, build-context JSON,
+manifest, generated binding, command logs, and JUnit results are retained as
+job artifacts.
+
+The same jobs run `eng/test/fixture/run_cmake_export_regressions.py` against
+the actual pinned SDK for early and late custom launchers, changed/removed
+probe launchers, consumer launchers, directory-scope leakage, deferred scalar
+property refresh, transitive generator-expression includes/options, source and
+binary-directory guards, and consumer/probe dependency cycles. The positive
+case builds the configured consumer component and context probe, not the
+firmware executable. These checks exercise configured header generation and
+context capture; native-host Cargo execution does not validate the ESP target
+ABI. A complete firmware Cargo/`idf.py` compile-and-link remains NIMBLERS-7,
+and no hardware, BLE interoperability, or publication claim is made.
+
+To reproduce a pull-request result, open Pipeline 35 above and queue or rerun
+the reviewed branch/commit with maintainer access to its protected resources.
+Run `HostValidation`, `C3BindingGeneration`, and `S3BindingGeneration` on the
+self-hosted `macOS` pool; do not install the SDK or run project builds locally.
+Confirm Azure's `system.pullRequest.sourceCommitId` matches the intended PR
+head, then download the `host-validation`, `esp32c3-binding-generation`, and
+`esp32s3-binding-generation` artifacts. Inspect each matrix report's
+`generation_states`, `acceptance_audit`, and retained command logs together
+with `generation-matrix.xml` before treating generation as verified.
+
 Current checks are CI-helper regression tests, shell syntax, rustfmt, Clippy,
 host compilation, Cargo unit/integration tests, doctests, rustdoc with warnings
 denied, package identity/publication guard, packaged license/docs, and relative
 Markdown links. Checks continue after a command failure so diagnostics from
 other commands are available, and any failed command fails validation.
 
-The Rust integration tests validate the private context contract and mode
+The SDK-free Rust integration tests validate the private context contract and mode
 selection with SDK-free filesystem fixtures, exercise Cargo binding-output
 identity and transaction failure paths, private binding generation with
 generic host C fixtures, and compile the copied private C shim
@@ -59,13 +120,11 @@ stack interoperability. The Python tests
 exercise context export/capture token handling as well as CI failure propagation,
 missing executables, diagnostic retention, report encoding, unexpected
 exceptions/interrupts, inherited configuration, exact-case tracked-file links,
-and invalid package contracts. Genuine C3/S3 binding generation and target
-configuration checks are later matrix work; no hardware verification is claimed.
-These runs do not configure a real ESP-IDF CMake consumer project; C3/S3 CMake
-exporter fixtures, including rejection of launchers set after component
-registration, are pending NIMBLERS-24. The CMake fixtures should also add
-`add_compile_options(-DARGYLE_LEAK)` after consumer target creation and before
-export, then verify that the probe capture excludes this directory-only define.
+and invalid package contracts. Separate configured C3/S3 jobs and real CMake
+exporter regressions produce the `esp32c3-binding-generation` and
+`esp32s3-binding-generation` artifacts. Both kinds of checks remain necessary:
+the configured generation jobs do not replace SDK-free host tests or establish
+target ABI, firmware-link, hardware, or BLE-interoperability evidence.
 
 ## Reports, artifacts, and isolation
 
@@ -85,7 +144,8 @@ report exists, the setup log and Azure task logs remain the relevant evidence.
 Reports intentionally avoid environment dumps or credential snapshots.
 
 Checkout and the job workspace are cleaned, checkout does not persist credentials,
-and tools/Cargo home/target/Python cache directories are unique to each build ID.
+and tools/Cargo home/target/Python cache directories are unique to each build
+job and attempt.
 There are no shared CI caches to restore. This run's temporary state is deleted
 after diagnostics are published. Future target caches must additionally isolate
 the chip, target toolchain, ESP-IDF revision, and configuration.

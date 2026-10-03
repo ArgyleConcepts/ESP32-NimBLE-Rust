@@ -3,7 +3,9 @@
 //! Keep this module independent of Cargo build-script state so the host-side
 //! fixture driver and future Cargo integration can apply the same validation.
 
+use crate::lifecycle::{self, IncludeLookupPath};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,10 +31,18 @@ pub struct EspBuildContext {
     pub sysroot: PathBuf,
     pub working_directory: PathBuf,
     pub build_configuration: String,
-    /// Exact compiler arguments captured from the configured CMake probe.
+    /// Effective ordered compiler arguments, with the SDK response file
+    /// replaced by its parsed contents.
     pub compiler_arguments: Vec<String>,
+    /// Exact argv captured from the configured CMake probe, including the
+    /// pinned ESP-IDF response-file token.
+    pub captured_compiler_arguments: Vec<String>,
+    /// The single pinned ESP-IDF 6.1 `toolchain/cflags` response file.
+    pub response_files: Vec<CompilerResponseFile>,
     /// Ordered include paths found in `compiler_arguments`.
     pub includes: Vec<IncludePath>,
+    /// Current present/missing resolution for every explicit compiler include.
+    pub include_lookups: Vec<IncludeLookupPath>,
     /// Compiler-provided include paths reported by CMake in search order.
     pub implicit_includes: Vec<PathBuf>,
     /// Ordered define/undefine events found in `compiler_arguments`.
@@ -40,6 +50,15 @@ pub struct EspBuildContext {
     pub sdkconfig: PathBuf,
     pub generated_headers: Vec<PathBuf>,
     pub version_header: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompilerResponseFile {
+    pub argument_index: usize,
+    pub token: String,
+    pub path: PathBuf,
+    pub sha256: String,
+    pub arguments: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -251,17 +270,49 @@ fn validate_context(value: &Value) -> Result<EspBuildContext, ContextError> {
     if compiler_arguments.is_empty() {
         return Err(field_error(
             "compiler.arguments",
-            "must contain the captured C compiler arguments",
+            "must contain the effective C compiler arguments",
         ));
     }
-    reject_response_files(&compiler_arguments)?;
+    let captured_compiler_arguments = if compiler_object.contains_key("captured_arguments") {
+        required_string_array(compiler_object, "captured_arguments", "compiler")?
+    } else if compiler_arguments
+        .iter()
+        .any(|argument| argument.starts_with('@'))
+    {
+        return Err(field_error(
+            "compiler.captured_arguments",
+            "is required when compiler arguments contain a response-file reference",
+        ));
+    } else {
+        compiler_arguments.clone()
+    };
+    if captured_compiler_arguments.is_empty() {
+        return Err(field_error(
+            "compiler.captured_arguments",
+            "must contain the exact captured C compiler argv",
+        ));
+    }
+    let response_files = parse_compiler_response_files(
+        compiler_object,
+        &build_root,
+        &captured_compiler_arguments,
+        &compiler_arguments,
+    )?;
     let includes = parse_includes(compiler_object, &compiler_arguments)?;
+    let include_lookups = includes
+        .iter()
+        .enumerate()
+        .map(|(index, include)| {
+            lifecycle::resolve_include_lookup(&include.path, &working_directory)
+                .map_err(|error| field_error(&format!("compiler.includes[{index}]"), &error))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let implicit_includes = required_path_array(compiler_object, "implicit_includes", "compiler")?;
     for (index, path) in implicit_includes.iter().enumerate() {
         require_directory(path, &format!("compiler.implicit_includes[{index}]"))?;
     }
     let defines = parse_defines(compiler_object, &compiler_arguments)?;
-    validate_argument_events(&compiler_arguments, &includes, &defines, &working_directory)?;
+    validate_argument_events(&compiler_arguments, &includes, &defines)?;
     validate_explicit_sysroot(&compiler_arguments, &sysroot, &working_directory)?;
 
     let configuration = required_object(object, "configuration", "contract")?;
@@ -302,13 +353,53 @@ fn validate_context(value: &Value) -> Result<EspBuildContext, ContextError> {
         working_directory,
         build_configuration,
         compiler_arguments,
+        captured_compiler_arguments,
+        response_files,
         includes,
+        include_lookups,
         implicit_includes,
         defines,
         sdkconfig,
         generated_headers,
         version_header,
     })
+}
+
+impl EspBuildContext {
+    /// Re-read and verify every captured SDK response file against the exact
+    /// bytes and argv splice accepted during context parsing.
+    pub fn verify_response_files_unchanged(&self) -> Result<(), ContextError> {
+        verify_response_files(
+            &self.build_root,
+            &self.captured_compiler_arguments,
+            &self.compiler_arguments,
+            &self.response_files,
+        )
+    }
+
+    /// Reject a directory appearing, disappearing, or resolving through a
+    /// different symlink after this CMake context was captured.
+    pub fn verify_include_lookups_unchanged(&self) -> Result<(), ContextError> {
+        if self.includes.len() != self.include_lookups.len() {
+            return Err(field_error(
+                "compiler.includes",
+                "lookup state no longer matches captured include options; re-export the CMake context",
+            ));
+        }
+        for (index, (include, captured)) in
+            self.includes.iter().zip(&self.include_lookups).enumerate()
+        {
+            let current = lifecycle::resolve_include_lookup(&include.path, &self.working_directory)
+                .map_err(|error| field_error(&format!("compiler.includes[{index}]"), &error))?;
+            if &current != captured {
+                return Err(field_error(
+                    &format!("compiler.includes[{index}]"),
+                    "lookup directory appeared, disappeared, or changed resolution during binding generation; rerun CMake context export",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn supported_esp_target(target: &str) -> Option<&'static str> {
@@ -580,11 +671,368 @@ fn parse_includes(
     Ok(result)
 }
 
-fn reject_response_files(arguments: &[String]) -> Result<(), ContextError> {
-    if arguments.iter().any(|argument| argument.starts_with('@')) {
+fn parse_compiler_response_files(
+    object: &serde_json::Map<String, Value>,
+    build_root: &Path,
+    captured_arguments: &[String],
+    effective_arguments: &[String],
+) -> Result<Vec<CompilerResponseFile>, ContextError> {
+    let Some(value) = object.get("response_files") else {
+        verify_response_files(build_root, captured_arguments, effective_arguments, &[])?;
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| field_error("compiler.response_files", "must be an array when present"))?;
+    if values.is_empty() {
+        verify_response_files(build_root, captured_arguments, effective_arguments, &[])?;
+        return Ok(Vec::new());
+    }
+    if values.len() != 1 {
+        return Err(field_error(
+            "compiler.response_files",
+            "must contain exactly the pinned ESP-IDF 6.1 toolchain/cflags response file",
+        ));
+    }
+    let item = values[0]
+        .as_object()
+        .ok_or_else(|| field_error("compiler.response_files[0]", "must be a JSON object"))?;
+    let argument_index = required_usize(item, "argument_index", "compiler.response_files[0]")?;
+    let token = required_string(item, "token", "compiler.response_files[0]")?;
+    let path = required_path(item, "path", "compiler.response_files[0]")?;
+    let sha256 = required_string(item, "sha256", "compiler.response_files[0]")?;
+    let arguments = required_string_array(item, "arguments", "compiler.response_files[0]")?;
+    let response = CompilerResponseFile {
+        argument_index,
+        token,
+        path,
+        sha256,
+        arguments,
+    };
+    verify_response_files(
+        build_root,
+        captured_arguments,
+        effective_arguments,
+        std::slice::from_ref(&response),
+    )?;
+    Ok(vec![response])
+}
+
+fn verify_response_files(
+    build_root: &Path,
+    captured_arguments: &[String],
+    effective_arguments: &[String],
+    response_files: &[CompilerResponseFile],
+) -> Result<(), ContextError> {
+    if response_files.is_empty() {
+        if captured_arguments != effective_arguments
+            || captured_arguments
+                .iter()
+                .any(|argument| argument.starts_with('@'))
+        {
+            return Err(field_error(
+                "compiler.captured_arguments",
+                "must equal compiler.arguments and contain no response-file reference when compiler.response_files is empty",
+            ));
+        }
+        return Ok(());
+    }
+    if response_files.len() != 1 {
+        return Err(field_error(
+            "compiler.response_files",
+            "must contain exactly the pinned ESP-IDF 6.1 toolchain/cflags response file",
+        ));
+    }
+    let response = &response_files[0];
+    let expected_path = build_root
+        .canonicalize()
+        .map_err(|_| {
+            field_error(
+                "roots.build",
+                "must be a readable configured build directory",
+            )
+        })?
+        .join("toolchain")
+        .join("cflags");
+    if response.path != expected_path {
+        return Err(field_error(
+            "compiler.response_files[0].path",
+            "must be exactly the normalized roots.build/toolchain/cflags path from the pinned ESP-IDF toolchain",
+        ));
+    }
+    let expected_token = format!("@{}", expected_path.display());
+    if response.token != expected_token {
+        return Err(field_error(
+            "compiler.response_files[0].token",
+            "must be the exact captured @roots.build/toolchain/cflags token",
+        ));
+    }
+    if response.sha256.len() != 64
+        || !response
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(field_error(
+            "compiler.response_files[0].sha256",
+            "must be a lowercase 64-character SHA-256 digest",
+        ));
+    }
+
+    let matching_tokens = captured_arguments
+        .iter()
+        .enumerate()
+        .filter(|(_, argument)| argument.starts_with('@'))
+        .collect::<Vec<_>>();
+    if matching_tokens.len() != 1
+        || matching_tokens[0].0 != response.argument_index
+        || matching_tokens[0].1 != &response.token
+    {
+        return Err(field_error(
+            "compiler.captured_arguments",
+            "must contain exactly the metadata-approved SDK @cflags token at its recorded argument_index",
+        ));
+    }
+
+    let toolchain_directory = expected_path
+        .parent()
+        .expect("fixed response file path always has a parent");
+    match fs::symlink_metadata(toolchain_directory) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        _ => {
+            return Err(field_error(
+                "compiler.response_files[0].path",
+                "must be inside an ordinary non-symlink toolchain directory",
+            ))
+        }
+    }
+    let metadata = fs::symlink_metadata(&expected_path).map_err(|_| {
+        field_error(
+            "compiler.response_files[0].path",
+            "must name the generated ESP-IDF toolchain/cflags response file",
+        )
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(field_error(
+            "compiler.response_files[0].path",
+            "must be an ordinary non-symlink regular response file",
+        ));
+    }
+    let bytes = fs::read(&expected_path).map_err(|_| {
+        field_error(
+            "compiler.response_files[0].path",
+            "must name a readable ESP-IDF response file",
+        )
+    })?;
+    let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    if actual_sha256 != response.sha256 {
+        return Err(field_error(
+            "compiler.response_files[0].sha256",
+            "does not match the current response-file bytes; rerun the CMake exporter",
+        ));
+    }
+    let parsed_arguments = tokenize_gcc_response_file(&bytes)?;
+    if parsed_arguments != response.arguments {
+        return Err(field_error(
+            "compiler.response_files[0].arguments",
+            "do not match the parsed GCC response-file contents",
+        ));
+    }
+    validate_safe_response_arguments(&parsed_arguments)?;
+
+    let mut expected_effective =
+        Vec::with_capacity(captured_arguments.len().saturating_sub(1) + parsed_arguments.len());
+    for (index, argument) in captured_arguments.iter().enumerate() {
+        if index == response.argument_index {
+            expected_effective.extend(parsed_arguments.iter().cloned());
+        } else {
+            if argument.starts_with('@') {
+                return Err(field_error(
+                    "compiler.captured_arguments",
+                    "contains an unapproved or nested response-file reference",
+                ));
+            }
+            expected_effective.push(argument.clone());
+        }
+    }
+    if expected_effective != effective_arguments {
         return Err(field_error(
             "compiler.arguments",
-            "contains a response-file reference; rerun CMake with tokenized compiler arguments enabled",
+            "does not match captured_arguments with the approved SDK response contents spliced at response_files[0].argument_index",
+        ));
+    }
+    Ok(())
+}
+
+/// Tokenize GCC 15 `@file` contents: ASCII whitespace separates arguments,
+/// single/double quotes group text, and backslash escapes the next character
+/// both inside and outside quotes. This intentionally does not use POSIX
+/// shell parsing, variable expansion, or nested response-file expansion.
+fn tokenize_gcc_response_file(bytes: &[u8]) -> Result<Vec<String>, ContextError> {
+    if bytes.contains(&0) {
+        return Err(field_error(
+            "compiler.response_files[0].path",
+            "contains a NUL byte that GCC cannot use as an argument",
+        ));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        field_error(
+            "compiler.response_files[0].path",
+            "must contain UTF-8 GCC response-file arguments",
+        )
+    })?;
+    let mut result = Vec::new();
+    let mut argument = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut started = false;
+    for character in text.chars() {
+        if escaped {
+            argument.push(character);
+            started = true;
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            started = true;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            } else {
+                argument.push(character);
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            started = true;
+        } else if matches!(
+            character,
+            ' ' | '\t' | '\n' | '\r' | '\u{000b}' | '\u{000c}'
+        ) {
+            if started {
+                result.push(std::mem::take(&mut argument));
+                started = false;
+            }
+        } else {
+            argument.push(character);
+            started = true;
+        }
+    }
+    if escaped {
+        return Err(field_error(
+            "compiler.response_files[0].path",
+            "ends with a dangling GCC response-file escape",
+        ));
+    }
+    if quote.is_some() {
+        return Err(field_error(
+            "compiler.response_files[0].path",
+            "contains an unmatched GCC response-file quote",
+        ));
+    }
+    if started {
+        result.push(argument);
+    }
+    Ok(result)
+}
+
+fn validate_safe_response_arguments(arguments: &[String]) -> Result<(), ContextError> {
+    let mut expects_operand = false;
+    for argument in arguments {
+        if argument.starts_with('@') {
+            return Err(field_error(
+                "compiler.response_files[0].arguments",
+                "contains a nested or additional response-file reference",
+            ));
+        }
+        if expects_operand {
+            if argument.is_empty() {
+                return Err(field_error(
+                    "compiler.response_files[0].arguments",
+                    "contains an empty operand for a GCC compiler option",
+                ));
+            }
+            expects_operand = false;
+            continue;
+        }
+        let tool_override = argument.starts_with("-B")
+            || argument.starts_with("-specs")
+            || argument.starts_with("--specs")
+            || argument.starts_with("-fplugin")
+            || argument.starts_with("-wrapper")
+            || argument.starts_with("-x")
+            || argument.starts_with("-target")
+            || argument.starts_with("--target")
+            || argument.starts_with("--gcc-toolchain")
+            || argument.starts_with("-fuse-ld");
+        if tool_override {
+            return Err(field_error(
+                "compiler.response_files[0].arguments",
+                "contains a toolchain/language override that is not allowed in SDK cflags",
+            ));
+        }
+        let action_or_output = matches!(
+            argument.as_str(),
+            "-c" | "-S"
+                | "-E"
+                | "-M"
+                | "-MM"
+                | "-MD"
+                | "-MMD"
+                | "-MP"
+                | "-MG"
+                | "-fsyntax-only"
+                | "--"
+                | "-"
+        ) || argument.starts_with("-o")
+            || argument == "--output"
+            || argument.starts_with("--output=")
+            || argument.starts_with("--output")
+            || argument.starts_with("-save-temps")
+            || argument == "-MF"
+            || argument.starts_with("-MF")
+            || argument == "-MT"
+            || argument.starts_with("-MT")
+            || argument == "-MQ"
+            || argument.starts_with("-MQ")
+            || argument.starts_with("-dependency-file")
+            || argument.starts_with("--dependency-file");
+        if action_or_output {
+            return Err(field_error(
+                "compiler.response_files[0].arguments",
+                "contains a compile action, source dependency, or output flag that must remain in the captured CMake argv",
+            ));
+        }
+        if matches!(
+            argument.as_str(),
+            "-I" | "-isystem"
+                | "-iquote"
+                | "-idirafter"
+                | "-D"
+                | "-U"
+                | "--sysroot"
+                | "-isysroot"
+                | "-include"
+                | "-imacros"
+        ) {
+            expects_operand = true;
+            continue;
+        }
+        if !argument.starts_with('-') {
+            return Err(field_error(
+                "compiler.response_files[0].arguments",
+                "contains a positional source operand instead of an SDK compiler flag",
+            ));
+        }
+    }
+    if expects_operand {
+        return Err(field_error(
+            "compiler.response_files[0].arguments",
+            "ends with a GCC compiler option that requires an operand",
         ));
     }
     Ok(())
@@ -594,7 +1042,6 @@ fn validate_argument_events(
     arguments: &[String],
     includes: &[IncludePath],
     defines: &[DefineEvent],
-    working_directory: &Path,
 ) -> Result<(), ContextError> {
     let mut expected_includes = Vec::new();
     let mut expected_defines = Vec::new();
@@ -692,14 +1139,6 @@ fn validate_argument_events(
             "compiler.defines",
             "must contain every define/undefine option from compiler.arguments in the same order",
         ));
-    }
-    for include in includes {
-        let effective_path = if include.path.is_absolute() {
-            include.path.clone()
-        } else {
-            working_directory.join(&include.path)
-        };
-        require_directory(&effective_path, "compiler.includes")?;
     }
     Ok(())
 }

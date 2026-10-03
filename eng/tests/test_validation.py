@@ -47,7 +47,16 @@ class ValidationTests(unittest.TestCase):
             validation.check_package_listing("Cargo.toml\nREADME.md\nsrc/lib.rs\n")
 
     def test_complete_package_listing(self):
-        validation.check_package_listing("\n".join([
+        validation.check_package_listing(self.complete_package_listing())
+
+    def test_python_bytecode_is_rejected_from_package_listing(self):
+        with self.assertRaisesRegex(ValueError, "Python bytecode artifacts"):
+            validation.check_package_listing(
+                self.complete_package_listing() + "\ncmake/__pycache__/probe.pyc\n"
+            )
+
+    def complete_package_listing(self):
+        return "\n".join([
             "Cargo.toml", "build.rs", "LICENSE", "README.md", "src/lib.rs", "CONTRIBUTING.md",
             "build_support/context.rs", "build_support/bindings.rs",
             "build_support/inputs.rs", "build_support/lifecycle.rs",
@@ -56,7 +65,7 @@ class ValidationTests(unittest.TestCase):
             "cmake/capture_compiler.py", "cmake/export_build_context.py",
             "SECURITY.md", "CODE_OF_CONDUCT.md", "docs/MAINTAINING.md",
             "docs/BUILD_CONTEXT.md", "docs/BINDING_GENERATION.md",
-        ]))
+        ])
 
     def test_failed_command_retains_status_and_diagnostics(self):
         with tempfile.TemporaryDirectory() as directory:

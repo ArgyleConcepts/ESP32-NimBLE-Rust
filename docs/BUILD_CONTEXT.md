@@ -26,10 +26,21 @@ the ESP-IDF repository root before its commit is recorded. It creates the
 small C probe with the selected compiler and exports the context to
 `<BUILD_DIR>/argyle-nimble/build-context-v1.json`. The probe captures compiler
 arguments as an argv array and records its working directory only after the
-compiler succeeds. A failed invocation clears any previous capture. The exporter
-rejects compiler response files because their contents are not an argv array.
-It does not parse `compile_commands.json`, split command strings, inspect a
-global SDK installation, or inspect inherited environment values.
+compiler succeeds. A failed invocation clears any previous capture. ESP-IDF
+6.1 places configured C flags in the single generated
+`<BUILD_DIR>/toolchain/cflags` response file. The launcher accepts only that
+ordinary file at its canonical build-root path, parses the pinned
+[GCC 15.2 response-file syntax](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/Overall-Options.html#Overall-Options),
+and rejects nested files and action, output, input, or
+tool-selection overrides. It hashes and parses the file before compiling with
+the original argv, then verifies that its bytes did not change before writing
+the capture. The exporter rechecks the hash and ordered tokens. The probe object
+depends on `toolchain/cflags`, so a later response-file edit must run the real
+selected-compiler probe again before a new context can be exported. The context
+retains both the raw captured argv and the ordered effective argv with the
+response tokens expanded. It does not parse `compile_commands.json`, split
+command strings, inspect a global SDK installation, or inspect inherited
+environment values.
 
 For reliable capture, call the exporter from the consumer target's defining
 CMake source and binary directory. It rejects nonempty `RULE_LAUNCH_COMPILE`
@@ -60,11 +71,24 @@ The emitted contract preserves these values:
 | `roots.sdk`, `roots.build` | Active ESP-IDF and CMake build roots. |
 | `target.chip`, `target.architecture` | Active ESP-IDF target and target-architecture build properties. |
 | `compiler.path`, `compiler.sysroot`, `compiler.working_directory` | The selected compiler invocation and its effective sysroot. Relative sysroot arguments are resolved from the captured working directory. |
-| `compiler.arguments` | Every compiler argument after the executable, preserved in order and with its original boundaries. |
-| `compiler.includes`, `compiler.defines` | Ordered include and define/undefine events derived from the authoritative argv, with argument indexes that are checked against it. |
+| `compiler.arguments` | Effective ordered compiler arguments after the single approved IDF `toolchain/cflags` response token has been replaced by parsed tokens. |
+| `compiler.captured_arguments`, `compiler.response_files` | Raw argv with the exact response token and its canonical path, SHA-256 digest, parsed tokens, and argv index. Other or nested response files are rejected. |
+| `compiler.includes`, `compiler.defines` | Ordered include and define/undefine events derived from the authoritative argv, with argument indexes that are checked against it. Explicit include lookup directories may be genuinely absent; implicit compiler includes, the sysroot, SDK, configuration, and tool paths must exist. |
 | `compiler.implicit_includes` | Ordered implicit include directories reported by CMake for the selected compiler. |
 | `compiler.build_configuration` | The selected single-config name; an empty string is retained when CMake has no named configuration. Multi-config generators are rejected. |
 | `configuration.sdkconfig`, `configuration.generated_headers`, `configuration.version_header` | ESP-IDF's active `SDKCONFIG`, `SDKCONFIG_HEADER`, and configured version header. |
+
+Some ESP-IDF components declare public `-I` lookup directories that are absent
+for a target, while GCC still accepts and preserves those search entries. The
+exporter retains their exact ordered argv tokens and accepts only a genuine
+missing-path lookup with an existing directory ancestor. A file in place of a
+directory, dangling symlink, or inspection error remains a configuration
+failure. Cargo watches the nearest existing parent and records whether the
+lookup is present or missing so later creation/removal changes generation
+identity. Implicit compiler include directories remain required inputs.
+The selected absent path is also watched directly; Cargo may rerun the ESP
+build script on every invocation while it remains absent. See the [binding
+generation invalidation notes](BINDING_GENERATION.md#cargo-selection-and-invalidation).
 
 The validator checks readable input files and directories, ESP-IDF 6.1.x,
 C3/S3 architecture pairing, agreement between the Cargo target and ESP target,
@@ -73,6 +97,14 @@ headers. Both config sources must enable `CONFIG_BT_ENABLED` and
 `CONFIG_BT_NIMBLE_ENABLED`. The generated version header must agree with the
 reported SDK version. Diagnostics identify the rejected field and corrective
 setup without printing the full context or inherited environment.
+
+For a consumer configuration matching the supported initial baseline, set
+`CONFIG_LIBC_NEWLIB=y` in `sdkconfig.defaults` and reconfigure with `idf.py`
+before exporting context. The C3/S3 matrix fixtures use this setting and
+assert it in both `sdkconfig` and `sdkconfig.h`. ESP-IDF's default Picolibc
+setup adds GCC `-specs` tool-selection flags, which this contract rejects with
+guidance to select Newlib for the supported baseline. Picolibc and other libc
+configurations are not included in the validated generation scope.
 
 The context file contains absolute local paths and compiler arguments from the
 consumer build. Treat it as a local build artifact and review it before sharing;
@@ -114,8 +146,13 @@ tools. Native host builds and rustdoc resolve to host-only mode without an SDK
 or context file. Either supported ESP target requires a context file; an
 invalid, missing, or mismatched context fails the build and never falls back to
 host mode. An explicit `host` request also rejects any supplied context path.
-The fixture tests validate the contract and diagnostics only; they do not
-compile real ESP-IDF headers or establish target ABI compatibility.
+The host fixture tests validate the contract and diagnostics without an SDK.
+The Azure-only C3/S3 matrix additionally configures the pinned ESP-IDF 6.1 SDK,
+compiles the exporter probe with the selected consumer compiler, and generates
+private bindings from the actual configured headers. This is generation and
+context-capture evidence only; it does not establish target ABI compatibility
+or link a firmware executable. See [Azure validation](CI.md#azure-validation)
+for the retained matrix and CMake regression reports.
 
 The probe copies target-level consumer include, define, compile-option and
 compile-feature properties, plus language standard/extensions, position-
@@ -127,8 +164,8 @@ It does not capture source-specific compiler properties attached only to an
 unrelated application source file. Consumers must put ABI-affecting settings
 needed for NimBLE header generation on the configured target or its interface
 dependencies. The export target does not request the application firmware
-executable link; full Cargo/`idf.py` integration and C3/S3 compile-link
-verification belong to later work.
+executable link; full target Cargo/`idf.py` compile-link verification belongs
+to NIMBLERS-7.
 
 See the [ESP-IDF NimBLE reference](https://docs.espressif.com/projects/esp-idf/en/v6.1/esp32c3/api-reference/bluetooth/nimble/index.html),
 [Cargo build-script reference](https://doc.rust-lang.org/cargo/reference/build-scripts.html),

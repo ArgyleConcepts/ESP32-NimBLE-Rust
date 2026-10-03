@@ -29,9 +29,12 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
-/* `BLE_ERR_REM_USER_CONN_TERM` is a variant of a broad named SDK enum.
- * Bindgen exposes only this audited value through the narrow anonymous enum. */
+/* Keep the two audited values below as narrow bindgen roots; neither requires
+ * broadening the SDK constant allowlist or hardcoding a Rust value. */
 enum {
+    /* The timeout macro expands through INT32_MAX and is not emitted directly. */
+    ARGYLE_NIMBLE_HS_FOREVER = BLE_HS_FOREVER,
+    /* This is one variant of a broad named SDK error enum. */
     ARGYLE_NIMBLE_ERR_REM_USER_CONN_TERM = BLE_ERR_REM_USER_CONN_TERM
 };
 

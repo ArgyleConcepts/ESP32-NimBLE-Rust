@@ -16,7 +16,7 @@ pool:
     - Agent.OS -equals Darwin
 
 variables:
-  toolsDirectory: $(Agent.TempDirectory)/argyle-nimble/$(Build.BuildId)
+  toolsDirectory: $(Agent.TempDirectory)/argyle-nimble/$(Build.BuildId)/$(System.JobId)/$(System.JobAttempt)
   RUSTUP_HOME: $(toolsDirectory)/rustup
   CARGO_HOME: $(toolsDirectory)/cargo
   CARGO_TARGET_DIR: $(toolsDirectory)/target/host-debug
@@ -87,13 +87,311 @@ jobs:
 
       - bash: |
           set -euo pipefail
-          expected="$AGENT_TEMPDIRECTORY/argyle-nimble/$BUILD_BUILDID"
-          if [[ "$NIMBLE_TOOLS_DIRECTORY" != "$expected" || -z "$BUILD_BUILDID" ]]; then
+          expected="$AGENT_TEMPDIRECTORY/argyle-nimble/$BUILD_BUILDID/$SYSTEM_JOBID/$SYSTEM_JOBATTEMPT"
+          if [[ "$NIMBLE_TOOLS_DIRECTORY" != "$expected" || -z "$BUILD_BUILDID" || -z "$SYSTEM_JOBID" ]]; then
             printf 'Refusing unexpected cleanup path\n' >&2
             exit 1
           fi
           rm -rf -- "$NIMBLE_TOOLS_DIRECTORY"
         displayName: Remove this run's tools and build state
+        condition: always()
+        env:
+          NIMBLE_TOOLS_DIRECTORY: $(toolsDirectory)
+
+  - job: C3BindingGeneration
+    displayName: ESP32-C3 configured binding generation
+    timeoutInMinutes: 180
+    workspace:
+      clean: all
+    steps:
+      - checkout: self
+        clean: true
+        fetchDepth: 0
+        fetchTags: false
+        persistCredentials: false
+        submodules: false
+        lfs: false
+
+      - bash: |
+          set -euo pipefail
+          mkdir -p "$VALIDATION_REPORTS"
+          bash eng/bootstrap-ci.sh 2>&1 | tee "$VALIDATION_REPORTS/host-tool-setup.log"
+        displayName: Install isolated Rust and Python tools
+        target:
+          settableVariables:
+            - nimblePython
+        env:
+          NIMBLE_TOOLS_DIRECTORY: $(toolsDirectory)
+          VALIDATION_REPORTS: $(Build.ArtifactStagingDirectory)/esp32c3
+
+      - bash: |
+          set -euo pipefail
+          mkdir -p "$VALIDATION_REPORTS"
+          bash eng/install-idf-ci.sh 2>&1 | tee "$VALIDATION_REPORTS/idf-tool-setup.log"
+        displayName: Install pinned isolated ESP-IDF 6.1 tools
+        target:
+          settableVariables:
+            - nimbleIdfRoot
+            - nimbleIdfToolsRoot
+            - nimbleIdfVenvRoot
+            - nimbleIdfVenvPython
+            - nimbleEspClangPath
+            - nimbleLibclangPath
+            - nimbleXtensaGccPath
+            - nimbleXtensaS3GccPath
+            - nimbleRiscvGccPath
+            - nimbleIdfCmakePath
+            - nimbleIdfNinjaPath
+            - IDF_CCACHE_ENABLE
+        env:
+          NIMBLE_TOOLS_DIRECTORY: $(toolsDirectory)
+          NIMBLE_PYTHON: $(nimblePython)
+          VALIDATION_REPORTS: $(Build.ArtifactStagingDirectory)/esp32c3
+
+      - bash: |
+          set -euo pipefail
+          export IDF_PATH="$NIMBLE_IDF_ROOT"
+          export IDF_TOOLS_PATH="$NIMBLE_IDF_TOOLS_ROOT"
+          export IDF_PYTHON_ENV_PATH="$NIMBLE_IDF_VENV_ROOT"
+          export IDF_CCACHE_ENABLE=0
+          export PATH="$NIMBLE_CARGO_BIN:$IDF_PYTHON_ENV_PATH/bin:$PATH"
+          idf_environment=$("$NIMBLE_IDF_VENV_PYTHON" "$NIMBLE_IDF_ROOT/tools/idf_tools.py" --non-interactive export)
+          eval "$idf_environment"
+          export IDF_PATH="$NIMBLE_IDF_ROOT"
+          export IDF_TOOLS_PATH="$NIMBLE_IDF_TOOLS_ROOT"
+          export IDF_PYTHON_ENV_PATH="$NIMBLE_IDF_VENV_ROOT"
+          export LIBCLANG_PATH="$NIMBLE_LIBCLANG"
+          canonical_path() {
+            "$NIMBLE_IDF_VENV_PYTHON" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+          }
+          assert_selected_tool() {
+            local tool_name="$1" expected_path="$2" actual_path
+            actual_path=$(command -v "$tool_name" || true)
+            if [[ -z "$actual_path" || "$(canonical_path "$actual_path")" != "$expected_path" ]]; then
+              printf 'ESP-IDF export selected an unexpected %s executable\n' "$tool_name" >&2
+              exit 1
+            fi
+          }
+          assert_selected_tool clang "$NIMBLE_ESP_CLANG"
+          assert_selected_tool xtensa-esp-elf-gcc "$NIMBLE_XTENSA_GCC"
+          assert_selected_tool riscv32-esp-elf-gcc "$NIMBLE_RISCV_GCC"
+          assert_selected_tool cmake "$NIMBLE_CMAKE"
+          assert_selected_tool ninja "$NIMBLE_NINJA"
+          if [[ "$(canonical_path "${ESP_CLANG_LIBS_PATH:-/missing}")" != "$(canonical_path "$(dirname "$NIMBLE_LIBCLANG")")" ]]; then
+            printf 'ESP-IDF export selected an unexpected libclang directory\n' >&2
+            exit 1
+          fi
+          export PATH="$NIMBLE_CARGO_BIN:$PATH"
+          "$NIMBLE_IDF_VENV_PYTHON" eng/validate-real-sdk-matrix.py \
+            --reports "$VALIDATION_REPORTS" \
+            --chip esp32c3 \
+            --idf-path "$NIMBLE_IDF_ROOT" \
+            --idf-tools-path "$NIMBLE_IDF_TOOLS_ROOT" \
+            --job-root "$NIMBLE_JOB_ROOT" \
+            --idf-python "$NIMBLE_IDF_VENV_PYTHON" \
+            --compiler "$NIMBLE_COMPILER" \
+            --clang "$NIMBLE_ESP_CLANG" \
+            --libclang "$NIMBLE_LIBCLANG" \
+            --cmake "$NIMBLE_CMAKE"
+        displayName: Configure ESP-IDF and generate C3 bindings and CMake reports
+        target:
+          settableVariables: none
+        env:
+          NIMBLE_IDF_ROOT: $(nimbleIdfRoot)
+          NIMBLE_IDF_TOOLS_ROOT: $(nimbleIdfToolsRoot)
+          NIMBLE_IDF_VENV_ROOT: $(nimbleIdfVenvRoot)
+          NIMBLE_IDF_VENV_PYTHON: $(nimbleIdfVenvPython)
+          NIMBLE_ESP_CLANG: $(nimbleEspClangPath)
+          NIMBLE_LIBCLANG: $(nimbleLibclangPath)
+          NIMBLE_NINJA: $(nimbleIdfNinjaPath)
+          NIMBLE_CMAKE: $(nimbleIdfCmakePath)
+          NIMBLE_COMPILER: $(nimbleRiscvGccPath)
+          NIMBLE_CARGO_BIN: $(CARGO_HOME)/bin
+          NIMBLE_XTENSA_GCC: $(nimbleXtensaGccPath)
+          NIMBLE_RISCV_GCC: $(nimbleRiscvGccPath)
+          NIMBLE_JOB_ROOT: $(toolsDirectory)/idf/$(Build.BuildId)/$(System.JobId)/$(System.JobAttempt)
+          NIMBLE_TOOLS_DIRECTORY: $(toolsDirectory)
+          VALIDATION_REPORTS: $(Build.ArtifactStagingDirectory)/esp32c3
+          IDF_CCACHE_ENABLE: '0'
+
+      - task: PublishTestResults@2
+        displayName: Publish ESP32-C3 binding and CMake results
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: |
+            $(Build.ArtifactStagingDirectory)/esp32c3/generation-matrix.xml
+            $(Build.ArtifactStagingDirectory)/esp32c3/cmake-regressions/esp32c3/junit.xml
+          testRunTitle: ESP32-C3 configured generation and CMake cases
+          failTaskOnFailedTests: true
+          failTaskOnMissingResultsFile: false
+
+      - task: PublishPipelineArtifact@1
+        displayName: Retain ESP32-C3 SDK and generation evidence
+        condition: always()
+        inputs:
+          targetPath: $(Build.ArtifactStagingDirectory)/esp32c3
+          artifact: esp32c3-binding-generation
+
+      - bash: |
+          set -euo pipefail
+          expected="$AGENT_TEMPDIRECTORY/argyle-nimble/$BUILD_BUILDID/$SYSTEM_JOBID/$SYSTEM_JOBATTEMPT"
+          if [[ "$NIMBLE_TOOLS_DIRECTORY" != "$expected" || -z "$BUILD_BUILDID" || -z "$SYSTEM_JOBID" ]]; then
+            printf 'Refusing unexpected cleanup path\n' >&2
+            exit 1
+          fi
+          rm -rf -- "$NIMBLE_TOOLS_DIRECTORY"
+        displayName: Remove this C3 job's tools and SDK state
+        condition: always()
+        env:
+          NIMBLE_TOOLS_DIRECTORY: $(toolsDirectory)
+
+  - job: S3BindingGeneration
+    displayName: ESP32-S3 configured binding generation
+    timeoutInMinutes: 180
+    workspace:
+      clean: all
+    steps:
+      - checkout: self
+        clean: true
+        fetchDepth: 0
+        fetchTags: false
+        persistCredentials: false
+        submodules: false
+        lfs: false
+
+      - bash: |
+          set -euo pipefail
+          mkdir -p "$VALIDATION_REPORTS"
+          bash eng/bootstrap-ci.sh 2>&1 | tee "$VALIDATION_REPORTS/host-tool-setup.log"
+        displayName: Install isolated Rust and Python tools
+        target:
+          settableVariables:
+            - nimblePython
+        env:
+          NIMBLE_TOOLS_DIRECTORY: $(toolsDirectory)
+          VALIDATION_REPORTS: $(Build.ArtifactStagingDirectory)/esp32s3
+
+      - bash: |
+          set -euo pipefail
+          mkdir -p "$VALIDATION_REPORTS"
+          bash eng/install-idf-ci.sh 2>&1 | tee "$VALIDATION_REPORTS/idf-tool-setup.log"
+        displayName: Install pinned isolated ESP-IDF 6.1 tools
+        target:
+          settableVariables:
+            - nimbleIdfRoot
+            - nimbleIdfToolsRoot
+            - nimbleIdfVenvRoot
+            - nimbleIdfVenvPython
+            - nimbleEspClangPath
+            - nimbleLibclangPath
+            - nimbleXtensaGccPath
+            - nimbleXtensaS3GccPath
+            - nimbleRiscvGccPath
+            - nimbleIdfCmakePath
+            - nimbleIdfNinjaPath
+            - IDF_CCACHE_ENABLE
+        env:
+          NIMBLE_TOOLS_DIRECTORY: $(toolsDirectory)
+          NIMBLE_PYTHON: $(nimblePython)
+          VALIDATION_REPORTS: $(Build.ArtifactStagingDirectory)/esp32s3
+
+      - bash: |
+          set -euo pipefail
+          export IDF_PATH="$NIMBLE_IDF_ROOT"
+          export IDF_TOOLS_PATH="$NIMBLE_IDF_TOOLS_ROOT"
+          export IDF_PYTHON_ENV_PATH="$NIMBLE_IDF_VENV_ROOT"
+          export IDF_CCACHE_ENABLE=0
+          export PATH="$NIMBLE_CARGO_BIN:$IDF_PYTHON_ENV_PATH/bin:$PATH"
+          idf_environment=$("$NIMBLE_IDF_VENV_PYTHON" "$NIMBLE_IDF_ROOT/tools/idf_tools.py" --non-interactive export)
+          eval "$idf_environment"
+          export IDF_PATH="$NIMBLE_IDF_ROOT"
+          export IDF_TOOLS_PATH="$NIMBLE_IDF_TOOLS_ROOT"
+          export IDF_PYTHON_ENV_PATH="$NIMBLE_IDF_VENV_ROOT"
+          export LIBCLANG_PATH="$NIMBLE_LIBCLANG"
+          canonical_path() {
+            "$NIMBLE_IDF_VENV_PYTHON" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+          }
+          assert_selected_tool() {
+            local tool_name="$1" expected_path="$2" actual_path
+            actual_path=$(command -v "$tool_name" || true)
+            if [[ -z "$actual_path" || "$(canonical_path "$actual_path")" != "$expected_path" ]]; then
+              printf 'ESP-IDF export selected an unexpected %s executable\n' "$tool_name" >&2
+              exit 1
+            fi
+          }
+          assert_selected_tool clang "$NIMBLE_ESP_CLANG"
+          assert_selected_tool xtensa-esp-elf-gcc "$NIMBLE_XTENSA_GCC"
+          assert_selected_tool xtensa-esp32s3-elf-gcc "$NIMBLE_XTENSA_S3_GCC"
+          assert_selected_tool riscv32-esp-elf-gcc "$NIMBLE_RISCV_GCC"
+          assert_selected_tool cmake "$NIMBLE_CMAKE"
+          assert_selected_tool ninja "$NIMBLE_NINJA"
+          if [[ "$(canonical_path "${ESP_CLANG_LIBS_PATH:-/missing}")" != "$(canonical_path "$(dirname "$NIMBLE_LIBCLANG")")" ]]; then
+            printf 'ESP-IDF export selected an unexpected libclang directory\n' >&2
+            exit 1
+          fi
+          export PATH="$NIMBLE_CARGO_BIN:$PATH"
+          "$NIMBLE_IDF_VENV_PYTHON" eng/validate-real-sdk-matrix.py \
+            --reports "$VALIDATION_REPORTS" \
+            --chip esp32s3 \
+            --idf-path "$NIMBLE_IDF_ROOT" \
+            --idf-tools-path "$NIMBLE_IDF_TOOLS_ROOT" \
+            --job-root "$NIMBLE_JOB_ROOT" \
+            --idf-python "$NIMBLE_IDF_VENV_PYTHON" \
+            --compiler "$NIMBLE_COMPILER" \
+            --clang "$NIMBLE_ESP_CLANG" \
+            --libclang "$NIMBLE_LIBCLANG" \
+            --cmake "$NIMBLE_CMAKE"
+        displayName: Configure ESP-IDF and generate S3 bindings and CMake reports
+        target:
+          settableVariables: none
+        env:
+          NIMBLE_IDF_ROOT: $(nimbleIdfRoot)
+          NIMBLE_IDF_TOOLS_ROOT: $(nimbleIdfToolsRoot)
+          NIMBLE_IDF_VENV_ROOT: $(nimbleIdfVenvRoot)
+          NIMBLE_IDF_VENV_PYTHON: $(nimbleIdfVenvPython)
+          NIMBLE_ESP_CLANG: $(nimbleEspClangPath)
+          NIMBLE_LIBCLANG: $(nimbleLibclangPath)
+          NIMBLE_NINJA: $(nimbleIdfNinjaPath)
+          NIMBLE_CMAKE: $(nimbleIdfCmakePath)
+          NIMBLE_COMPILER: $(nimbleXtensaS3GccPath)
+          NIMBLE_CARGO_BIN: $(CARGO_HOME)/bin
+          NIMBLE_XTENSA_GCC: $(nimbleXtensaGccPath)
+          NIMBLE_XTENSA_S3_GCC: $(nimbleXtensaS3GccPath)
+          NIMBLE_RISCV_GCC: $(nimbleRiscvGccPath)
+          NIMBLE_JOB_ROOT: $(toolsDirectory)/idf/$(Build.BuildId)/$(System.JobId)/$(System.JobAttempt)
+          NIMBLE_TOOLS_DIRECTORY: $(toolsDirectory)
+          VALIDATION_REPORTS: $(Build.ArtifactStagingDirectory)/esp32s3
+          IDF_CCACHE_ENABLE: '0'
+
+      - task: PublishTestResults@2
+        displayName: Publish ESP32-S3 binding and CMake results
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFormat: JUnit
+          testResultsFiles: |
+            $(Build.ArtifactStagingDirectory)/esp32s3/generation-matrix.xml
+            $(Build.ArtifactStagingDirectory)/esp32s3/cmake-regressions/esp32s3/junit.xml
+          testRunTitle: ESP32-S3 configured generation and CMake cases
+          failTaskOnFailedTests: true
+          failTaskOnMissingResultsFile: false
+
+      - task: PublishPipelineArtifact@1
+        displayName: Retain ESP32-S3 SDK and generation evidence
+        condition: always()
+        inputs:
+          targetPath: $(Build.ArtifactStagingDirectory)/esp32s3
+          artifact: esp32s3-binding-generation
+
+      - bash: |
+          set -euo pipefail
+          expected="$AGENT_TEMPDIRECTORY/argyle-nimble/$BUILD_BUILDID/$SYSTEM_JOBID/$SYSTEM_JOBATTEMPT"
+          if [[ "$NIMBLE_TOOLS_DIRECTORY" != "$expected" || -z "$BUILD_BUILDID" || -z "$SYSTEM_JOBID" ]]; then
+            printf 'Refusing unexpected cleanup path\n' >&2
+            exit 1
+          fi
+          rm -rf -- "$NIMBLE_TOOLS_DIRECTORY"
+        displayName: Remove this S3 job's tools and SDK state
         condition: always()
         env:
           NIMBLE_TOOLS_DIRECTORY: $(toolsDirectory)

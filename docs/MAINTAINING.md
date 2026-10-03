@@ -76,11 +76,12 @@ accepting external contribution builds.
 
 ## Validation evidence
 
-Azure validation compiles/tests host-side build-context tooling without requiring
+Azure host validation compiles/tests build-context tooling without requiring
 ESP-IDF, inspects metadata/package contents, and verifies license inclusion and
-relative docs links. The private parser fixtures do not establish BLE behavior,
-target ABI compatibility, or C3/S3 firmware compilation. Follow the CI guide
-when extending or rerunning checks.
+relative docs links. Separate C3/S3 jobs generate bindings from configured
+ESP-IDF 6.1 headers and retain their manifests. Those checks do not establish BLE
+behavior, target ABI compatibility, or firmware compilation. Follow the CI
+guide when extending or rerunning checks.
 
 The initial repository-policy check on 2026-10-02 used
 [PR #4 to develop](https://github.com/ArgyleConcepts/ESP32-NimBLE-Rust/pull/4) and
@@ -99,12 +100,15 @@ back; CODEOWNERS had no reported errors on either base. Force-push/deletion poli
 was inspected without attempting destructive operations. The non-owner review
 requirement was verified through configuration, not by impersonating a contributor.
 
-Each later implementation includes its own tests. The final Phase 1 matrix
-integrates compile-pass/fail, unit/property, lifecycle, concurrency,
-fault-injection, FFI, and C3/S3 compile/link checks. Require 90% line coverage of
-host-testable handwritten framework code with documented generated/target-only
-exclusions. These checks do not establish hardware verification. Package readiness
-also requires compiling a fresh external consumer through Azure.
+Each implementation includes its own tests. The NIMBLERS-24 Azure matrix
+exercises configured C3/S3 binding generation, compiler/header/configuration
+mutation, lifecycle failures, and private-surface rejection. SDK-free host
+validation remains separate, and neither matrix establishes ESP target ABI or
+firmware compile/link evidence; those checks belong to NIMBLERS-7. Require 90%
+line coverage of host-testable handwritten framework code with documented
+generated/target-only exclusions. These checks do not establish hardware
+verification. Package readiness also requires compiling a fresh external
+consumer through Azure.
 
 ## Security and releases
 
