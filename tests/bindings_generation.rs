@@ -37,7 +37,7 @@ fn generated_integer_const(source: &str, name: &str) -> i64 {
         _ => None,
     });
     let constant = constant.unwrap_or_else(|| panic!("generated const {name} is missing"));
-    let syn::Expr::Lit(expression) = &constant.expr else {
+    let syn::Expr::Lit(expression) = &*constant.expr else {
         panic!("generated const {name} is not a literal");
     };
     let syn::Lit::Int(value) = &expression.lit else {
