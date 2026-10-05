@@ -12,6 +12,8 @@ use super::gap::{GapCodes, GapEvent, GapEventView};
 use super::native::{
     check, native_length, Backend, NativeError, NativeEvent, NativeResult, Operation,
 };
+use crate::error::ATT_STATUS_BASE;
+use crate::AttError;
 use std::ffi::{c_int, c_void};
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -29,6 +31,39 @@ pub(crate) const GAP_CODES: GapCodes = GapCodes {
     subscribe_terminated: bindings::BLE_GAP_SUBSCRIBE_REASON_TERM,
     subscribe_restore: bindings::BLE_GAP_SUBSCRIBE_REASON_RESTORE,
 };
+
+// The public ATT error codes are the Bluetooth specification's values; check
+// that the consumer's NimBLE uses the same ones, so handler results pass
+// through unchanged. A mismatch fails compilation.
+macro_rules! assert_att_codes {
+    ($($public:ident = $native:ident),* $(,)?) => {$(
+        const _: () = assert!(AttError::$public.code() as u32 == bindings::$native as u32);
+    )*};
+}
+
+assert_att_codes!(
+    INVALID_HANDLE = BLE_ATT_ERR_INVALID_HANDLE,
+    READ_NOT_PERMITTED = BLE_ATT_ERR_READ_NOT_PERMITTED,
+    WRITE_NOT_PERMITTED = BLE_ATT_ERR_WRITE_NOT_PERMITTED,
+    INVALID_PDU = BLE_ATT_ERR_INVALID_PDU,
+    INSUFFICIENT_AUTHENTICATION = BLE_ATT_ERR_INSUFFICIENT_AUTHEN,
+    REQUEST_NOT_SUPPORTED = BLE_ATT_ERR_REQ_NOT_SUPPORTED,
+    INVALID_OFFSET = BLE_ATT_ERR_INVALID_OFFSET,
+    INSUFFICIENT_AUTHORIZATION = BLE_ATT_ERR_INSUFFICIENT_AUTHOR,
+    PREPARE_QUEUE_FULL = BLE_ATT_ERR_PREPARE_QUEUE_FULL,
+    ATTRIBUTE_NOT_FOUND = BLE_ATT_ERR_ATTR_NOT_FOUND,
+    ATTRIBUTE_NOT_LONG = BLE_ATT_ERR_ATTR_NOT_LONG,
+    INSUFFICIENT_ENCRYPTION_KEY_SIZE = BLE_ATT_ERR_INSUFFICIENT_KEY_SZ,
+    INVALID_ATTRIBUTE_VALUE_LENGTH = BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN,
+    UNLIKELY = BLE_ATT_ERR_UNLIKELY,
+    INSUFFICIENT_ENCRYPTION = BLE_ATT_ERR_INSUFFICIENT_ENC,
+    UNSUPPORTED_GROUP_TYPE = BLE_ATT_ERR_UNSUPPORTED_GROUP,
+    INSUFFICIENT_RESOURCES = BLE_ATT_ERR_INSUFFICIENT_RES,
+    DATABASE_OUT_OF_SYNC = BLE_ATT_ERR_DB_OUT_OF_SYNC,
+    VALUE_NOT_ALLOWED = BLE_ATT_ERR_VALUE_NOT_ALLOWED,
+);
+
+const _: () = assert!(ATT_STATUS_BASE as u32 == bindings::BLE_HS_ERR_ATT_BASE as u32);
 
 /// The dispatcher receiving host callbacks. NimBLE's sync and reset callbacks
 /// carry no user argument, so the single installed dispatcher is kept here.

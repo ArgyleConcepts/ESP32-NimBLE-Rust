@@ -215,6 +215,12 @@ the shim similarly aliases its configured value as
 property bits (`BLE_GATT_CHR_PROP_*`) and GATT server flag bits
 (`BLE_GATT_CHR_F_*`) remain distinct SDK values.
 
+Every ATT protocol error code (`BLE_ATT_ERR_*`, `0x01` through `0x13`) and the
+host-status offset for ATT errors (`BLE_HS_ERR_ATT_BASE`) are roots so that
+real target builds can check the public `AttError` constants against the
+consumer's SDK. A mismatch fails compilation; the public contract is
+documented on `AttError` in [`src/error.rs`](../src/error.rs).
+
 No security manager, bond store, central-role, or arbitrary NimBLE declarations
 are included. Expanding this set requires header-level review and matching
 behavior tests; broad `BLE_*` or `ble_*` patterns are not used as roots.
