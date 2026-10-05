@@ -43,13 +43,14 @@ impl<'b, B: Backend> OwnedMbuf<'b, B> {
     /// Append `data` and return the extended buffer. On failure the buffer
     /// is released (the SDK may have appended part of `data`) and the error is
     /// returned. A chain longer than the SDK's `u16` packet length is rejected
-    /// before any native call, because NimBLE's length field would wrap.
+    /// before any native call, because NimBLE's length field would wrap; the
+    /// error reports the resulting chain length.
     pub(crate) fn append(mut self, data: &[u8]) -> NativeResult<Self> {
-        let total = self.len().checked_add(data.len());
-        if total.is_none_or(|total| total > usize::from(u16::MAX)) {
+        let total = self.len().saturating_add(data.len());
+        if total > usize::from(u16::MAX) {
             return Err(NativeError::InvalidLength {
                 operation: Operation::MbufAppend,
-                length: data.len(),
+                length: total,
             });
         }
         let raw = self
@@ -238,7 +239,7 @@ mod tests {
             mbuf.append(b"x").err(),
             Some(NativeError::InvalidLength {
                 operation: Operation::MbufAppend,
-                length: 1
+                length: usize::from(u16::MAX) + 1
             })
         );
         assert!(!fake

@@ -189,6 +189,12 @@ impl EventDispatcher {
         Ok(sink)
     }
 
+    /// Test coordination: number of deliveries currently registered.
+    #[cfg(test)]
+    pub(crate) fn delivering_count(&self) -> usize {
+        self.lock().delivering.len()
+    }
+
     /// Test coordination: block until a second detach is waiting.
     #[cfg(test)]
     pub(crate) fn wait_until_detach_waiting(&self) {
@@ -205,6 +211,126 @@ impl EventDispatcher {
         while !state.detaching {
             state = self.wait(state);
         }
+    }
+}
+
+/// Why a [`CallbackSlot`] refused a request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SlotError {
+    /// A dispatcher is installed, or a removal is still in progress.
+    Busy,
+    /// Removal was requested from inside a delivery; nothing changed.
+    Reentrant,
+}
+
+struct SlotState {
+    installed: Option<Arc<EventDispatcher>>,
+    /// The dispatcher whose removal is in progress, so concurrent removers
+    /// also wait for its in-flight deliveries.
+    removing: Option<Arc<EventDispatcher>>,
+}
+
+/// The single place a backend keeps the dispatcher its native callbacks use.
+///
+/// Deliveries register with the dispatcher while the slot lock is held, and
+/// removal empties the slot before detaching, so a completed
+/// [`CallbackSlot::remove`] means no delivery that saw the slot is still
+/// running. Because reading the slot and registering happen under one lock,
+/// there is no window in which a delivery could escape that wait. The ESP
+/// backend and the test fake share this type.
+pub(crate) struct CallbackSlot {
+    state: Mutex<SlotState>,
+}
+
+impl CallbackSlot {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: Mutex::new(SlotState {
+                installed: None,
+                removing: None,
+            }),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, SlotState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn install(&self, dispatcher: Arc<EventDispatcher>) -> Result<(), SlotError> {
+        let mut state = self.lock();
+        if state.installed.is_some() || state.removing.is_some() {
+            return Err(SlotError::Busy);
+        }
+        state.installed = Some(dispatcher);
+        Ok(())
+    }
+
+    /// Whether the calling thread is inside a delivery from the installed
+    /// dispatcher or one being removed.
+    pub(crate) fn is_delivering_on_current_thread(&self) -> bool {
+        let state = self.lock();
+        state
+            .installed
+            .iter()
+            .chain(state.removing.iter())
+            .any(|dispatcher| dispatcher.is_delivering_on_current_thread())
+    }
+
+    /// Deliver through the installed dispatcher, or return `None` when no
+    /// dispatcher is installed.
+    pub(crate) fn deliver(&self, event: NativeEvent) -> Option<Delivery> {
+        let state = self.lock();
+        let dispatcher = state.installed.clone()?;
+        let active = dispatcher.begin();
+        drop(state);
+        Some(match active {
+            Some(active) => {
+                active.deliver(event);
+                Delivery::Delivered
+            }
+            None => Delivery::Dropped,
+        })
+    }
+
+    /// Remove the installed dispatcher and wait until no delivery that saw
+    /// it is running. `clear_native` runs once, under the slot lock, before
+    /// the dispatcher is detached. A concurrent second removal waits for the
+    /// first one; a removal from inside a delivery fails and changes nothing.
+    pub(crate) fn remove(&self, clear_native: impl FnOnce()) -> Result<(), SlotError> {
+        let mut state = self.lock();
+        let reentrant = state
+            .installed
+            .iter()
+            .chain(state.removing.iter())
+            .any(|dispatcher| dispatcher.is_delivering_on_current_thread());
+        if reentrant {
+            return Err(SlotError::Reentrant);
+        }
+        if let Some(dispatcher) = state.installed.take() {
+            clear_native();
+            state.removing = Some(dispatcher.clone());
+            drop(state);
+            dispatcher
+                .detach()
+                .expect("a non-reentrant detach cannot fail");
+            let mut state = self.lock();
+            if state
+                .removing
+                .as_ref()
+                .is_some_and(|removing| Arc::ptr_eq(removing, &dispatcher))
+            {
+                state.removing = None;
+            }
+        } else if let Some(dispatcher) = state.removing.clone() {
+            drop(state);
+            // Waits for the first removal's detach to complete.
+            dispatcher
+                .detach()
+                .expect("a non-reentrant detach cannot fail");
+        }
+        Ok(())
     }
 }
 
@@ -423,7 +549,7 @@ mod tests {
         };
         assert!(delivering.join().is_err(), "the sink panic propagates");
         // The drop guard deregistered the panicked delivery, so detach returns.
-        assert!(!dispatcher.is_delivering_on_current_thread());
+        assert_eq!(dispatcher.delivering_count(), 0);
         assert!(dispatcher.detach().unwrap().is_some());
     }
 

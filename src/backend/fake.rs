@@ -10,7 +10,7 @@
 //! Passing tests here are host evidence about framework logic only; they are
 //! not target, SDK, or hardware validation.
 
-use super::dispatch::{Delivery, EventDispatcher};
+use super::dispatch::{CallbackSlot, Delivery, EventDispatcher};
 use super::gap::GapEvent;
 use super::native::{
     check, native_length, Backend, NativeError, NativeEvent, NativeResult, Operation,
@@ -155,16 +155,26 @@ struct FakeState {
     mbufs: BTreeMap<u32, MbufRecord>,
     next_mbuf: u32,
     violations: Vec<LedgerViolation>,
-    dispatcher: Option<Arc<EventDispatcher>>,
     holds: HashMap<Operation, Hold>,
     notifications: Vec<(u16, u16, Vec<u8>)>,
     mtu: HashMap<u16, u16>,
 }
 
 /// Cheaply cloneable handle to one shared fake host.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct FakeBackend {
     state: Arc<Mutex<FakeState>>,
+    /// The same callback slot type the ESP backend uses.
+    callbacks: Arc<CallbackSlot>,
+}
+
+impl Default for FakeBackend {
+    fn default() -> Self {
+        Self {
+            state: Arc::default(),
+            callbacks: Arc::new(CallbackSlot::new()),
+        }
+    }
 }
 
 impl FakeBackend {
@@ -254,19 +264,7 @@ impl FakeBackend {
     /// Deliver a native callback through the installed dispatcher, as the
     /// NimBLE host task would.
     pub(crate) fn inject(&self, event: NativeEvent) -> Option<Delivery> {
-        // Register the delivery while holding the fake's callback slot, as
-        // the ESP trampolines do, so `remove_callbacks` waits for it.
-        let state = self.lock();
-        let dispatcher = state.dispatcher.clone()?;
-        let active = dispatcher.begin();
-        drop(state);
-        Some(match active {
-            Some(active) => {
-                active.deliver(event);
-                Delivery::Delivered
-            }
-            None => Delivery::Dropped,
-        })
+        self.callbacks.deliver(event)
     }
 
     /// Record a call, consume a scripted result, then stop at a hold if one
@@ -354,39 +352,24 @@ impl Backend for FakeBackend {
     fn install_callbacks(&self, dispatcher: Arc<EventDispatcher>) -> NativeResult<()> {
         let code = self.enter(Operation::InstallCallbacks, NativeCall::InstallCallbacks);
         check(Operation::InstallCallbacks, code)?;
-        let mut state = self.lock();
-        if state.dispatcher.is_some() {
-            return Err(NativeError::Busy {
+        self.callbacks
+            .install(dispatcher)
+            .map_err(|_| NativeError::Busy {
                 operation: Operation::InstallCallbacks,
-            });
-        }
-        state.dispatcher = Some(dispatcher);
-        Ok(())
+            })
     }
 
     fn remove_callbacks(&self) -> NativeResult<()> {
+        let reentrant = NativeError::Reentrant {
+            operation: Operation::RemoveCallbacks,
+        };
+        // Refuse before recording anything, as the ESP backend does.
+        if self.callbacks.is_delivering_on_current_thread() {
+            return Err(reentrant);
+        }
         let code = self.enter(Operation::RemoveCallbacks, NativeCall::RemoveCallbacks);
         check(Operation::RemoveCallbacks, code)?;
-        let mut state = self.lock();
-        if state
-            .dispatcher
-            .as_ref()
-            .is_some_and(|dispatcher| dispatcher.is_delivering_on_current_thread())
-        {
-            return Err(NativeError::Reentrant {
-                operation: Operation::RemoveCallbacks,
-            });
-        }
-        let dispatcher = state.dispatcher.take();
-        drop(state);
-        if let Some(dispatcher) = dispatcher {
-            // Same quiescence rule as the ESP backend: no delivery that saw
-            // the installed callbacks is still running once this returns.
-            dispatcher
-                .detach()
-                .expect("a non-reentrant detach cannot fail");
-        }
-        Ok(())
+        self.callbacks.remove(|| {}).map_err(|_| reentrant)
     }
 
     fn host_start(&self) -> NativeResult<()> {
@@ -523,7 +506,10 @@ impl Backend for FakeBackend {
                 .push((connection, attribute, data));
         }
         // NimBLE reports the result through the connection's GAP callback on
-        // this thread before returning, for success and failure alike.
+        // this thread before returning, for success and failure alike. The
+        // fake models a connection whose GAP callback is set (as it is once
+        // advertising has started); the event is dropped while no
+        // dispatcher is installed.
         self.inject(NativeEvent::Gap(GapEvent::NotifyTransmit {
             connection,
             attribute,
@@ -909,6 +895,61 @@ mod tests {
         fake.remove_callbacks().unwrap();
         assert!(!dispatcher.is_attached());
         assert_eq!(fake.inject(NativeEvent::HostSynced), None);
+    }
+
+    #[test]
+    fn a_concurrent_second_removal_waits_for_the_first_removals_callbacks() {
+        let fake = FakeBackend::new();
+        let dispatcher = Arc::new(EventDispatcher::new());
+        let gate = Arc::new(Gate::new());
+        dispatcher
+            .attach(Arc::new(GatedRecorder {
+                gate: gate.clone(),
+                events: Mutex::new(Vec::new()),
+            }))
+            .unwrap();
+        fake.install_callbacks(dispatcher.clone()).unwrap();
+        let callback = {
+            let fake = fake.clone();
+            thread::spawn(move || fake.inject(NativeEvent::HostSynced))
+        };
+        gate.wait_entered();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let removers = (0..2)
+            .map(|index| {
+                let fake = fake.clone();
+                let done_tx = done_tx.clone();
+                thread::spawn(move || {
+                    fake.remove_callbacks().unwrap();
+                    done_tx.send(index).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        // One remover detaches; the other waits for that detach to finish.
+        dispatcher.wait_until_detaching();
+        dispatcher.wait_until_detach_waiting();
+        assert!(
+            done_rx.try_recv().is_err(),
+            "a removal returned while a callback was still running"
+        );
+        // Installing during removal is refused.
+        assert_eq!(
+            fake.install_callbacks(Arc::new(EventDispatcher::new())),
+            Err(NativeError::Busy {
+                operation: Operation::InstallCallbacks
+            })
+        );
+
+        gate.release();
+        assert_eq!(callback.join().unwrap(), Some(Delivery::Delivered));
+        for remover in removers {
+            remover.join().unwrap();
+        }
+        assert_eq!(done_rx.try_iter().count(), 2);
+        assert_eq!(dispatcher.delivering_count(), 0);
+        fake.install_callbacks(Arc::new(EventDispatcher::new()))
+            .unwrap();
     }
 
     #[test]

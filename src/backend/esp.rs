@@ -7,14 +7,14 @@
 //! targets also build with `panic=abort`).
 
 use super::bindings;
-use super::dispatch::EventDispatcher;
+use super::dispatch::{CallbackSlot, EventDispatcher};
 use super::gap::{GapCodes, GapEvent, GapEventView};
 use super::native::{
     check, native_length, Backend, NativeError, NativeEvent, NativeResult, Operation,
 };
 use std::ffi::{c_int, c_void};
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 /// SDK GAP codes from the consumer's generated bindings.
 pub(crate) const GAP_CODES: GapCodes = GapCodes {
@@ -31,29 +31,11 @@ pub(crate) const GAP_CODES: GapCodes = GapCodes {
 };
 
 /// The dispatcher receiving host callbacks. NimBLE's sync and reset callbacks
-/// carry no user argument, so the single installed dispatcher is stored here.
-static CALLBACK_DISPATCHER: Mutex<Option<Arc<EventDispatcher>>> = Mutex::new(None);
+/// carry no user argument, so the single installed dispatcher is kept here.
+static CALLBACKS: CallbackSlot = CallbackSlot::new();
 
-fn installed() -> MutexGuard<'static, Option<Arc<EventDispatcher>>> {
-    CALLBACK_DISPATCHER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Register the delivery while holding the slot lock, then run the sink
-/// without it. `remove_callbacks` empties the slot before detaching, so every
-/// delivery that saw the installed dispatcher is registered before the detach
-/// starts waiting, and none can reach a sink attached later.
 fn deliver(event: NativeEvent) {
-    let slot = installed();
-    let dispatcher = slot.clone();
-    let active = dispatcher
-        .as_ref()
-        .and_then(|dispatcher| dispatcher.begin());
-    drop(slot);
-    if let Some(active) = active {
-        active.deliver(event);
-    }
+    let _ = CALLBACKS.deliver(event);
 }
 
 extern "C" fn on_host_sync() {
@@ -147,14 +129,11 @@ impl Backend for EspBackend {
     }
 
     fn install_callbacks(&self, dispatcher: Arc<EventDispatcher>) -> NativeResult<()> {
-        let mut slot = installed();
-        if slot.is_some() {
-            return Err(NativeError::Busy {
+        CALLBACKS
+            .install(dispatcher)
+            .map_err(|_| NativeError::Busy {
                 operation: Operation::InstallCallbacks,
-            });
-        }
-        *slot = Some(dispatcher);
-        drop(slot);
+            })?;
         // SAFETY: the shims store these function pointers in `ble_hs_cfg`;
         // they are `'static` and remain valid for the program's lifetime.
         unsafe {
@@ -165,29 +144,18 @@ impl Backend for EspBackend {
     }
 
     fn remove_callbacks(&self) -> NativeResult<()> {
-        let mut slot = installed();
-        if slot
-            .as_ref()
-            .is_some_and(|dispatcher| dispatcher.is_delivering_on_current_thread())
-        {
-            return Err(NativeError::Reentrant {
+        CALLBACKS
+            .remove(|| {
+                // SAFETY: clearing the callbacks stops new native deliveries;
+                // the shims only assign fields in `ble_hs_cfg`.
+                unsafe {
+                    bindings::argyle_nimble_set_sync_callback(None);
+                    bindings::argyle_nimble_set_reset_callback(None);
+                }
+            })
+            .map_err(|_| NativeError::Reentrant {
                 operation: Operation::RemoveCallbacks,
-            });
-        }
-        // SAFETY: clearing the callbacks stops new native deliveries.
-        unsafe {
-            bindings::argyle_nimble_set_sync_callback(None);
-            bindings::argyle_nimble_set_reset_callback(None);
-        }
-        let dispatcher = slot.take();
-        drop(slot);
-        if let Some(dispatcher) = dispatcher {
-            // Wait for callbacks that registered before the slot was emptied.
-            dispatcher
-                .detach()
-                .expect("a non-reentrant detach cannot fail");
-        }
-        Ok(())
+            })
     }
 
     fn host_start(&self) -> NativeResult<()> {
