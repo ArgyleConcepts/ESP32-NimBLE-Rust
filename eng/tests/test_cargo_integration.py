@@ -224,6 +224,18 @@ class CargoDriverTests(unittest.TestCase):
             driver.run(self.arguments(), {}, FakeCargo(self.root, produce_library=False))
         self.assertFalse(self.identity.exists())
 
+    def test_lockfile_created_by_cargo_is_recorded(self):
+        class CreatingCargo(FakeCargo):
+            def __call__(self, command, **kwargs):
+                result = super().__call__(command, **kwargs)
+                if command[1] == "build":
+                    (self.root / "Cargo.lock").write_text("# created by cargo\n", encoding="utf-8")
+                return result
+
+        driver.run(self.arguments(), {}, CreatingCargo(self.root, lockfile=False))
+        identity = json.loads(self.identity.read_text(encoding="utf-8"))
+        self.assertEqual(identity["lockfile"]["path"], str(self.root / "Cargo.lock"))
+
     def test_locked_build_requires_a_workspace_lockfile(self):
         with self.assertRaisesRegex(driver.IntegrationError, "no Cargo.lock"):
             driver.run(self.arguments("--locked"), {}, FakeCargo(self.root, lockfile=False))

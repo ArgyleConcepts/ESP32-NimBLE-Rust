@@ -126,8 +126,8 @@ The script then fetches host and `-Zbuild-std` sources once. Every build uses
   - the linker map's library input.
 - **No-op rebuild.** The exported context file must be left untouched.
   Bindings, layout assertions, and the Rust library must not change. The
-  report records whether Cargo still reran the build script because of an
-  absent watched SDK path.
+  report records whether Cargo reran the build script. Inside `idf.py` it does,
+  because the watched compiler working directory contains the Cargo output.
 - **Second clean build in another directory.** It must agree on toolchain,
   lockfile, bindings, layout, scalar ABI, shim, and link-audit identity.
 - **In-place configuration change.** Toggle `CONFIG_BT_NIMBLE_CPFD_CAFD` in

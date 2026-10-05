@@ -140,13 +140,16 @@ changed `sdkconfig` and generated header and regenerates the bindings and
 target artifacts.
 
 The Cargo custom target runs on every build, and Cargo decides what is fresh.
-The context exporter rewrites its JSON only when the content changes. The
-build script can still rerun on an unchanged build, and Cargo then recompiles
-the crate and Ninja relinks. This happens when a watched SDK path is absent,
-such as `.git/packed-refs` in a loose-ref ESP-IDF checkout or a missing include
-lookup; see the [invalidation notes](BINDING_GENERATION.md#cargo-selection-and-invalidation).
-Unchanged inputs regenerate identical bindings, layout assertions, and Rust
-library bytes.
+The context exporter rewrites its JSON only when the content changes. Inside
+`idf.py`, however, the captured compiler working directory is the IDF build
+root, which also contains the Cargo output. The build script watches that
+directory, so the [overlap rule](BINDING_GENERATION.md#cargo-selection-and-invalidation)
+makes it rerun on every build. Cargo then recompiles the crate and Ninja
+relinks. Absent watched SDK paths, such as `.git/packed-refs` in a loose-ref
+checkout, have the same effect. Unchanged inputs regenerate identical bindings,
+layout assertions, and Rust library bytes. Making no-op builds skip this work
+requires a narrower working-directory watch, which is not part of this
+integration.
 
 After each successful build, `<BUILD_DIR>/argyle-nimble/cargo-integration.json`
 records:

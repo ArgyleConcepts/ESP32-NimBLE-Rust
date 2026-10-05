@@ -349,6 +349,20 @@ fn only_c_nameable_records_and_fields_are_selected() {
 }
 
 #[test]
+fn audited_root_types_are_never_skipped_as_placeholders() {
+    // ble_addr_t is an audited root type; an incomplete-looking binding for it
+    // must still be probed so GCC reports the problem instead of hiding it.
+    let source = "#[repr(C)] pub struct ble_addr_t { pub _address: u8 }\n\
+                  #[repr(C)] pub struct optional_record { pub _address: u8 }\n";
+    let records = target::layout_records(source).unwrap();
+    let names = records
+        .iter()
+        .map(|record| record.rust_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["ble_addr_t"]);
+}
+
+#[test]
 fn bindings_without_records_or_valid_rust_fail_closed() {
     let error = target::layout_records("pub type only_alias = u32;").unwrap_err();
     assert!(error.contains("no C-nameable records"), "{error}");

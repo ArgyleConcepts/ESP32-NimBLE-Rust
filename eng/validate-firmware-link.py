@@ -521,7 +521,7 @@ class Validation:
             all(repeat[key] == a[key] for key in ("bindings_sha256", "layout_sha256", "library_sha256")),
             "an unchanged rebuild keeps bindings, layout assertions, and the Rust library identical",
         )
-        self.runner.values["noop_build_script_reran"] = "Compiling argyle-nimble" in noop_output
+        self.runner.values["noop_build_script_reran"] = "Compiling argyle-nimble v" in noop_output
 
         second_build = self.build("clean-b", chip)
         second = self.verify_firmware("clean-b", second_build, chip)

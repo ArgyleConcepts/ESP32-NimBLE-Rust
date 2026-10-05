@@ -207,7 +207,7 @@ def rustc_for(arguments: argparse.Namespace, environment: dict[str, str]) -> str
 
 def workspace_lockfile(
     runner: Runner, arguments: argparse.Namespace, environment: dict[str, str]
-) -> Path | None:
+) -> Path:
     manifest = query(
         runner,
         [
@@ -223,8 +223,7 @@ def workspace_lockfile(
         environment,
         "cargo locate-project",
     )
-    lockfile = Path(manifest).with_name("Cargo.lock")
-    return lockfile if lockfile.is_file() else None
+    return Path(manifest).with_name("Cargo.lock")
 
 
 def write_identity(path: Path, document: dict) -> None:
@@ -253,7 +252,7 @@ def run(argv: Sequence[str], base_environment: dict[str, str], runner: Runner = 
     cargo_version = query(runner, [str(arguments.cargo), "--version", "--verbose"], workdir, environment, "cargo --version")
     rustc_version = query(runner, [rustc_for(arguments, environment), "-vV"], workdir, environment, "rustc -vV")
     lockfile = workspace_lockfile(runner, arguments, environment)
-    if arguments.locked and lockfile is None:
+    if arguments.locked and not lockfile.is_file():
         raise IntegrationError("LOCKED was requested, but the Cargo workspace has no Cargo.lock")
 
     command = cargo_command(arguments)
@@ -272,7 +271,7 @@ def run(argv: Sequence[str], base_environment: dict[str, str], runner: Runner = 
         )
     # Hash after Cargo: without LOCKED, Cargo may update the lockfile it used.
     lock_identity = (
-        {"path": str(lockfile), "sha256": sha256(lockfile)} if lockfile is not None else None
+        {"path": str(lockfile), "sha256": sha256(lockfile)} if lockfile.is_file() else None
     )
 
     write_identity(arguments.identity, {

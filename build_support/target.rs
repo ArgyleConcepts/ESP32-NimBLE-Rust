@@ -378,7 +378,10 @@ pub(crate) fn layout_records(bindings_source: &str) -> Result<Vec<LayoutRecord>,
             syn::Item::Union(item) => (item.ident.to_string(), true, &item.generics, Vec::new()),
             _ => continue,
         };
-        if !generics.params.is_empty() || !is_c_nameable(&name) || is_layout_placeholder(&fields) {
+        if !generics.params.is_empty()
+            || !is_c_nameable(&name)
+            || is_layout_placeholder(&name, &fields)
+        {
             continue;
         }
         let c_spelling = if TYPEDEF_RECORDS.contains(&name.as_str()) {
@@ -411,9 +414,12 @@ pub(crate) fn layout_records(bindings_source: &str) -> Result<Vec<LayoutRecord>,
 /// Bindgen emits a single placeholder field for a record without a known C
 /// layout, such as a forward-declared (incomplete) struct that the selected
 /// configuration never defines. C cannot take `sizeof` of it and Rust uses it
-/// only behind pointers, so there is no layout to compare.
-fn is_layout_placeholder(fields: &[String]) -> bool {
-    matches!(fields, [only] if only == "_unused" || only == "_address")
+/// only behind pointers, so there is no layout to compare. The audited root
+/// types must always have a complete layout, so they are never skipped: if
+/// one became a placeholder, the GCC probe fails instead of passing.
+fn is_layout_placeholder(name: &str, fields: &[String]) -> bool {
+    !bindings::REQUIRED_TYPES.contains(&name)
+        && matches!(fields, [only] if only == "_unused" || only == "_address")
 }
 
 fn is_c_nameable(name: &str) -> bool {

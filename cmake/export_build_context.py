@@ -332,8 +332,8 @@ def main() -> int:
         fail("output", "must be an absolute path")
     output.parent.mkdir(parents=True, exist_ok=True)
     contents = (json.dumps(contract, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-    # The export target runs on every build. Keep an identical file untouched so
-    # its modification time does not make Cargo rerun binding generation.
+    # The export target runs on every build. Keep an identical file untouched
+    # so consumers that watch it by modification time see no spurious change.
     try:
         if output.is_file() and not output.is_symlink() and output.read_bytes() == contents:
             print("ESP-IDF build context unchanged (contract v1)")
