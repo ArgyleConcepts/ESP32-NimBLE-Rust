@@ -365,6 +365,9 @@ pub(crate) enum BackendDetail {
     HostStatus(i32),
     /// A NimBLE OS-layer status (`os_error_t`) or a shim's `-1`.
     OsStatus(i32),
+    /// A NimBLE port status that is either a `BLE_HS_*` host status or a
+    /// `ble_npl_error_t`, which share small values.
+    PortStatus(i32),
     OutOfMemory,
     InvalidLength(usize),
     OutOfRange {
@@ -411,19 +414,28 @@ impl fmt::Display for BackendError {
                 formatter,
                 "{operation} failed with ESP-IDF error {status} (0x{status:x})"
             ),
-            BackendDetail::HostStatus(status) => match self.att_error() {
-                Some(att) => write!(
-                    formatter,
-                    "{operation} failed with NimBLE host status {status} (0x{status:x}): {att}"
-                ),
-                None => write!(
+            BackendDetail::HostStatus(status) => {
+                write!(
                     formatter,
                     "{operation} failed with NimBLE host status {status} (0x{status:x})"
-                ),
-            },
+                )?;
+                match self.att_error() {
+                    Some(att) => write!(formatter, ": {att}"),
+                    None if (ATT_STATUS_BASE..ATT_STATUS_BASE + 0x100).contains(&status) => write!(
+                        formatter,
+                        ": unallocated ATT error 0x{:02x}",
+                        status - ATT_STATUS_BASE
+                    ),
+                    None => Ok(()),
+                }
+            }
             BackendDetail::OsStatus(status) => write!(
                 formatter,
                 "{operation} failed with NimBLE OS status {status} (0x{status:x})"
+            ),
+            BackendDetail::PortStatus(status) => write!(
+                formatter,
+                "{operation} failed with NimBLE port status {status} (0x{status:x}; a BLE_HS_* or ble_npl_error_t value)"
             ),
             BackendDetail::OutOfMemory => write!(formatter, "{operation} could not allocate"),
             BackendDetail::InvalidLength(length) => {
@@ -583,6 +595,13 @@ mod tests {
         let reserved = BackendError::new("op", BackendDetail::HostStatus(0x150));
         assert_eq!(reserved.att_error(), None);
         assert!(reserved.to_string().contains("0x150"));
+        assert!(
+            reserved.to_string().ends_with("unallocated ATT error 0x50"),
+            "{reserved}"
+        );
+        let port = BackendError::new("nimble_port_stop", BackendDetail::PortStatus(3));
+        assert_eq!(port.att_error(), None);
+        assert!(port.to_string().contains("ble_npl_error_t"), "{port}");
         for status in [0, 6, 0xff, 0x200, 0x20d] {
             assert_eq!(
                 BackendError::new("op", BackendDetail::HostStatus(status)).att_error(),

@@ -8,8 +8,10 @@
 //!   byte first. [`Uuid::to_canonical_bytes`] of
 //!   `6e400001-b5a3-f393-e0a9-e50e24dcca9e` starts `6e 40 00 01`.
 //! - **Wire** order is the Bluetooth protocol order used by ATT PDUs,
-//!   advertising data, and NimBLE's `ble_uuid*_t` values: the least significant
-//!   byte first. [`Uuid::to_wire_bytes`] of the same UUID starts `9e ca dc 24`.
+//!   advertising data, and the byte array in NimBLE's `ble_uuid128_t`: the
+//!   least significant byte first. [`Uuid::to_wire_bytes`] of the same UUID
+//!   starts `9e ca dc 24`. NimBLE stores 16- and 32-bit UUIDs as native
+//!   integers instead, so they take the numeric value, not wire bytes.
 //!
 //! Wire bytes keep the UUID's own width. ATT PDUs carry only 16- and 128-bit
 //! UUIDs (Core Specification Vol 3, Part F, 3.2.1), so a 32-bit UUID sent in
@@ -60,10 +62,10 @@ pub enum Uuid {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum UuidError {
-    /// The input length matches no UUID width. Text must be 4, 8, or 36
-    /// characters; bytes must be 2, 4, or 16.
+    /// The input length matches no UUID width. Text must be 4, 8, or 36 bytes
+    /// of ASCII; byte input must be 2, 4, or 16 bytes.
     InvalidLength {
-        /// The rejected length in characters or bytes.
+        /// The rejected length in bytes.
         length: usize,
     },
     /// A text character is not a hexadecimal digit where one is required.
@@ -84,7 +86,7 @@ impl fmt::Display for UuidError {
         match self {
             Self::InvalidLength { length } => write!(
                 formatter,
-                "UUID length {length} matches no width (expected 4, 8, or 36 characters or 2, 4, or 16 bytes)"
+                "UUID length of {length} bytes matches no width (expected 4, 8, or 36 bytes of text or 2, 4, or 16 bytes)"
             ),
             Self::InvalidCharacter { index } => {
                 write!(formatter, "UUID character at index {index} is not hexadecimal")
@@ -176,17 +178,12 @@ impl Uuid {
     }
 
     /// The UUID width in bytes: 2, 4, or 16.
-    pub const fn len(&self) -> usize {
+    pub const fn byte_len(&self) -> usize {
         match self {
             Self::Uuid16(_) => 2,
             Self::Uuid32(_) => 4,
             Self::Uuid128(_) => 16,
         }
-    }
-
-    /// Always `false`; present for the `len` convention.
-    pub const fn is_empty(&self) -> bool {
-        false
     }
 
     /// The full 128-bit value. 16- and 32-bit UUIDs expand over
@@ -335,7 +332,7 @@ mod tests {
             assert_eq!(uuid.to_wire_bytes().as_ref(), wire);
             assert_eq!(Uuid::from_canonical_bytes(canonical), Ok(uuid));
             assert_eq!(Uuid::from_wire_bytes(wire), Ok(uuid));
-            assert_eq!(uuid.len(), wire.len());
+            assert_eq!(uuid.byte_len(), wire.len());
             assert_eq!(encode_value(&uuid).unwrap(), wire);
             assert_eq!(decode_value::<Uuid>(wire), Ok(uuid));
         }
@@ -401,6 +398,8 @@ mod tests {
             ),
             // Multi-byte UTF-8 is rejected by position, not split.
             ("18é", UuidError::InvalidCharacter { index: 2 }),
+            // Lengths count bytes: four characters, six bytes.
+            ("18éé", UuidError::InvalidLength { length: 6 }),
         ];
         for (text, error) in cases {
             assert_eq!(Uuid::parse(text), Err(error), "{text:?}");

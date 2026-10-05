@@ -70,10 +70,12 @@ impl Operation {
             | Self::MbufAppend
             | Self::MbufCopy
             | Self::MbufFree => BackendDetail::OsStatus(code),
+            // `nimble_port_stop` returns a `ble_npl_error_t` if its semaphore
+            // cannot be created and a host status if the host cannot stop.
+            Self::HostStop => BackendDetail::PortStatus(code),
             Self::InstallCallbacks
             | Self::RemoveCallbacks
             | Self::HostStart
-            | Self::HostStop
             | Self::Notify
             | Self::Terminate
             | Self::AdvertisingStop
@@ -353,6 +355,11 @@ mod tests {
         });
         assert_eq!(os.backend().and_then(BackendError::att_error), None);
         assert!(os.to_string().contains("OS status"), "{os}");
+        let stop = Error::from(NativeError::Status {
+            operation: Operation::HostStop,
+            code: 3,
+        });
+        assert!(stop.to_string().contains("port status 3"), "{stop}");
 
         let att = Error::from(NativeError::Status {
             operation: Operation::Notify,
