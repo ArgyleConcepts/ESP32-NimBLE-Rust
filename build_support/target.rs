@@ -45,11 +45,6 @@ const LAYOUT_PROBE_ASSEMBLY: &str = "argyle_nimble_layout_probe.s";
 const SHIM_OBJECT: &str = "nimble_shim.o";
 const LAYOUT_MARKER: &str = "->ARGYLE_NIMBLE_LAYOUT ";
 
-/// Rust's std for ESP-IDF uses the `libc` crate's 64-bit `time_t` unless the
-/// legacy `espidf_time32` cfg is set (libc 0.2.174, used by Rust 1.90 std).
-/// ESP-IDF 5.0 and later use a 64-bit `time_t`.
-const STD_TIME_T_SIZE: u64 = 8;
-
 /// Supported Cargo target triples and their ESP-IDF chips.
 pub(crate) const SUPPORTED_TARGETS: &[(&str, &str)] = &[
     ("riscv32imc-esp-espidf", "esp32c3"),
@@ -83,6 +78,9 @@ struct ScalarCheck {
     /// Evaluated inside the private `bindings` module.
     rust_expression: &'static str,
     message: &'static str,
+    /// Compare with Rust std's ESP-IDF type aliases, which exist only when
+    /// compiling for `target_os = "espidf"`.
+    std_espidf_type: bool,
 }
 
 const SCALAR_CHECKS: &[ScalarCheck] = &[
@@ -91,96 +89,120 @@ const SCALAR_CHECKS: &[ScalarCheck] = &[
         c_expression: "sizeof(int)",
         rust_expression: "::core::mem::size_of::<::core::ffi::c_int>()",
         message: "C int size differs from Rust c_int",
+        std_espidf_type: false,
     },
     ScalarCheck {
         key: "int_align",
         c_expression: "_Alignof(int)",
         rust_expression: "::core::mem::align_of::<::core::ffi::c_int>()",
         message: "C int alignment differs from Rust c_int",
+        std_espidf_type: false,
     },
     ScalarCheck {
         key: "short_size",
         c_expression: "sizeof(short)",
         rust_expression: "::core::mem::size_of::<::core::ffi::c_short>()",
         message: "C short size differs from Rust c_short",
+        std_espidf_type: false,
     },
     ScalarCheck {
         key: "long_size",
         c_expression: "sizeof(long)",
         rust_expression: "::core::mem::size_of::<::core::ffi::c_long>()",
         message: "C long size differs from Rust c_long",
+        std_espidf_type: false,
     },
     ScalarCheck {
         key: "long_long_size",
         c_expression: "sizeof(long long)",
         rust_expression: "::core::mem::size_of::<::core::ffi::c_longlong>()",
         message: "C long long size differs from Rust c_longlong",
+        std_espidf_type: false,
     },
     ScalarCheck {
         key: "long_long_align",
         c_expression: "_Alignof(long long)",
         rust_expression: "::core::mem::align_of::<::core::ffi::c_longlong>()",
         message: "C long long alignment differs from Rust c_longlong",
+        std_espidf_type: false,
     },
     ScalarCheck {
         key: "pointer_size",
         c_expression: "sizeof(void *)",
         rust_expression: "::core::mem::size_of::<*const ::core::ffi::c_void>()",
         message: "C pointer size differs from Rust pointers",
+        std_espidf_type: false,
     },
     ScalarCheck {
         key: "pointer_align",
         c_expression: "_Alignof(void *)",
         rust_expression: "::core::mem::align_of::<*const ::core::ffi::c_void>()",
         message: "C pointer alignment differs from Rust pointers",
+        std_espidf_type: false,
     },
     ScalarCheck {
         key: "size_t_size",
         c_expression: "sizeof(size_t)",
         rust_expression: "::core::mem::size_of::<usize>()",
         message: "C size_t differs from Rust usize",
+        std_espidf_type: false,
     },
     ScalarCheck {
         key: "double_size",
         c_expression: "sizeof(double)",
         rust_expression: "::core::mem::size_of::<::core::ffi::c_double>()",
         message: "C double size differs from Rust c_double",
+        std_espidf_type: false,
     },
     ScalarCheck {
         key: "double_align",
         c_expression: "_Alignof(double)",
         rust_expression: "::core::mem::align_of::<::core::ffi::c_double>()",
         message: "C double alignment differs from Rust c_double",
+        std_espidf_type: false,
     },
     ScalarCheck {
         key: "float_size",
         c_expression: "sizeof(float)",
         rust_expression: "::core::mem::size_of::<::core::ffi::c_float>()",
         message: "C float size differs from Rust c_float",
+        std_espidf_type: false,
     },
     ScalarCheck {
         key: "bool_size",
         c_expression: "sizeof(_Bool)",
         rust_expression: "::core::mem::size_of::<bool>()",
         message: "C _Bool size differs from Rust bool",
+        std_espidf_type: false,
     },
     ScalarCheck {
         key: "enum_size",
         c_expression: "sizeof(enum argyle_nimble_layout_enum)",
         rust_expression: "::core::mem::size_of::<::core::ffi::c_int>()",
         message: "C enums are not int-sized; -fshort-enums is unsupported",
+        std_espidf_type: false,
     },
     ScalarCheck {
         key: "char_signed",
         c_expression: "((char)-1 < 0)",
         rust_expression: "(::core::ffi::c_char::MIN != 0) as usize",
         message: "C char signedness differs from Rust c_char",
+        std_espidf_type: false,
     },
     ScalarCheck {
         key: "off_t_size",
         c_expression: "sizeof(off_t)",
-        rust_expression: "::core::mem::size_of::<::core::ffi::c_long>()",
-        message: "Newlib off_t differs from Rust std's ESP-IDF off_t (c_long)",
+        rust_expression: "::core::mem::size_of::<::std::os::espidf::raw::off_t>()",
+        message: "Newlib off_t differs from Rust std's ESP-IDF off_t",
+        std_espidf_type: true,
+    },
+    ScalarCheck {
+        key: "time_t_size",
+        c_expression: "sizeof(time_t)",
+        rust_expression: "::core::mem::size_of::<::std::os::espidf::raw::time_t>()",
+        message:
+            "ESP-IDF time_t differs from Rust std's ESP-IDF time_t; do not set --cfg espidf_time32",
+        std_espidf_type: true,
     },
 ];
 
@@ -328,8 +350,12 @@ pub(crate) struct LayoutRecord {
 /// Records whose names contain bindgen's anonymous-type marker, bindgen helper
 /// types, and generic types are skipped; their enclosing named records still
 /// have size and alignment checks. Bindgen-internal fields (anonymous members,
-/// bitfield units, padding, and opaque blobs) are skipped. Union members always
+/// bitfield storage units, padding, and opaque blobs) are skipped: C bitfields
+/// have no `offsetof`, so individual bit positions are not compared and only
+/// the enclosing record's size and alignment cover them. Union members always
 /// begin at offset zero, so unions receive size and alignment checks only.
+/// Incomplete records, which bindgen represents with a single placeholder
+/// field, have no layout to check and are skipped.
 pub(crate) fn layout_records(bindings_source: &str) -> Result<Vec<LayoutRecord>, String> {
     let file = syn::parse_file(bindings_source)
         .map_err(|_| "generated bindings could not be parsed for ABI layout checks".to_owned())?;
@@ -352,7 +378,7 @@ pub(crate) fn layout_records(bindings_source: &str) -> Result<Vec<LayoutRecord>,
             syn::Item::Union(item) => (item.ident.to_string(), true, &item.generics, Vec::new()),
             _ => continue,
         };
-        if !generics.params.is_empty() || !is_c_nameable(&name) {
+        if !generics.params.is_empty() || !is_c_nameable(&name) || is_layout_placeholder(&fields) {
             continue;
         }
         let c_spelling = if TYPEDEF_RECORDS.contains(&name.as_str()) {
@@ -380,6 +406,14 @@ pub(crate) fn layout_records(bindings_source: &str) -> Result<Vec<LayoutRecord>,
         return Err("generated bindings contain no C-nameable records to check".to_owned());
     }
     Ok(records)
+}
+
+/// Bindgen emits a single placeholder field for a record without a known C
+/// layout, such as a forward-declared (incomplete) struct that the selected
+/// configuration never defines. C cannot take `sizeof` of it and Rust uses it
+/// only behind pointers, so there is no layout to compare.
+fn is_layout_placeholder(fields: &[String]) -> bool {
+    matches!(fields, [only] if only == "_unused" || only == "_address")
 }
 
 fn is_c_nameable(name: &str) -> bool {
@@ -427,7 +461,6 @@ pub(crate) fn render_layout_probe(
             check.key, check.c_expression
         ));
     }
-    source.push_str("    ARGYLE_NIMBLE_LAYOUT(\"scalar time_t_size\", sizeof(time_t));\n");
     for (index, record) in records.iter().enumerate() {
         let spelling = &record.c_spelling;
         source.push_str(&format!(
@@ -507,15 +540,6 @@ pub(crate) fn render_layout_assertions(
     values: &LayoutValues,
 ) -> Result<String, String> {
     let missing = |what: &str| format!("GCC layout probe did not report {what}");
-    let time_t = values
-        .scalars
-        .get("time_t_size")
-        .ok_or_else(|| missing("time_t_size"))?;
-    if *time_t != STD_TIME_T_SIZE {
-        return Err(format!(
-            "the selected ESP-IDF configuration reports a {time_t}-byte time_t, but Rust std for ESP-IDF uses a {STD_TIME_T_SIZE}-byte time_t; this configuration is unsupported"
-        ));
-    }
     let mut source = String::from(
         "// Generated by argyle-nimble's build script from the consumer's selected GCC.\n\
          // rustc evaluates these when compiling for the real ESP target.\n",
@@ -525,6 +549,11 @@ pub(crate) fn render_layout_assertions(
             .scalars
             .get(check.key)
             .ok_or_else(|| missing(check.key))?;
+        if check.std_espidf_type {
+            // std's `os::espidf::raw` aliases are deprecated re-exports of the
+            // libc types std itself uses; they exist only for ESP-IDF targets.
+            source.push_str("#[cfg(target_os = \"espidf\")]\n#[allow(deprecated)]\n");
+        }
         source.push_str(&format!(
             "const _: () = assert!({} == {value}, \"{}\");\n",
             check.rust_expression, check.message
@@ -557,7 +586,6 @@ pub(crate) fn render_layout_assertions(
         }
     }
     let expected = SCALAR_CHECKS.len()
-        + 1
         + records
             .iter()
             .map(|record| 2 + record.fields.len())

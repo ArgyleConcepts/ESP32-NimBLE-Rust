@@ -253,6 +253,34 @@ class CompilerExportTests(unittest.TestCase):
             self.assertEqual(context["compiler"]["build_configuration"], "")
             self.assertEqual(context["compiler"]["sysroot"], str(sysroot))
 
+            # The export target runs on every idf.py build. An unchanged
+            # context keeps its file (and mtime) so Cargo stays fresh.
+            os.utime(output, ns=(1_000_000_000, 1_000_000_000))
+            with mock.patch.object(export_build_context.sys, "argv", sys_argv):
+                self.assertEqual(export_build_context.main(), 0)
+            self.assertEqual(output.stat().st_mtime_ns, 1_000_000_000)
+
+            sdkconfig.write_text("CONFIG_IDF_TARGET=\"esp32c3\"\nCONFIG_CHANGED=y\n", encoding="utf-8")
+            capture.write_text(json.dumps({
+                "compiler": str(compiler),
+                "arguments": ["-c", "context_probe.c", "--sysroot", "toolchain sysroot", "-DCHANGED=1"],
+                "working_directory": str(working_directory),
+                "status": 0,
+            }), encoding="utf-8")
+            with mock.patch.object(export_build_context.sys, "argv", sys_argv):
+                self.assertEqual(export_build_context.main(), 0)
+            self.assertNotEqual(output.stat().st_mtime_ns, 1_000_000_000)
+            self.assertIn("-DCHANGED=1", json.loads(output.read_text(encoding="utf-8"))["compiler"]["arguments"])
+
+            # A symlinked output is replaced rather than trusted as unchanged.
+            target = root / "symlink target.json"
+            target.write_bytes(output.read_bytes())
+            output.unlink()
+            output.symlink_to(target)
+            with mock.patch.object(export_build_context.sys, "argv", sys_argv):
+                self.assertEqual(export_build_context.main(), 0)
+            self.assertFalse(output.is_symlink())
+
     def test_capture_requires_a_successful_object_with_argv_and_working_directory(self):
         with tempfile.TemporaryDirectory(prefix="argyle capture ") as temporary:
             capture = Path(temporary) / "capture.json"

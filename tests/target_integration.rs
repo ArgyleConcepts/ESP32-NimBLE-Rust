@@ -61,6 +61,14 @@ pub union fixture_union {
 pub struct fixture_opaque {
     pub _bindgen_opaque_blob: [u32; 3usize],
 }
+#[repr(C)]
+pub struct fixture_incomplete {
+    pub _address: u8,
+}
+#[repr(C)]
+pub struct fixture_forward {
+    _unused: [u8; 0],
+}
 pub type fixture_alias = u32;
 "#;
 
@@ -86,6 +94,9 @@ union fixture_union {
 struct fixture_opaque {
     uint32_t hidden[3];
 };
+/* Declared but never defined, like a configuration-disabled SDK record. */
+struct fixture_incomplete;
+struct fixture_forward;
 "#;
 
 struct TempDirectory(PathBuf);
@@ -412,10 +423,36 @@ fn incomplete_or_unsupported_probe_values_fail_before_rust_compilation() {
     let error = target::render_layout_assertions(&records, &extra).unwrap_err();
     assert!(error.contains("requested checks"), "{error}");
 
-    let mut time32 = complete;
-    time32.scalars.insert("time_t_size".into(), 4);
-    let error = target::render_layout_assertions(&records, &time32).unwrap_err();
-    assert!(error.contains("4-byte time_t"), "{error}");
+    let mut missing_time = complete;
+    missing_time.scalars.remove("time_t_size");
+    let error = target::render_layout_assertions(&records, &missing_time).unwrap_err();
+    assert!(error.contains("time_t_size"), "{error}");
+}
+
+#[test]
+fn std_libc_types_are_compared_only_for_esp_idf_targets() {
+    let directory = TempDirectory::new("layout std types");
+    let records = target::layout_records(FIXTURE_BINDINGS).unwrap();
+    let mut values = host_layout(directory.path(), &records);
+    // A 32-bit time_t would mismatch Rust std's 64-bit ESP-IDF time_t. The
+    // assertion uses std's own alias and compiles only for ESP-IDF targets.
+    values.scalars.insert("time_t_size".into(), 4);
+    let assertions = target::render_layout_assertions(&records, &values).unwrap();
+    for (alias, value) in [("time_t", 4), ("off_t", values.scalars["off_t_size"])] {
+        let line = format!(
+            "#[cfg(target_os = \"espidf\")]\n#[allow(deprecated)]\nconst _: () = assert!(::core::mem::size_of::<::std::os::espidf::raw::{alias}>() == {value},"
+        );
+        assert!(
+            assertions.contains(&line),
+            "{alias} assertion is not gated:\n{assertions}"
+        );
+    }
+    let output = compile_rust_assertions(directory.path(), &assertions);
+    assert!(
+        output.status.success(),
+        "host compilation must skip ESP-IDF-only std type assertions:\n{}",
+        output_text(&output)
+    );
 }
 
 #[test]

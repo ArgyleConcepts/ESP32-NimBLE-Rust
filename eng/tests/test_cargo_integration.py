@@ -174,10 +174,24 @@ class CargoDriverTests(unittest.TestCase):
 
     def test_context_for_another_chip_fails_before_cargo(self):
         self.context.write_text(json.dumps(context_document("esp32s3")), encoding="utf-8")
+        self.identity.write_text("{\"stale\": true}\n", encoding="utf-8")
         cargo = FakeCargo(self.root)
         with self.assertRaisesRegex(driver.IntegrationError, "context is for 'esp32s3'"):
             driver.run(self.arguments(), {}, cargo)
         self.assertEqual(cargo.commands, [])
+        self.assertFalse(self.identity.exists(), "a pre-Cargo failure left a stale identity")
+
+    def test_lockfile_identity_is_recorded_after_cargo_updates_it(self):
+        class UpdatingCargo(FakeCargo):
+            def __call__(self, command, **kwargs):
+                result = super().__call__(command, **kwargs)
+                if command[1] == "build":
+                    (self.root / "Cargo.lock").write_text("# updated by cargo\n", encoding="utf-8")
+                return result
+
+        driver.run(self.arguments(), {}, UpdatingCargo(self.root))
+        identity = json.loads(self.identity.read_text(encoding="utf-8"))
+        self.assertEqual(identity["lockfile"]["sha256"], driver.sha256(self.root / "Cargo.lock"))
 
     def test_missing_or_malformed_context_fails_before_cargo(self):
         cargo = FakeCargo(self.root)
@@ -194,8 +208,10 @@ class CargoDriverTests(unittest.TestCase):
 
     def test_missing_clang_tools_fail_with_selector_guidance(self):
         (self.root / "libclang.dylib").unlink()
+        self.identity.write_text("{\"stale\": true}\n", encoding="utf-8")
         with self.assertRaisesRegex(driver.IntegrationError, "ARGYLE_NIMBLE_LIBCLANG_PATH"):
             driver.run(self.arguments(), {}, FakeCargo(self.root))
+        self.assertFalse(self.identity.exists())
 
     def test_cargo_failure_removes_a_stale_identity(self):
         self.identity.write_text("{\"stale\": true}\n", encoding="utf-8")

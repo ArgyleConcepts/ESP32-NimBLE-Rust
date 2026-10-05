@@ -506,15 +506,25 @@ class Validation:
         first = self.build("clean-a", chip)
         a = self.verify_firmware("clean-a", first, chip)
 
-        self.idf("noop-a-build", first, "build")
+        context_file = first / "argyle-nimble/build-context-v1.json"
+        context_mtime = context_file.stat().st_mtime_ns
+        noop_output = self.idf("noop-a-build", first, "build")
         repeat = self.verify_firmware("noop-a", first, chip)
+        self.runner.check(
+            "noop-context-untouched",
+            context_file.stat().st_mtime_ns == context_mtime
+            and "ESP-IDF build context unchanged" in noop_output,
+            "an unchanged rebuild leaves the exported context file untouched",
+        )
         self.runner.check(
             "noop-rebuild-stable",
             all(repeat[key] == a[key] for key in ("bindings_sha256", "layout_sha256", "library_sha256")),
             "an unchanged rebuild keeps bindings, layout assertions, and the Rust library identical",
         )
+        self.runner.values["noop_build_script_reran"] = "Compiling argyle-nimble" in noop_output
 
-        second = self.verify_firmware("clean-b", self.build("clean-b", chip), chip)
+        second_build = self.build("clean-b", chip)
+        second = self.verify_firmware("clean-b", second_build, chip)
         stable = ("rustc", "cargo", "lockfile_sha256", "bindings_sha256", "layout_sha256", "scalars",
                   "shim_source_sha256", "link_audit_sha256", "profile", "opt_level", "rust_target")
         differences = [key for key in stable if a[key] != second[key]]
@@ -522,6 +532,8 @@ class Validation:
             "clean-repeat-consistent-inputs", not differences,
             f"two clean builds in separate directories agree on {', '.join(stable)}; differ in {differences}",
         )
+
+        self.in_place_configuration_change(second_build, chip, second)
 
         debug = self.build("debug-optimization", chip, self.defaults(
             "debug", "CONFIG_COMPILER_OPTIMIZATION_DEBUG=y\n# CONFIG_COMPILER_OPTIMIZATION_SIZE is not set\n"))
@@ -532,10 +544,10 @@ class Validation:
         switched = self.verify_firmware("target-switch", first, other)
         map_text = (first / "argyle_nimble_link_fixture.map").read_text(encoding="utf-8", errors="replace")
         self.runner.check(
-            "target-switch-invalidates-cache",
+            "target-switch-relinks-new-chip",
             switched["chip"] == other and f"argyle-nimble/cargo/{chip}/" not in map_text
             and read_json(first / "argyle-nimble/build-context-v1.json")["target"]["chip"] == other,
-            f"switching {chip} to {other} re-exported the context and linked only {other} Cargo output",
+            f"set-target {other} (which fully cleans the build directory) re-exported the context and linked only {other} Cargo output",
         )
 
         std = self.build("std-audit", chip, "-DARGYLE_NIMBLE_FIXTURE_STD_AUDIT=ON")
@@ -584,6 +596,40 @@ class Validation:
             not (self.manifest.parent / "target").exists()
             and sha256(self.manifest.with_name("Cargo.lock")) == self.lock_digest,
             "the fixture's Rust source directory has no Cargo target directory and an unchanged lockfile",
+        )
+
+    def in_place_configuration_change(self, build: Path, chip: str, baseline: dict) -> None:
+        """Change NimBLE configuration in a retained build directory and back."""
+        key = "CONFIG_BT_NIMBLE_CPFD_CAFD"
+        sdkconfig = build / "sdkconfig"
+        original = sdkconfig.read_text(encoding="utf-8")
+        lines = original.splitlines()
+        enabled = f"{key}=y" in lines
+        replacement = f"# {key} is not set" if enabled else f"{key}=y"
+        current = f"{key}=y" if enabled else f"# {key} is not set"
+        self.runner.check(
+            "config-change-option-present", current in lines,
+            f"{key} is configured in the retained sdkconfig",
+        )
+        sdkconfig.write_text(original.replace(current, replacement, 1), encoding="utf-8")
+        self.idf("config-change-build", build, "build")
+        changed = self.verify_firmware("config-change", build, chip)
+        self.runner.check(
+            "config-change-regenerates",
+            changed["bindings_sha256"] != baseline["bindings_sha256"]
+            and changed["layout_sha256"] != baseline["layout_sha256"]
+            and changed["layout_records"] != baseline["layout_records"],
+            f"toggling {key} in place regenerated bindings and layout assertions "
+            f"({baseline['layout_records']} -> {changed['layout_records']} checked records)",
+        )
+        sdkconfig.write_text(original, encoding="utf-8")
+        self.idf("config-restore-build", build, "build")
+        restored = self.verify_firmware("config-restore", build, chip)
+        self.runner.check(
+            "config-restore-matches-baseline",
+            restored["bindings_sha256"] == baseline["bindings_sha256"]
+            and restored["layout_sha256"] == baseline["layout_sha256"],
+            "restoring the configuration restores the original bindings and layout assertions",
         )
 
     def negative_configuration_cases(self) -> None:

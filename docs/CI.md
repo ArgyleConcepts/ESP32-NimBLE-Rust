@@ -124,15 +124,21 @@ The script then fetches host and `-Zbuild-std` sources once. Every build uses
   - the ELF machine and the machine of every static-library member;
   - every bound NimBLE/shim symbol defined in the ELF;
   - the linker map's library input.
-- **No-op rebuild.** Bindings, layout assertions, and the Rust library must not
-  change.
+- **No-op rebuild.** The exported context file must be left untouched.
+  Bindings, layout assertions, and the Rust library must not change. The
+  report records whether Cargo still reran the build script because of an
+  absent watched SDK path.
 - **Second clean build in another directory.** It must agree on toolchain,
   lockfile, bindings, layout, scalar ABI, shim, and link-audit identity.
+- **In-place configuration change.** Toggle `CONFIG_BT_NIMBLE_CPFD_CAFD` in
+  that retained build directory's `sdkconfig`, rebuild, then restore it. The
+  change must regenerate bindings and layout assertions; restoring must
+  reproduce the baseline.
 - **`CONFIG_COMPILER_OPTIMIZATION_DEBUG` build.** Cargo `dev` profile,
   `opt-level = 1`.
 - **Target switch.** `idf.py set-target` to the other chip in the first build
-  directory. It must re-export the context and link only the new chip's Cargo
-  output.
+  directory. ESP-IDF fully cleans the build directory as part of this step. The
+  rebuild must re-export the context and link only the new chip's Cargo output.
 - **Compatibility-shim audit.**
   - std facilities link without shims;
   - `std::fs::symlink_metadata` fails with only `lstat` unresolved;

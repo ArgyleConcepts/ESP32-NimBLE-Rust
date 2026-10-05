@@ -331,9 +331,18 @@ def main() -> int:
     if not output.is_absolute():
         fail("output", "must be an absolute path")
     output.parent.mkdir(parents=True, exist_ok=True)
+    contents = (json.dumps(contract, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    # The export target runs on every build. Keep an identical file untouched so
+    # its modification time does not make Cargo rerun binding generation.
+    try:
+        if output.is_file() and not output.is_symlink() and output.read_bytes() == contents:
+            print("ESP-IDF build context unchanged (contract v1)")
+            return 0
+    except OSError:
+        pass
     temporary = output.with_name(f".{output.name}.tmp")
     try:
-        temporary.write_text(json.dumps(contract, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        temporary.write_bytes(contents)
         os.replace(temporary, output)
     except OSError:
         try:

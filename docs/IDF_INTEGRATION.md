@@ -133,19 +133,33 @@ precedence over manifest profiles, so Rust matches the IDF optimization choice
 and never unwinds across C callbacks. No extra `RUSTFLAGS` are needed.
 
 Cargo output goes to `<BUILD_DIR>/argyle-nimble/cargo/<idf-target>/`, so
-`idf.py fullclean` removes it. `idf.py set-target` re-exports the context, and
-the new chip uses a separate directory. Cargo's own fingerprints decide what is
-fresh; Ninja relinks firmware only when the library changes. After each
-successful build, `<BUILD_DIR>/argyle-nimble/cargo-integration.json` records:
+`idf.py fullclean` removes it, and the directory is separate per chip.
+`idf.py set-target` performs a full clean and re-exports the context. After a
+configuration change in an existing build directory, the build script sees the
+changed `sdkconfig` and generated header and regenerates the bindings and
+target artifacts.
+
+The Cargo custom target runs on every build, and Cargo decides what is fresh.
+The context exporter rewrites its JSON only when the content changes. The
+build script can still rerun on an unchanged build, and Cargo then recompiles
+the crate and Ninja relinks. This happens when a watched SDK path is absent,
+such as `.git/packed-refs` in a loose-ref ESP-IDF checkout or a missing include
+lookup; see the [invalidation notes](BINDING_GENERATION.md#cargo-selection-and-invalidation).
+Unchanged inputs regenerate identical bindings, layout assertions, and Rust
+library bytes.
+
+After each successful build, `<BUILD_DIR>/argyle-nimble/cargo-integration.json`
+records:
 
 - the cargo and rustc versions;
 - the profile and opt-level;
-- the lockfile digest;
+- the lockfile digest, taken after Cargo runs;
 - the context path, digest, and SDK revision;
 - the integration directory;
 - the library digest.
 
-A failed build removes the previous record.
+The driver removes the previous record before validating anything, so a failed
+build never leaves one behind.
 
 ## Target build checks
 
@@ -154,7 +168,11 @@ build script adds these steps to [binding generation](BINDING_GENERATION.md):
 
 - **Runtime selection.** It rejects:
   - a Cargo target that does not match the context's chip;
-  - `panic` other than `abort`;
+  - `panic` other than `abort` as reported by Cargo's target cfg. A RUSTFLAGS
+    `-C panic=unwind` is detected. A manifest profile `panic` setting is not
+    visible to build scripts; the CMake driver overrides it with
+    `CARGO_PROFILE_<PROFILE>_PANIC=abort`, so only direct Cargo use can bypass
+    this check;
   - the legacy `--cfg espidf_time32`;
   - a configuration that does not select Newlib in both `sdkconfig` and
     `sdkconfig.h`.
@@ -162,15 +180,21 @@ build script adds these steps to [binding generation](BINDING_GENERATION.md):
   the captured flags (`-S` only; nothing runs). The probe reports these values,
   which become `const` assertions that rustc evaluates while compiling the
   generated declarations for the real target:
-  - sizes, alignments, and named-field offsets of every C-nameable generated
-    NimBLE/shim record;
+  - sizes and alignments of every C-nameable generated NimBLE/shim record.
+    Records the selected configuration only forward-declares (for example
+    `struct ble_gatt_cpfd` with `CONFIG_BT_NIMBLE_CPFD_CAFD` off) have no C
+    layout, are used only behind pointers, and are skipped;
+  - offsets of their named, non-bitfield struct fields. C bitfields have no
+    `offsetof`, so individual bit positions (for example the presence flags in
+    `ble_hs_adv_fields`) are covered only by the enclosing record's size and
+    alignment;
   - `int`, `short`, `long`, `long long`, pointer, `size_t`, `double`, `float`,
     `_Bool`, and enum sizes;
   - `char` signedness;
-  - Newlib `off_t`.
+  - Newlib `time_t` and `off_t` against Rust std's own ESP-IDF type aliases
+    (`std::os::espidf::raw`).
 
-  Any difference fails compilation and names the type or field. A non-8-byte
-  `time_t` is rejected because Rust std for ESP-IDF uses a 64-bit `time_t`.
+  Any difference fails compilation and names the type or field.
 - **Private C shim.** `src/backend/nimble_shim.c` is compiled with the same
   captured flags, then archived with the archiver reported by that GCC
   (`-print-prog-name=ar`). Cargo bundles the archive into the application's
@@ -189,8 +213,8 @@ and `lstat`. Against ESP-IDF 6.1 with Rust 1.90 std:
 
 - **`espidf_time64`** is obsolete. Rust 1.90's std uses `libc` 0.2.174, where
   ESP-IDF `time_t` is 64-bit unless `espidf_time32` is set. The integration
-  passes no time cfg and rejects `espidf_time32`. The ABI probe confirms GCC's
-  `time_t` is 8 bytes.
+  passes no time cfg and rejects `espidf_time32`. The ABI layout check compares
+  GCC's `time_t` with std's own ESP-IDF `time_t`.
 - **`atexit`** is not needed. The std-audit fixture links thread spawn/join,
   thread-local destructors, mutexes, `SystemTime`/`Instant`, and
   `fs::metadata` against ESP-IDF 6.1 Newlib without any shim. argyle-nimble
@@ -216,7 +240,7 @@ and `lstat`. Against ESP-IDF 6.1 with Rust 1.90 std:
 | Missing or relative Espressif clang/libclang selection | CMake configuration |
 | Missing context export, context for a different chip, missing manifest | Cargo driver before Cargo runs |
 | Cargo target/context chip mismatch, missing compiler or include paths, stale SDK revision | Build-context validation in the build script |
-| `panic=unwind`, `--cfg espidf_time32`, non-Newlib headers | Target runtime validation in the build script |
+| RUSTFLAGS `-C panic=unwind`, `--cfg espidf_time32`, non-Newlib headers | Target runtime validation in the build script |
 | Rust/GCC layout difference | rustc `const` assertion naming the type or field |
 | Unresolved C symbol | Firmware link (with `LINK_AUDIT`, every bound symbol is checked) |
 

@@ -207,7 +207,7 @@ def rustc_for(arguments: argparse.Namespace, environment: dict[str, str]) -> str
 
 def workspace_lockfile(
     runner: Runner, arguments: argparse.Namespace, environment: dict[str, str]
-) -> dict | None:
+) -> Path | None:
     manifest = query(
         runner,
         [
@@ -224,9 +224,7 @@ def workspace_lockfile(
         "cargo locate-project",
     )
     lockfile = Path(manifest).with_name("Cargo.lock")
-    if not lockfile.is_file():
-        return None
-    return {"path": str(lockfile), "sha256": sha256(lockfile)}
+    return lockfile if lockfile.is_file() else None
 
 
 def write_identity(path: Path, document: dict) -> None:
@@ -238,6 +236,9 @@ def write_identity(path: Path, document: dict) -> None:
 
 def run(argv: Sequence[str], base_environment: dict[str, str], runner: Runner = subprocess.run) -> int:
     arguments = parse_arguments(argv)
+    # Remove a previous identity before any other check so a failed build can
+    # never leave a record that appears to describe the current inputs.
+    arguments.identity.unlink(missing_ok=True)
     if not arguments.manifest_path.is_file():
         raise IntegrationError(f"Cargo manifest is missing: {arguments.manifest_path}")
     for label, path in (("Espressif clang", arguments.esp_clang), ("libclang", arguments.libclang)):
@@ -247,9 +248,6 @@ def run(argv: Sequence[str], base_environment: dict[str, str], runner: Runner = 
                 "ARGYLE_NIMBLE_LIBCLANG_PATH to the pinned ESP-IDF esp-clang package"
             )
     context = read_context(arguments)
-    # Remove a previous identity first so a failed build cannot leave a record
-    # that appears to describe the current inputs.
-    arguments.identity.unlink(missing_ok=True)
     environment = cargo_environment(base_environment, arguments)
     workdir = arguments.manifest_path.parent
     cargo_version = query(runner, [str(arguments.cargo), "--version", "--verbose"], workdir, environment, "cargo --version")
@@ -272,6 +270,10 @@ def run(argv: Sequence[str], base_environment: dict[str, str], runner: Runner = 
             f"Cargo succeeded but did not produce {library}; LIBRARY_NAME must match the "
             "crate's library name and the crate must declare crate-type = [\"staticlib\"]"
         )
+    # Hash after Cargo: without LOCKED, Cargo may update the lockfile it used.
+    lock_identity = (
+        {"path": str(lockfile), "sha256": sha256(lockfile)} if lockfile is not None else None
+    )
 
     write_identity(arguments.identity, {
         "schema_version": SCHEMA_VERSION,
@@ -290,7 +292,7 @@ def run(argv: Sequence[str], base_environment: dict[str, str], runner: Runner = 
         "features": arguments.feature,
         "locked": arguments.locked,
         "offline": arguments.offline,
-        "lockfile": lockfile,
+        "lockfile": lock_identity,
         "context": {
             "path": str(arguments.context),
             "sha256": sha256(arguments.context),
