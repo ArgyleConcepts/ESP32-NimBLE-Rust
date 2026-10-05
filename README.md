@@ -13,7 +13,7 @@ the BLE boundary:
   UTF-8 encodings, a `BigEndian` wrapper, and `Encode`/`Decode` traits for
   application codecs over Rust-owned bytes only.
 - `AttError` for ATT results returned to a client, kept separate from
-  `Error` for framework lifecycle, transport, backend, and encoding failures.
+  `Error` for framework lifecycle, backend, and encoding failures.
 
 It has **no BLE controller, GATT server, implemented BLE behavior, or published
 package**. See the rustdoc on each type for contracts and examples. Its private,

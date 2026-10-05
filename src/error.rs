@@ -6,8 +6,8 @@
 //!   connected client, such as "write not permitted". It is a valid ATT error
 //!   code, not a failure of this framework.
 //! - [`Error`] reports a failure of the framework itself: lifecycle misuse,
-//!   transport problems, native backend failures, or values that cannot be
-//!   encoded. It is never sent to the client.
+//!   native backend failures, or values that cannot be encoded. It is never
+//!   sent to the client.
 //!
 //! No conversion exists from [`AttError`] to [`Error`]. A decode failure in a
 //! handler converts to the ATT error the client should see with `?`; see the
@@ -20,13 +20,17 @@ use std::fmt;
 ///
 /// Codes are defined by the Bluetooth Core Specification (Vol 3, Part F,
 /// 3.4.1.1) and the Core Specification Supplement (Part B) for the common
-/// profile range. Constructors accept only the ranges handlers may return:
+/// profile codes. Constructors accept only codes those documents allocate:
 ///
 /// - `0x01..=0x13`: protocol errors, available as associated constants;
 /// - `0x80..=0x9F`: application errors, defined by the application's profile;
-/// - `0xE0..=0xFF`: common profile and service errors.
+/// - `0xFC..=0xFF`: common profile and service errors.
 ///
-/// `0x00` and the reserved ranges are rejected, so every value is sendable.
+/// `0x00` and every range reserved for future use (`0x14..=0x7F`,
+/// `0xA0..=0xFB`) are rejected. Some allocated protocol codes, such as
+/// [`INVALID_PDU`](Self::INVALID_PDU), describe conditions the host detects
+/// itself; attribute handlers normally return permission, length, value, or
+/// application errors.
 ///
 /// ```
 /// use argyle_nimble::AttError;
@@ -45,7 +49,7 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AttError(u8);
 
-/// A code that is not a valid ATT error to return: `0x00` or a reserved range.
+/// A code that is not an allocated ATT error: `0x00` or a reserved range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InvalidAttErrorCode {
     code: u8,
@@ -62,7 +66,7 @@ impl fmt::Display for InvalidAttErrorCode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "0x{:02x} is not an ATT error code a server may return",
+            "0x{:02x} is not an allocated ATT error code",
             self.code
         )
     }
@@ -120,10 +124,10 @@ impl AttError {
     /// `0xFF`: the value is out of range.
     pub const OUT_OF_RANGE: Self = Self(0xff);
 
-    /// Validate any ATT error code a server may return.
+    /// Validate an allocated ATT error code.
     pub const fn from_code(code: u8) -> Result<Self, InvalidAttErrorCode> {
         match code {
-            0x01..=0x13 | 0x80..=0x9f | 0xe0..=0xff => Ok(Self(code)),
+            0x01..=0x13 | 0x80..=0x9f | 0xfc..=0xff => Ok(Self(code)),
             _ => Err(InvalidAttErrorCode { code }),
         }
     }
@@ -181,10 +185,7 @@ impl fmt::Display for AttError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.name() {
             Some(name) => write!(formatter, "ATT error 0x{:02x} ({name})", self.0),
-            None if self.is_application() => {
-                write!(formatter, "ATT application error 0x{:02x}", self.0)
-            }
-            None => write!(formatter, "ATT profile error 0x{:02x}", self.0),
+            None => write!(formatter, "ATT application error 0x{:02x}", self.0),
         }
     }
 }
@@ -230,8 +231,6 @@ pub enum ErrorKind {
     /// An operation was used in a state that does not allow it, such as a
     /// second owner of the BLE host or a reentrant shutdown.
     Lifecycle,
-    /// The link or connection could not carry the request.
-    Transport,
     /// The native NimBLE host reported a failure. The error's
     /// [`source`](std::error::Error::source) is a [`BackendError`].
     Backend,
@@ -244,7 +243,6 @@ impl fmt::Display for ErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Lifecycle => "lifecycle error",
-            Self::Transport => "transport error",
             Self::Backend => "native backend error",
             Self::Encode => "encoding error",
         })
@@ -264,7 +262,10 @@ pub struct Error {
 
 #[derive(Debug)]
 enum Cause {
-    Message(&'static str),
+    Message {
+        operation: Option<&'static str>,
+        message: &'static str,
+    },
     Backend(BackendError),
     Encode(EncodeError),
 }
@@ -283,12 +284,16 @@ impl Error {
         }
     }
 
-    // Constructed by the controller and runtime in later tickets.
-    #[allow(dead_code)]
-    pub(crate) fn new(kind: ErrorKind, message: &'static str) -> Self {
+    /// A failure described by a fixed message, optionally naming the
+    /// operation that failed.
+    pub(crate) fn new(
+        kind: ErrorKind,
+        operation: Option<&'static str>,
+        message: &'static str,
+    ) -> Self {
         Self {
             kind,
-            cause: Cause::Message(message),
+            cause: Cause::Message { operation, message },
         }
     }
 }
@@ -296,7 +301,14 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.cause {
-            Cause::Message(message) => write!(formatter, "{}: {message}", self.kind),
+            Cause::Message {
+                operation: Some(operation),
+                message,
+            } => write!(formatter, "{}: {operation}: {message}", self.kind),
+            Cause::Message {
+                operation: None,
+                message,
+            } => write!(formatter, "{}: {message}", self.kind),
             Cause::Backend(error) => write!(formatter, "{}: {error}", self.kind),
             Cause::Encode(error) => write!(formatter, "{}: {error}", self.kind),
         }
@@ -306,7 +318,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.cause {
-            Cause::Message(_) => None,
+            Cause::Message { .. } => None,
             Cause::Backend(error) => Some(error),
             Cause::Encode(error) => Some(error),
         }
@@ -331,12 +343,13 @@ impl From<BackendError> for Error {
     }
 }
 
-/// A failure reported by the native NimBLE host.
+/// A failure reported by ESP-IDF or the native NimBLE host.
 ///
-/// It names the native operation and keeps the SDK status in its `Display`
-/// and `Debug` output for diagnosis, including statuses this crate does not
-/// recognise. When the status carries an ATT error from the peer,
-/// [`att_error`](Self::att_error) returns it.
+/// It names the native operation and keeps the SDK status, labelled with the
+/// status family the operation returns, in its `Display` and `Debug` output
+/// for diagnosis, including statuses this crate does not recognise. When a
+/// NimBLE host status carries an ATT error, [`att_error`](Self::att_error)
+/// returns it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackendError {
     operation: &'static str,
@@ -345,9 +358,13 @@ pub struct BackendError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BackendDetail {
+    /// An `esp_err_t` from an ESP-IDF port function.
+    EspError(i32),
     /// A NimBLE host status (`BLE_HS_*`, or an ATT/HCI/L2CAP/security error
     /// offset into its range).
-    Status(i32),
+    HostStatus(i32),
+    /// A NimBLE OS-layer status (`os_error_t`) or a shim's `-1`.
+    OsStatus(i32),
     OutOfMemory,
     InvalidLength(usize),
     OutOfRange {
@@ -370,12 +387,13 @@ impl BackendError {
         self.operation
     }
 
-    /// The ATT error carried by the native status, if it has one. A status
-    /// with an ATT code that servers may not return is not reported here but
-    /// stays visible in `Display`.
+    /// The ATT error carried by a NimBLE host status, if it has one. ESP-IDF
+    /// and OS-layer statuses never carry one, even when their values fall in
+    /// the same numeric range. A status with an unallocated ATT code is not
+    /// reported here but stays visible in `Display`.
     pub fn att_error(&self) -> Option<AttError> {
         match self.detail {
-            BackendDetail::Status(status)
+            BackendDetail::HostStatus(status)
                 if (ATT_STATUS_BASE..ATT_STATUS_BASE + 0x100).contains(&status) =>
             {
                 AttError::from_code((status - ATT_STATUS_BASE) as u8).ok()
@@ -389,16 +407,24 @@ impl fmt::Display for BackendError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let operation = self.operation;
         match self.detail {
-            BackendDetail::Status(status) => match self.att_error() {
+            BackendDetail::EspError(status) => write!(
+                formatter,
+                "{operation} failed with ESP-IDF error {status} (0x{status:x})"
+            ),
+            BackendDetail::HostStatus(status) => match self.att_error() {
                 Some(att) => write!(
                     formatter,
-                    "{operation} failed with NimBLE status {status} (0x{status:x}): {att}"
+                    "{operation} failed with NimBLE host status {status} (0x{status:x}): {att}"
                 ),
                 None => write!(
                     formatter,
-                    "{operation} failed with NimBLE status {status} (0x{status:x})"
+                    "{operation} failed with NimBLE host status {status} (0x{status:x})"
                 ),
             },
+            BackendDetail::OsStatus(status) => write!(
+                formatter,
+                "{operation} failed with NimBLE OS status {status} (0x{status:x})"
+            ),
             BackendDetail::OutOfMemory => write!(formatter, "{operation} could not allocate"),
             BackendDetail::InvalidLength(length) => {
                 write!(formatter, "{operation} rejected a length of {length} bytes")
@@ -422,7 +448,7 @@ mod tests {
     fn every_code_is_classified_once() {
         for code in 0..=u8::MAX {
             let accepted = AttError::from_code(code);
-            let sendable = matches!(code, 0x01..=0x13 | 0x80..=0x9f | 0xe0..=0xff);
+            let sendable = matches!(code, 0x01..=0x13 | 0x80..=0x9f | 0xfc..=0xff);
             assert_eq!(accepted.is_ok(), sendable, "0x{code:02x}");
             assert_eq!(AttError::try_from(code), accepted);
             match accepted {
@@ -479,10 +505,12 @@ mod tests {
             AttError::application(0x9f).unwrap().to_string(),
             "ATT application error 0x9f"
         );
-        assert_eq!(
-            AttError::from_code(0xe0).unwrap().to_string(),
-            "ATT profile error 0xe0"
-        );
+        for reserved in [0x00, 0x14, 0x7f, 0xa0, 0xe0, 0xfb] {
+            assert_eq!(
+                AttError::from_code(reserved).map_err(|error| error.code()),
+                Err(reserved)
+            );
+        }
     }
 
     #[test]
@@ -522,12 +550,28 @@ mod tests {
 
     #[test]
     fn backend_errors_stay_diagnosable_and_expose_att_causes() {
-        let unknown = BackendError::new("nimble_port_init", BackendDetail::Status(-7_654));
-        assert_eq!(unknown.operation(), "nimble_port_init");
+        let unknown = BackendError::new("ble_gap_terminate", BackendDetail::HostStatus(-7_654));
+        assert_eq!(unknown.operation(), "ble_gap_terminate");
         assert_eq!(unknown.att_error(), None);
         assert!(unknown.to_string().contains("-7654"), "{unknown}");
 
-        let att = BackendError::new("ble_gatts_notify_custom", BackendDetail::Status(0x10d));
+        // ESP_ERR_NO_MEM (0x101) and an OS status in the same numeric range
+        // are not mistaken for ATT errors.
+        for detail in [
+            BackendDetail::EspError(0x101),
+            BackendDetail::OsStatus(0x103),
+        ] {
+            let error = BackendError::new("op", detail);
+            assert_eq!(error.att_error(), None);
+            assert!(!error.to_string().contains("ATT"), "{error}");
+        }
+        assert!(
+            BackendError::new("nimble_port_init", BackendDetail::EspError(0x101))
+                .to_string()
+                .contains("ESP-IDF error 257 (0x101)")
+        );
+
+        let att = BackendError::new("ble_gatts_notify_custom", BackendDetail::HostStatus(0x10d));
         assert_eq!(
             att.att_error(),
             Some(AttError::INVALID_ATTRIBUTE_VALUE_LENGTH)
@@ -536,12 +580,12 @@ mod tests {
         assert!(att.to_string().contains("invalid attribute value length"));
 
         // An ATT code no server may return is not reported as an AttError.
-        let reserved = BackendError::new("op", BackendDetail::Status(0x150));
+        let reserved = BackendError::new("op", BackendDetail::HostStatus(0x150));
         assert_eq!(reserved.att_error(), None);
         assert!(reserved.to_string().contains("0x150"));
         for status in [0, 6, 0xff, 0x200, 0x20d] {
             assert_eq!(
-                BackendError::new("op", BackendDetail::Status(status)).att_error(),
+                BackendError::new("op", BackendDetail::HostStatus(status)).att_error(),
                 None,
                 "0x{status:x}"
             );
@@ -582,7 +626,7 @@ mod tests {
             Some(&encode)
         );
 
-        let lifecycle = Error::new(ErrorKind::Lifecycle, "the host is already owned");
+        let lifecycle = Error::new(ErrorKind::Lifecycle, None, "the host is already owned");
         assert_eq!(lifecycle.kind(), ErrorKind::Lifecycle);
         assert!(lifecycle.source().is_none());
         assert_eq!(
@@ -590,8 +634,8 @@ mod tests {
             "lifecycle error: the host is already owned"
         );
         assert_eq!(
-            Error::new(ErrorKind::Transport, "x").to_string(),
-            "transport error: x"
+            Error::new(ErrorKind::Lifecycle, Some("start"), "x").to_string(),
+            "lifecycle error: start: x"
         );
     }
 }

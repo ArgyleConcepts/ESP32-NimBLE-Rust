@@ -11,6 +11,10 @@
 //!   advertising data, and NimBLE's `ble_uuid*_t` values: the least significant
 //!   byte first. [`Uuid::to_wire_bytes`] of the same UUID starts `9e ca dc 24`.
 //!
+//! Wire bytes keep the UUID's own width. ATT PDUs carry only 16- and 128-bit
+//! UUIDs (Core Specification Vol 3, Part F, 3.2.1), so a 32-bit UUID sent in
+//! one must use its 128-bit form, [`Uuid::Uuid128`] of [`Uuid::to_u128`].
+//!
 //! A UUID keeps the width it was created with. A 16-bit UUID and its 128-bit
 //! expansion over the Bluetooth Base UUID are different values; compare
 //! [`Uuid::to_u128`] results to treat them as the same attribute type.
@@ -272,7 +276,9 @@ impl FromStr for Uuid {
     }
 }
 
-/// Encodes the wire-order bytes with no length prefix.
+/// Encodes the wire-order bytes at the UUID's own width, with no length
+/// prefix. ATT PDUs carry only 16- and 128-bit UUIDs, so a 32-bit UUID placed
+/// in one must first be converted to [`Uuid::Uuid128`] of [`Uuid::to_u128`].
 impl Encode for Uuid {
     fn encode(&self, writer: &mut ValueWriter<'_>) -> Result<(), EncodeError> {
         writer.write_bytes(self.to_wire_bytes().as_ref())

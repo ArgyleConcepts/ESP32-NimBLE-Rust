@@ -58,6 +58,28 @@ impl Operation {
             Self::Mtu => "ble_att_mtu",
         }
     }
+
+    /// Interpret a nonzero status in the family this operation returns.
+    fn status_detail(self, code: i32) -> BackendDetail {
+        match self {
+            // `nimble_port_init` and `nimble_port_deinit` return `esp_err_t`.
+            Self::HostInit | Self::HostDeinit => BackendDetail::EspError(code),
+            // The mbuf wrappers return `os_error_t` values or the shim's -1.
+            Self::MbufFromFlat
+            | Self::MbufLen
+            | Self::MbufAppend
+            | Self::MbufCopy
+            | Self::MbufFree => BackendDetail::OsStatus(code),
+            Self::InstallCallbacks
+            | Self::RemoveCallbacks
+            | Self::HostStart
+            | Self::HostStop
+            | Self::Notify
+            | Self::Terminate
+            | Self::AdvertisingStop
+            | Self::Mtu => BackendDetail::HostStatus(code),
+        }
+    }
 }
 
 /// A failed native operation. Status codes are the SDK's own values; they are
@@ -142,7 +164,7 @@ impl From<NativeError> for Error {
     fn from(error: NativeError) -> Self {
         let operation = error.operation().name();
         let detail = match error {
-            NativeError::Status { code, .. } => BackendDetail::Status(code),
+            NativeError::Status { operation, code } => operation.status_detail(code),
             NativeError::OutOfMemory { .. } => BackendDetail::OutOfMemory,
             NativeError::InvalidLength { length, .. } => BackendDetail::InvalidLength(length),
             NativeError::OutOfRange { offset, length, .. } => {
@@ -151,12 +173,14 @@ impl From<NativeError> for Error {
             NativeError::Busy { .. } => {
                 return Error::new(
                     ErrorKind::Lifecycle,
+                    Some(operation),
                     "the native host callbacks already have an owner",
                 )
             }
             NativeError::Reentrant { .. } => {
                 return Error::new(
                     ErrorKind::Lifecycle,
+                    Some(operation),
                     "the operation cannot run from inside a BLE callback",
                 )
             }
@@ -301,16 +325,34 @@ mod tests {
         use std::error::Error as _;
 
         let unknown = Error::from(NativeError::Status {
-            operation: Operation::HostInit,
+            operation: Operation::Terminate,
             code: -31_337,
         });
         assert_eq!(unknown.kind(), ErrorKind::Backend);
         let backend = unknown.backend().expect("a backend cause");
-        assert_eq!(backend.operation(), "nimble_port_init");
+        assert_eq!(backend.operation(), "ble_gap_terminate");
         assert_eq!(backend.att_error(), None);
-        assert!(unknown.to_string().contains("nimble_port_init"));
+        assert!(unknown.to_string().contains("ble_gap_terminate"));
         assert!(unknown.to_string().contains("-31337"));
         assert!(unknown.source().is_some());
+
+        // ESP_ERR_NO_MEM from the port and an OS status in the ATT numeric
+        // range keep their own meaning.
+        let esp = Error::from(NativeError::Status {
+            operation: Operation::HostInit,
+            code: 0x101,
+        });
+        assert_eq!(esp.backend().and_then(BackendError::att_error), None);
+        assert!(
+            esp.to_string().contains("ESP-IDF error 257 (0x101)"),
+            "{esp}"
+        );
+        let os = Error::from(NativeError::Status {
+            operation: Operation::MbufAppend,
+            code: 0x101,
+        });
+        assert_eq!(os.backend().and_then(BackendError::att_error), None);
+        assert!(os.to_string().contains("OS status"), "{os}");
 
         let att = Error::from(NativeError::Status {
             operation: Operation::Notify,
@@ -349,17 +391,24 @@ mod tests {
             assert_eq!(converted.backend().map(BackendError::operation), Some(name));
         }
 
-        for error in [
-            NativeError::Busy {
-                operation: Operation::InstallCallbacks,
-            },
-            NativeError::Reentrant {
-                operation: Operation::RemoveCallbacks,
-            },
+        for (error, name) in [
+            (
+                NativeError::Busy {
+                    operation: Operation::InstallCallbacks,
+                },
+                "install host callbacks",
+            ),
+            (
+                NativeError::Reentrant {
+                    operation: Operation::RemoveCallbacks,
+                },
+                "remove host callbacks",
+            ),
         ] {
             let converted = Error::from(error);
             assert_eq!(converted.kind(), ErrorKind::Lifecycle);
             assert!(converted.backend().is_none());
+            assert!(converted.to_string().contains(name), "{converted}");
         }
     }
 

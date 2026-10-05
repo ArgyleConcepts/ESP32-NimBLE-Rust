@@ -190,8 +190,9 @@ pub trait Decode<'a>: Sized {
 /// A bounded writer that appends encoded bytes to a caller's `Vec<u8>`.
 ///
 /// The capacity limits the bytes this writer may add, not the vector's
-/// allocation. Every write either succeeds completely or leaves the output
-/// unchanged.
+/// allocation. [`write_bytes`](Self::write_bytes) and [`write`](Self::write)
+/// either succeed completely or leave the output unchanged; calling
+/// [`Encode::encode`] directly gives no such rollback.
 #[derive(Debug)]
 pub struct ValueWriter<'a> {
     output: &'a mut Vec<u8>,
@@ -253,7 +254,14 @@ impl<'a> ValueWriter<'a> {
     /// wrote are removed before the error is returned.
     pub fn write<T: Encode + ?Sized>(&mut self, value: &T) -> Result<(), EncodeError> {
         let length = self.output.len();
-        let result = value.encode(self);
+        // Encode through a reborrowed writer: even an implementation that
+        // replaces the writer it is given cannot detach this one from its
+        // output, so the rollback below always applies to the right bytes.
+        let result = value.encode(&mut ValueWriter {
+            output: &mut *self.output,
+            start: self.start,
+            capacity: self.capacity,
+        });
         if result.is_err() {
             self.output.truncate(length);
         }
@@ -264,7 +272,9 @@ impl<'a> ValueWriter<'a> {
 /// A cursor over received bytes.
 ///
 /// Reads never panic: a read past the end returns
-/// [`DecodeError::Truncated`] and consumes nothing.
+/// [`DecodeError::Truncated`] and consumes nothing. [`read`](Self::read)
+/// rewinds the reader if decoding fails; calling [`Decode::decode`] directly
+/// gives no such rollback.
 #[derive(Clone, Debug)]
 pub struct ValueReader<'a> {
     data: &'a [u8],
@@ -339,12 +349,13 @@ impl<'a> ValueReader<'a> {
         bytes
     }
 
-    /// Decode one `T`. If decoding fails, the reader is left where it was.
+    /// Decode one `T`. If decoding fails, the reader is left exactly as it
+    /// was, even if the implementation replaced it.
     pub fn read<T: Decode<'a>>(&mut self) -> Result<T, DecodeError> {
-        let position = self.position;
+        let saved = self.clone();
         let result = T::decode(self);
         if result.is_err() {
-            self.position = position;
+            *self = saved;
         }
         result
     }
@@ -814,6 +825,44 @@ mod tests {
         let mut reader = ValueReader::new(&[1, 9]);
         assert!(reader.read::<Named<'_>>().is_err());
         assert_eq!(reader.position(), 0, "a failed read rewinds the reader");
+    }
+
+    /// Codecs that replace the writer or reader they are given, then fail.
+    struct ReplacesWriter;
+
+    impl Encode for ReplacesWriter {
+        fn encode(&self, writer: &mut ValueWriter<'_>) -> Result<(), EncodeError> {
+            writer.write_bytes(&[0xaa])?;
+            *writer = ValueWriter::new(Box::leak(Box::default()), 0);
+            Err(EncodeError::InvalidValue { reason: "replaced" })
+        }
+    }
+
+    struct ReplacesReader;
+
+    impl<'a> Decode<'a> for ReplacesReader {
+        fn decode(reader: &mut ValueReader<'a>) -> Result<Self, DecodeError> {
+            reader.read_bytes(1)?;
+            *reader = ValueReader::new(&[]);
+            Err(DecodeError::InvalidValue { reason: "replaced" })
+        }
+    }
+
+    #[test]
+    fn rollback_survives_codecs_that_replace_their_writer_or_reader() {
+        let mut output = vec![1];
+        let mut writer = ValueWriter::new(&mut output, 4);
+        writer.write(&2_u8).unwrap();
+        assert!(writer.write(&ReplacesWriter).is_err());
+        assert_eq!((writer.len(), writer.remaining()), (1, 3));
+        writer.write(&3_u8).unwrap();
+        assert_eq!(output, [1, 2, 3]);
+
+        let mut reader = ValueReader::new(&[1, 2, 3]);
+        assert_eq!(reader.read::<u8>(), Ok(1));
+        assert!(reader.read::<ReplacesReader>().is_err());
+        assert_eq!((reader.position(), reader.remaining()), (1, 2));
+        assert_eq!(reader.read::<u16>(), Ok(0x0302));
     }
 
     #[test]
