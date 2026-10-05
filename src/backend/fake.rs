@@ -11,6 +11,7 @@
 //! not target, SDK, or hardware validation.
 
 use super::dispatch::{Delivery, EventDispatcher};
+use super::gap::GapEvent;
 use super::native::{
     check, native_length, Backend, NativeError, NativeEvent, NativeResult, Operation,
 };
@@ -213,6 +214,11 @@ impl FakeBackend {
         self.lock().mbufs.get(&id).map(|record| record.state)
     }
 
+    /// Current bytes of a buffer, including after it was released.
+    pub(crate) fn mbuf_data(&self, id: u32) -> Option<Vec<u8>> {
+        self.lock().mbufs.get(&id).map(|record| record.data.clone())
+    }
+
     pub(crate) fn violations(&self) -> Vec<LedgerViolation> {
         self.lock().violations.clone()
     }
@@ -248,8 +254,19 @@ impl FakeBackend {
     /// Deliver a native callback through the installed dispatcher, as the
     /// NimBLE host task would.
     pub(crate) fn inject(&self, event: NativeEvent) -> Option<Delivery> {
-        let dispatcher = self.lock().dispatcher.clone()?;
-        Some(dispatcher.deliver(event))
+        // Register the delivery while holding the fake's callback slot, as
+        // the ESP trampolines do, so `remove_callbacks` waits for it.
+        let state = self.lock();
+        let dispatcher = state.dispatcher.clone()?;
+        let active = dispatcher.begin();
+        drop(state);
+        Some(match active {
+            Some(active) => {
+                active.deliver(event);
+                Delivery::Delivered
+            }
+            None => Delivery::Dropped,
+        })
     }
 
     /// Record a call, consume a scripted result, then stop at a hold if one
@@ -350,11 +367,24 @@ impl Backend for FakeBackend {
     fn remove_callbacks(&self) -> NativeResult<()> {
         let code = self.enter(Operation::RemoveCallbacks, NativeCall::RemoveCallbacks);
         check(Operation::RemoveCallbacks, code)?;
-        let dispatcher = self.lock().dispatcher.take();
+        let mut state = self.lock();
+        if state
+            .dispatcher
+            .as_ref()
+            .is_some_and(|dispatcher| dispatcher.is_delivering_on_current_thread())
+        {
+            return Err(NativeError::Reentrant {
+                operation: Operation::RemoveCallbacks,
+            });
+        }
+        let dispatcher = state.dispatcher.take();
+        drop(state);
         if let Some(dispatcher) = dispatcher {
-            // Same quiescence rule as the ESP backend: no delivery may still
-            // be running once callbacks are removed.
-            let _ = dispatcher.detach();
+            // Same quiescence rule as the ESP backend: no delivery that saw
+            // the installed callbacks is still running once this returns.
+            dispatcher
+                .detach()
+                .expect("a non-reentrant detach cannot fail");
         }
         Ok(())
     }
@@ -418,14 +448,21 @@ impl Backend for FakeBackend {
                 length: data.len(),
             },
         );
-        check(Operation::MbufAppend, code)?;
+        // Like `os_mbuf_append`, a failure does not roll back: model an
+        // allocation that ran out after copying the first half.
+        let copied = if code == 0 {
+            data.len()
+        } else {
+            data.len() / 2
+        };
         self.with_live(mbuf.id, Operation::MbufAppend, |record| {
-            record.data.extend_from_slice(data)
+            record.data.extend_from_slice(&data[..copied])
         })
         .ok_or(NativeError::Status {
             operation: Operation::MbufAppend,
             code: -1,
-        })
+        })?;
+        check(Operation::MbufAppend, code)
     }
 
     fn mbuf_copy(
@@ -485,6 +522,14 @@ impl Backend for FakeBackend {
                 .notifications
                 .push((connection, attribute, data));
         }
+        // NimBLE reports the result through the connection's GAP callback on
+        // this thread before returning, for success and failure alike.
+        self.inject(NativeEvent::Gap(GapEvent::NotifyTransmit {
+            connection,
+            attribute,
+            status: code,
+            indication: false,
+        }));
         check(Operation::Notify, code)
     }
 
@@ -512,7 +557,6 @@ impl Backend for FakeBackend {
 mod tests {
     use super::*;
     use crate::backend::dispatch::EventSink;
-    use crate::backend::gap::GapEvent;
     use crate::backend::mbuf::OwnedMbuf;
     use std::sync::mpsc;
     use std::thread;
@@ -671,15 +715,42 @@ mod tests {
         );
     }
 
-    /// Notify is held mid-call while another thread removes callbacks and an
-    /// event is injected; the observable order is the same on every run.
-    fn overlapping_notify_and_shutdown() -> (Vec<NativeCall>, Vec<NativeEvent>, Option<Delivery>) {
+    /// Blocks the first event inside the sink until its gate is released.
+    struct GatedRecorder {
+        gate: Arc<Gate>,
+        events: Mutex<Vec<NativeEvent>>,
+    }
+
+    impl EventSink for GatedRecorder {
+        fn on_event(&self, event: NativeEvent) {
+            let first = self.events.lock().unwrap().is_empty();
+            self.events.lock().unwrap().push(event);
+            if first {
+                self.gate.pass();
+            }
+        }
+    }
+
+    /// Notify is held mid-call and a callback is held inside the sink while
+    /// another thread removes callbacks. Removal must wait for the in-flight
+    /// callback, later events must be dropped, and the observable result must
+    /// be the same on every run.
+    fn overlapping_notify_callback_and_shutdown() -> (
+        Vec<NativeCall>,
+        Vec<NativeEvent>,
+        Option<Delivery>,
+        Vec<u32>,
+    ) {
         let fake = FakeBackend::new();
         let dispatcher = Arc::new(EventDispatcher::new());
-        let recorder = Arc::new(Recorder::default());
-        dispatcher.attach(recorder.clone()).unwrap();
-        fake.install_callbacks(dispatcher).unwrap();
-        let held = fake.hold(Operation::Notify);
+        let callback_gate = Arc::new(Gate::new());
+        let sink = Arc::new(GatedRecorder {
+            gate: callback_gate.clone(),
+            events: Mutex::new(Vec::new()),
+        });
+        dispatcher.attach(sink.clone()).unwrap();
+        fake.install_callbacks(dispatcher.clone()).unwrap();
+        let held_notify = fake.hold(Operation::Notify);
 
         let notifying = {
             let fake = fake.clone();
@@ -689,33 +760,43 @@ mod tests {
                     .notify(4, 12)
             })
         };
-        held.wait_entered();
-        assert_eq!(
-            fake.inject(NativeEvent::HostSynced),
-            Some(Delivery::Delivered)
-        );
+        held_notify.wait_entered();
 
-        let (done_tx, done_rx) = mpsc::channel();
-        let stopping = {
+        let callback = {
+            let fake = fake.clone();
+            thread::spawn(move || fake.inject(NativeEvent::HostSynced))
+        };
+        callback_gate.wait_entered();
+
+        let (removed_tx, removed_rx) = mpsc::channel();
+        let removing = {
             let fake = fake.clone();
             thread::spawn(move || {
                 fake.remove_callbacks().unwrap();
-                done_tx.send(()).unwrap();
+                removed_tx.send(()).unwrap();
             })
         };
-        done_rx.recv().unwrap();
+        dispatcher.wait_until_detaching();
+        assert!(
+            removed_rx.try_recv().is_err(),
+            "removal returned while a callback was still running"
+        );
         let late = fake.inject(NativeEvent::HostReset { reason: 2 });
-        held.release();
+
+        callback_gate.release();
+        assert_eq!(callback.join().unwrap(), Some(Delivery::Delivered));
+        removed_rx.recv().unwrap();
+        removing.join().unwrap();
+        held_notify.release();
         notifying.join().unwrap().unwrap();
-        stopping.join().unwrap();
         fake.assert_balanced().unwrap();
-        let events = recorder.0.lock().unwrap().clone();
-        (fake.calls(), events, late)
+        let events = sink.events.lock().unwrap().clone();
+        (fake.calls(), events, late, fake.live_mbufs())
     }
 
     #[test]
     fn coordinated_overlap_is_deterministic_across_repeated_runs() {
-        let first = overlapping_notify_and_shutdown();
+        let first = overlapping_notify_callback_and_shutdown();
         assert_eq!(
             first.0,
             [
@@ -729,11 +810,117 @@ mod tests {
                 NativeCall::RemoveCallbacks,
             ]
         );
+        // The in-flight callback completed; the late event and the notify's
+        // transmit event, both after removal, were not delivered.
         assert_eq!(first.1, [NativeEvent::HostSynced]);
         assert_eq!(first.2, None);
+        assert!(first.3.is_empty());
         for _ in 0..50 {
-            assert_eq!(overlapping_notify_and_shutdown(), first);
+            assert_eq!(overlapping_notify_callback_and_shutdown(), first);
         }
+    }
+
+    #[test]
+    fn notify_reports_its_result_through_the_gap_callback_before_returning() {
+        struct ThreadRecorder(Mutex<Vec<(thread::ThreadId, NativeEvent)>>);
+        impl EventSink for ThreadRecorder {
+            fn on_event(&self, event: NativeEvent) {
+                self.0.lock().unwrap().push((thread::current().id(), event));
+            }
+        }
+        let fake = FakeBackend::new();
+        let dispatcher = Arc::new(EventDispatcher::new());
+        let sink = Arc::new(ThreadRecorder(Mutex::new(Vec::new())));
+        dispatcher.attach(sink.clone()).unwrap();
+        fake.install_callbacks(dispatcher).unwrap();
+
+        OwnedMbuf::from_slice(&fake, b"ok")
+            .unwrap()
+            .notify(1, 5)
+            .unwrap();
+        fake.fail_next(Operation::Notify, 14);
+        assert!(OwnedMbuf::from_slice(&fake, b"no")
+            .unwrap()
+            .notify(1, 5)
+            .is_err());
+        let caller = thread::current().id();
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            [
+                (
+                    caller,
+                    NativeEvent::Gap(GapEvent::NotifyTransmit {
+                        connection: 1,
+                        attribute: 5,
+                        status: 0,
+                        indication: false
+                    })
+                ),
+                (
+                    caller,
+                    NativeEvent::Gap(GapEvent::NotifyTransmit {
+                        connection: 1,
+                        attribute: 5,
+                        status: 14,
+                        indication: false
+                    })
+                ),
+            ]
+        );
+        fake.remove_callbacks().unwrap();
+        fake.assert_balanced().unwrap();
+    }
+
+    #[test]
+    fn removing_callbacks_from_inside_a_callback_is_refused_and_changes_nothing() {
+        struct Remover {
+            fake: FakeBackend,
+            result: Mutex<Option<NativeResult<()>>>,
+        }
+        impl EventSink for Remover {
+            fn on_event(&self, _event: NativeEvent) {
+                *self.result.lock().unwrap() = Some(self.fake.remove_callbacks());
+            }
+        }
+        let fake = FakeBackend::new();
+        let dispatcher = Arc::new(EventDispatcher::new());
+        let sink = Arc::new(Remover {
+            fake: fake.clone(),
+            result: Mutex::new(None),
+        });
+        dispatcher.attach(sink.clone()).unwrap();
+        fake.install_callbacks(dispatcher.clone()).unwrap();
+        assert_eq!(
+            fake.inject(NativeEvent::HostSynced),
+            Some(Delivery::Delivered)
+        );
+        assert_eq!(
+            *sink.result.lock().unwrap(),
+            Some(Err(NativeError::Reentrant {
+                operation: Operation::RemoveCallbacks
+            }))
+        );
+        // Still installed and attached; a later removal from outside works.
+        assert!(dispatcher.is_attached());
+        assert_eq!(
+            fake.inject(NativeEvent::HostSynced),
+            Some(Delivery::Delivered)
+        );
+        fake.remove_callbacks().unwrap();
+        assert!(!dispatcher.is_attached());
+        assert_eq!(fake.inject(NativeEvent::HostSynced), None);
+    }
+
+    #[test]
+    fn a_failed_raw_append_keeps_a_partial_payload_like_nimble() {
+        let fake = FakeBackend::new();
+        let mut raw = fake.mbuf_from_flat(b"ab").unwrap();
+        fake.fail_next(Operation::MbufAppend, 3);
+        assert!(fake.mbuf_append(&mut raw, b"cdef").is_err());
+        assert_eq!(fake.mbuf_data(1), Some(b"abcd".to_vec()));
+        assert_eq!(fake.mbuf_state(1), Some(MbufState::Live));
+        fake.mbuf_free(raw).unwrap();
+        fake.assert_balanced().unwrap();
     }
 
     #[test]

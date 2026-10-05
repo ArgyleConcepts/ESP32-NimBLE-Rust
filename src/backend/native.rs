@@ -54,6 +54,9 @@ pub(crate) enum NativeError {
     },
     /// Callbacks are already installed, so another owner holds the host.
     Busy { operation: Operation },
+    /// The call was made from inside a native callback delivery, where it
+    /// would have to wait for itself. Nothing was changed.
+    Reentrant { operation: Operation },
 }
 
 impl NativeError {
@@ -63,7 +66,8 @@ impl NativeError {
             | Self::OutOfMemory { operation }
             | Self::InvalidLength { operation, .. }
             | Self::OutOfRange { operation, .. }
-            | Self::Busy { operation } => operation,
+            | Self::Busy { operation }
+            | Self::Reentrant { operation } => operation,
         }
     }
 }
@@ -91,6 +95,10 @@ impl fmt::Display for NativeError {
             } => write!(
                 formatter,
                 "{operation:?} range at offset {offset} with length {length} is outside the buffer"
+            ),
+            Self::Reentrant { operation } => write!(
+                formatter,
+                "{operation:?} cannot run from inside a native callback"
             ),
             Self::Busy { operation } => {
                 write!(
@@ -149,6 +157,8 @@ pub(crate) trait Backend: Send + Sync {
     /// [`NativeError::Busy`] if callbacks are already installed.
     fn install_callbacks(&self, dispatcher: Arc<EventDispatcher>) -> NativeResult<()>;
     /// Clear native callbacks and wait for in-flight deliveries to finish.
+    /// Fails with [`NativeError::Reentrant`], changing nothing, when called
+    /// from inside a delivery.
     fn remove_callbacks(&self) -> NativeResult<()>;
     /// Start the host task.
     fn host_start(&self) -> NativeResult<()>;
@@ -159,7 +169,9 @@ pub(crate) trait Backend: Send + Sync {
     fn mbuf_from_flat(&self, data: &[u8]) -> NativeResult<Self::Mbuf>;
     /// Length of the full buffer chain.
     fn mbuf_len(&self, mbuf: &Self::Mbuf) -> usize;
-    /// Append `data` to the chain; on failure the buffer remains owned.
+    /// Append `data` to the chain. On failure the buffer remains owned, but
+    /// NimBLE does not roll back: the chain may already hold a prefix of
+    /// `data` and report the longer length.
     fn mbuf_append(&self, mbuf: &mut Self::Mbuf, data: &[u8]) -> NativeResult<()>;
     /// Copy `destination.len()` bytes starting at `offset`.
     fn mbuf_copy(
@@ -172,7 +184,10 @@ pub(crate) trait Backend: Send + Sync {
     fn mbuf_free(&self, mbuf: Self::Mbuf) -> NativeResult<()>;
 
     /// Send a notification. The SDK takes ownership of `mbuf` whether or not
-    /// the call succeeds.
+    /// the call succeeds. Before returning, NimBLE reports the result through
+    /// the connection's GAP callback on the calling thread, so a
+    /// [`GapEvent::NotifyTransmit`] can be delivered synchronously from inside
+    /// this call. Callers must not hold locks that their event sink takes.
     fn notify(&self, connection: u16, attribute: u16, mbuf: Self::Mbuf) -> NativeResult<()>;
     /// Terminate a connection as a remote-user termination.
     fn terminate(&self, connection: u16) -> NativeResult<()>;
@@ -213,6 +228,9 @@ mod tests {
                 operation: Operation::MbufCopy,
                 offset: 1,
                 length: 2,
+            },
+            NativeError::Reentrant {
+                operation: Operation::RemoveCallbacks,
             },
             NativeError::Busy {
                 operation: Operation::InstallCallbacks,

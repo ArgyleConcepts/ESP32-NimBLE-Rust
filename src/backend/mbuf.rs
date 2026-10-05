@@ -4,6 +4,10 @@
 //! explicitly with [`OwnedMbuf::free`], by transferring it to the SDK with
 //! [`OwnedMbuf::notify`], or on drop. Both consuming methods take `self`, so
 //! safe code cannot free or transfer the same buffer twice.
+//!
+//! [`OwnedMbuf::append`] also takes `self`: NimBLE does not roll back a failed
+//! append, so the chain may hold a partial payload. A failed append releases
+//! the buffer instead of letting a corrupted payload be sent.
 
 use super::native::{Backend, NativeError, NativeResult, Operation};
 
@@ -36,13 +40,24 @@ impl<'b, B: Backend> OwnedMbuf<'b, B> {
         self.len() == 0
     }
 
-    /// Append `data`. On failure the buffer is unchanged and still owned.
-    pub(crate) fn append(&mut self, data: &[u8]) -> NativeResult<()> {
+    /// Append `data` and return the extended buffer. On failure the buffer
+    /// is released (the SDK may have appended part of `data`) and the error is
+    /// returned. A chain longer than the SDK's `u16` packet length is rejected
+    /// before any native call, because NimBLE's length field would wrap.
+    pub(crate) fn append(mut self, data: &[u8]) -> NativeResult<Self> {
+        let total = self.len().checked_add(data.len());
+        if total.is_none_or(|total| total > usize::from(u16::MAX)) {
+            return Err(NativeError::InvalidLength {
+                operation: Operation::MbufAppend,
+                length: data.len(),
+            });
+        }
         let raw = self
             .raw
             .as_mut()
             .expect("an OwnedMbuf holds its buffer until it is consumed");
-        self.backend.mbuf_append(raw, data)
+        self.backend.mbuf_append(raw, data)?;
+        Ok(self)
     }
 
     /// Copy `destination.len()` bytes starting at `offset`.
@@ -101,8 +116,10 @@ mod tests {
     fn a_buffer_round_trips_and_is_freed_on_drop_in_call_order() {
         let fake = FakeBackend::new();
         {
-            let mut mbuf = OwnedMbuf::from_slice(&fake, b"head").unwrap();
-            mbuf.append(b"-tail").unwrap();
+            let mbuf = OwnedMbuf::from_slice(&fake, b"head")
+                .unwrap()
+                .append(b"-tail")
+                .unwrap();
             assert_eq!(mbuf.len(), 9);
             assert_eq!(mbuf.to_vec().unwrap(), b"head-tail");
             let mut middle = [0; 3];
@@ -113,6 +130,7 @@ mod tests {
             fake.calls(),
             [
                 NativeCall::MbufFromFlat { id: 1, length: 4 },
+                NativeCall::MbufLen { id: 1 },
                 NativeCall::MbufAppend { id: 1, length: 5 },
                 NativeCall::MbufLen { id: 1 },
                 NativeCall::MbufLen { id: 1 },
@@ -138,10 +156,10 @@ mod tests {
     #[test]
     fn an_empty_payload_is_a_valid_empty_buffer() {
         let fake = FakeBackend::new();
-        let mut mbuf = OwnedMbuf::from_slice(&fake, &[]).unwrap();
+        let mbuf = OwnedMbuf::from_slice(&fake, &[]).unwrap();
         assert!(mbuf.is_empty());
         assert_eq!(mbuf.to_vec().unwrap(), Vec::<u8>::new());
-        mbuf.append(b"z").unwrap();
+        let mbuf = mbuf.append(b"z").unwrap();
         assert!(!mbuf.is_empty());
         drop(mbuf);
         fake.assert_balanced().unwrap();
@@ -193,19 +211,40 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_append_keeps_the_buffer_owned_and_unchanged() {
+    fn a_failed_append_releases_the_partially_appended_buffer() {
         let fake = FakeBackend::new();
         fake.fail_next(Operation::MbufAppend, 3);
-        let mut mbuf = OwnedMbuf::from_slice(&fake, b"keep").unwrap();
+        let mbuf = OwnedMbuf::from_slice(&fake, b"keep").unwrap();
         assert_eq!(
-            mbuf.append(b"more"),
-            Err(NativeError::Status {
+            mbuf.append(b"more").err(),
+            Some(NativeError::Status {
                 operation: Operation::MbufAppend,
                 code: 3
             })
         );
-        assert_eq!(mbuf.to_vec().unwrap(), b"keep");
-        assert_eq!(mbuf.free(), Ok(()));
+        // Like NimBLE, the fake kept part of the payload; the buffer was
+        // released rather than left available to send.
+        assert_eq!(fake.mbuf_data(1), Some(b"keepmo".to_vec()));
+        assert_eq!(fake.mbuf_state(1), Some(MbufState::Freed));
+        fake.assert_balanced().unwrap();
+    }
+
+    #[test]
+    fn a_chain_longer_than_the_native_length_is_rejected_without_a_native_call() {
+        let fake = FakeBackend::new();
+        let full = vec![0; usize::from(u16::MAX)];
+        let mbuf = OwnedMbuf::from_slice(&fake, &full).unwrap();
+        assert_eq!(
+            mbuf.append(b"x").err(),
+            Some(NativeError::InvalidLength {
+                operation: Operation::MbufAppend,
+                length: 1
+            })
+        );
+        assert!(!fake
+            .calls()
+            .iter()
+            .any(|call| matches!(call, NativeCall::MbufAppend { .. })));
         assert_eq!(fake.mbuf_state(1), Some(MbufState::Freed));
         fake.assert_balanced().unwrap();
     }

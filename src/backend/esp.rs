@@ -40,12 +40,19 @@ fn installed() -> MutexGuard<'static, Option<Arc<EventDispatcher>>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Deliver without holding the slot lock, so removal can wait for quiescence
-/// in the dispatcher instead of blocking here.
+/// Register the delivery while holding the slot lock, then run the sink
+/// without it. `remove_callbacks` empties the slot before detaching, so every
+/// delivery that saw the installed dispatcher is registered before the detach
+/// starts waiting, and none can reach a sink attached later.
 fn deliver(event: NativeEvent) {
-    let dispatcher = installed().clone();
-    if let Some(dispatcher) = dispatcher {
-        dispatcher.deliver(event);
+    let slot = installed();
+    let dispatcher = slot.clone();
+    let active = dispatcher
+        .as_ref()
+        .and_then(|dispatcher| dispatcher.begin());
+    drop(slot);
+    if let Some(active) = active {
+        active.deliver(event);
     }
 }
 
@@ -158,17 +165,27 @@ impl Backend for EspBackend {
     }
 
     fn remove_callbacks(&self) -> NativeResult<()> {
+        let mut slot = installed();
+        if slot
+            .as_ref()
+            .is_some_and(|dispatcher| dispatcher.is_delivering_on_current_thread())
+        {
+            return Err(NativeError::Reentrant {
+                operation: Operation::RemoveCallbacks,
+            });
+        }
         // SAFETY: clearing the callbacks stops new native deliveries.
         unsafe {
             bindings::argyle_nimble_set_sync_callback(None);
             bindings::argyle_nimble_set_reset_callback(None);
         }
-        let dispatcher = installed().take();
+        let dispatcher = slot.take();
+        drop(slot);
         if let Some(dispatcher) = dispatcher {
-            // Wait for callbacks that started before the clear. A removal from
-            // inside a callback cannot wait for itself and leaves delivery to
-            // finish on its own.
-            let _ = dispatcher.detach();
+            // Wait for callbacks that registered before the slot was emptied.
+            dispatcher
+                .detach()
+                .expect("a non-reentrant detach cannot fail");
         }
         Ok(())
     }

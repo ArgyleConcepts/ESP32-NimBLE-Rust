@@ -39,11 +39,42 @@ struct DispatchState {
     /// Threads currently inside `sink.on_event`.
     delivering: Vec<ThreadId>,
     detaching: bool,
+    /// Incremented each time a detach completes, so a detach that waited for
+    /// another one does not remove a sink attached in between.
+    epoch: u64,
+    /// Detaches waiting for another detach to finish (test coordination).
+    waiting_detaches: usize,
 }
 
 pub(crate) struct EventDispatcher {
     state: Mutex<DispatchState>,
     changed: Condvar,
+}
+
+/// A registered delivery. Registration happens in [`EventDispatcher::begin`],
+/// so a detach that starts afterwards waits for it. Dropping the value
+/// deregisters it, including when the sink panics.
+pub(crate) struct ActiveDelivery<'d> {
+    dispatcher: &'d EventDispatcher,
+    sink: Arc<dyn EventSink>,
+    thread: ThreadId,
+}
+
+impl ActiveDelivery<'_> {
+    pub(crate) fn deliver(self, event: NativeEvent) {
+        self.sink.on_event(event);
+    }
+}
+
+impl Drop for ActiveDelivery<'_> {
+    fn drop(&mut self) {
+        let mut state = self.dispatcher.lock();
+        if let Some(position) = state.delivering.iter().position(|id| *id == self.thread) {
+            state.delivering.swap_remove(position);
+        }
+        drop(state);
+        self.dispatcher.changed.notify_all();
+    }
 }
 
 impl EventDispatcher {
@@ -53,16 +84,26 @@ impl EventDispatcher {
                 sink: None,
                 delivering: Vec::new(),
                 detaching: false,
+                epoch: 0,
+                waiting_detaches: 0,
             }),
             changed: Condvar::new(),
         }
     }
 
     fn lock(&self) -> MutexGuard<'_, DispatchState> {
-        // A panic while holding this lock aborts on ESP targets; in host tests
-        // the state is still consistent because every update is a single step.
+        // Every update below is a single step under the lock, and delivery
+        // registration is undone by a drop guard, so the state stays
+        // consistent even if a host-test sink panicked while another thread
+        // held the lock. ESP targets abort on panic.
         self.state
             .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn wait<'s>(&self, state: MutexGuard<'s, DispatchState>) -> MutexGuard<'s, DispatchState> {
+        self.changed
+            .wait(state)
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
@@ -79,51 +120,82 @@ impl EventDispatcher {
         self.lock().sink.is_some()
     }
 
+    /// Whether the calling thread is inside a delivery from this dispatcher.
+    pub(crate) fn is_delivering_on_current_thread(&self) -> bool {
+        let current = thread::current().id();
+        self.lock().delivering.contains(&current)
+    }
+
+    /// Register a delivery to the attached sink, or return `None` when no
+    /// sink is attached or a detach has started. Backends call this while
+    /// still holding their own callback-slot lock, so removing callbacks and
+    /// then detaching always waits for every delivery that saw the slot.
+    pub(crate) fn begin(&self) -> Option<ActiveDelivery<'_>> {
+        let thread = thread::current().id();
+        let mut state = self.lock();
+        if state.detaching {
+            return None;
+        }
+        let sink = state.sink.clone()?;
+        state.delivering.push(thread);
+        Some(ActiveDelivery {
+            dispatcher: self,
+            sink,
+            thread,
+        })
+    }
+
     /// Forward one event. The sink is called without holding the lock, so a
     /// sink may deliver nested events or query the dispatcher.
     pub(crate) fn deliver(&self, event: NativeEvent) -> Delivery {
-        let current = thread::current().id();
-        let sink = {
-            let mut state = self.lock();
-            match state.sink.clone() {
-                Some(sink) if !state.detaching => {
-                    state.delivering.push(current);
-                    sink
-                }
-                _ => return Delivery::Dropped,
+        match self.begin() {
+            Some(active) => {
+                active.deliver(event);
+                Delivery::Delivered
             }
-        };
-        sink.on_event(event);
-        let mut state = self.lock();
-        if let Some(position) = state.delivering.iter().position(|id| *id == current) {
-            state.delivering.swap_remove(position);
+            None => Delivery::Dropped,
         }
-        drop(state);
-        self.changed.notify_all();
-        Delivery::Delivered
     }
 
     /// Remove the sink and wait for in-flight deliveries to return. New
-    /// deliveries are dropped as soon as detaching starts.
+    /// deliveries are dropped as soon as detaching starts. A detach that finds
+    /// another detach in progress waits for it and then returns `None`.
     pub(crate) fn detach(&self) -> Result<Option<Arc<dyn EventSink>>, DispatchError> {
         let current = thread::current().id();
         let mut state = self.lock();
         if state.delivering.contains(&current) {
             return Err(DispatchError::DetachFromCallback);
         }
+        if state.detaching {
+            let epoch = state.epoch;
+            state.waiting_detaches += 1;
+            self.changed.notify_all();
+            while state.epoch == epoch {
+                state = self.wait(state);
+            }
+            state.waiting_detaches -= 1;
+            return Ok(None);
+        }
         state.detaching = true;
         self.changed.notify_all();
         while !state.delivering.is_empty() {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = self.wait(state);
         }
         let sink = state.sink.take();
         state.detaching = false;
+        state.epoch += 1;
         drop(state);
         self.changed.notify_all();
         Ok(sink)
+    }
+
+    /// Test coordination: block until a second detach is waiting.
+    #[cfg(test)]
+    pub(crate) fn wait_until_detach_waiting(&self) {
+        let mut state = self.lock();
+        while state.waiting_detaches == 0 {
+            state = self.wait(state);
+        }
     }
 
     /// Test coordination: block until another thread has started `detach`.
@@ -131,10 +203,7 @@ impl EventDispatcher {
     pub(crate) fn wait_until_detaching(&self) {
         let mut state = self.lock();
         while !state.detaching {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = self.wait(state);
         }
     }
 }
@@ -336,5 +405,92 @@ mod tests {
             assert_eq!(reasons, expected);
             assert!(dispatcher.detach().unwrap().is_some());
         }
+    }
+
+    #[test]
+    fn a_panicking_sink_does_not_leave_detach_waiting_forever() {
+        struct Panicking;
+        impl EventSink for Panicking {
+            fn on_event(&self, _event: NativeEvent) {
+                panic!("sink failure");
+            }
+        }
+        let dispatcher = Arc::new(EventDispatcher::new());
+        dispatcher.attach(Arc::new(Panicking)).unwrap();
+        let delivering = {
+            let dispatcher = dispatcher.clone();
+            thread::spawn(move || dispatcher.deliver(NativeEvent::HostSynced))
+        };
+        assert!(delivering.join().is_err(), "the sink panic propagates");
+        // The drop guard deregistered the panicked delivery, so detach returns.
+        assert!(!dispatcher.is_delivering_on_current_thread());
+        assert!(dispatcher.detach().unwrap().is_some());
+    }
+
+    #[test]
+    fn two_deliveries_can_be_inside_the_sink_at_once() {
+        // NimBLE delivers from its host task and, for notify transmit events,
+        // from the notifying thread, so deliveries must not serialize. Each
+        // event waits inside the sink until the other has also arrived.
+        struct Rendezvous(Barrier);
+        impl EventSink for Rendezvous {
+            fn on_event(&self, _event: NativeEvent) {
+                self.0.wait();
+            }
+        }
+        let dispatcher = Arc::new(EventDispatcher::new());
+        dispatcher
+            .attach(Arc::new(Rendezvous(Barrier::new(2))))
+            .unwrap();
+        let workers = (0..2)
+            .map(|_| {
+                let dispatcher = dispatcher.clone();
+                thread::spawn(move || dispatcher.deliver(NativeEvent::HostSynced))
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), Delivery::Delivered);
+        }
+        assert!(dispatcher.detach().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_waiting_second_detach_does_not_remove_a_newly_attached_sink() {
+        let dispatcher = Arc::new(EventDispatcher::new());
+        let gate = Arc::new(Gate::new());
+        dispatcher
+            .attach(Arc::new(Blocking {
+                gate: gate.clone(),
+                inner: Recorder::default(),
+            }))
+            .unwrap();
+        let delivering = {
+            let dispatcher = dispatcher.clone();
+            thread::spawn(move || dispatcher.deliver(NativeEvent::HostSynced))
+        };
+        gate.wait_entered();
+        let first = {
+            let dispatcher = dispatcher.clone();
+            thread::spawn(move || dispatcher.detach().unwrap().is_some())
+        };
+        dispatcher.wait_until_detaching();
+        let second = {
+            let dispatcher = dispatcher.clone();
+            thread::spawn(move || dispatcher.detach().unwrap().is_some())
+        };
+        dispatcher.wait_until_detach_waiting();
+        gate.release();
+        assert_eq!(delivering.join().unwrap(), Delivery::Delivered);
+        assert!(first.join().unwrap());
+        // Attach a replacement while the second detach may still be waking.
+        let replacement = Arc::new(Recorder::default());
+        dispatcher.attach(replacement.clone()).unwrap();
+        assert!(!second.join().unwrap(), "the waiting detach took a sink");
+        assert!(dispatcher.is_attached(), "the replacement sink was removed");
+        assert_eq!(
+            dispatcher.deliver(NativeEvent::HostSynced),
+            Delivery::Delivered
+        );
+        assert_eq!(replacement.events(), [NativeEvent::HostSynced]);
     }
 }
