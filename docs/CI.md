@@ -189,7 +189,14 @@ ESP-IDF/NimBLE headers, establish a target ABI, compile firmware, or test BLE
 stack interoperability. The target-integration tests cover runtime-selection
 rejection, record selection, and the GCC probe-to-rustc assertion mechanism.
 They compile a host fixture with the host C compiler and rustc, including
-mismatches that must fail. The Python tests
+mismatches that must fail. The backend unit tests run the production
+callback dispatcher, GAP event translation, and owned-buffer logic against a
+`cfg(test)`-only fake backend. The fake records native call order, returns
+scripted SDK status codes, and keeps a buffer ledger that detects leaks,
+double frees, and double transfers. Its gates coordinate overlapping
+operations without sleeps. The tests show framework logic on the host only;
+they are not SDK, target, or hardware evidence. The firmware fixtures compile
+the real ESP backend for C3 and S3. The Python tests
 exercise context export/capture token handling as well as CI failure propagation,
 missing executables, diagnostic retention, report encoding, unexpected
 exceptions/interrupts, inherited configuration, exact-case tracked-file links,

@@ -76,7 +76,15 @@ milestones.
   ABI layout assertions, and C shim archive for real target builds.
 - `cmake/ArgyleNimbleCargo.cmake`: reusable `idf.py` integration that runs
   Cargo for the IDF target and links the Rust static library.
-- `src/backend/`: private C shims; no safe/public BLE controller exists yet.
+- `src/backend/`: private native boundary. It contains:
+  - a crate-private `Backend` trait over the bound NimBLE operations;
+  - the ESP-IDF implementation, the only caller of the generated bindings;
+  - shared callback dispatch with quiescent detach, GAP event translation, and
+    owned buffers that are freed or transferred exactly once;
+  - a `cfg(test)`-only deterministic fake backend for host tests;
+  - the C shims.
+
+  No safe or public BLE controller exists yet.
 - [CONTRIBUTING.md](CONTRIBUTING.md): contributor workflow and validation policy.
 - [Maintainer guide](docs/MAINTAINING.md): governance and external contributions.
 
