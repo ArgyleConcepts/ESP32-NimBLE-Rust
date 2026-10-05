@@ -1,9 +1,34 @@
-//! Private boundary reserved for backend behavior and ESP-IDF integration.
+//! Private boundary between framework logic and ESP-IDF NimBLE.
 //!
-//! The C shims here expose only a narrow, audited NimBLE surface to private
-//! generated bindings. No safe runtime backend or public BLE API exists yet.
-//! Generated bindings must come from the consuming application's actual
-//! ESP-IDF build configuration and remain private.
+//! - [`native`]: the crate-private [`native::Backend`] trait over the bound
+//!   native operations, with typed errors and events.
+//! - [`dispatch`]: delivery of native callbacks to the framework, including
+//!   quiescent detach for shutdown.
+//! - [`gap`]: translation of the C shim's GAP event view into owned events.
+//! - [`mbuf`]: owned native buffers that are freed or transferred exactly once.
+//! - `esp` (ESP builds only): the real backend, the only caller of the
+//!   generated bindings.
+//! - `fake` (`cfg(test)` only): a deterministic host backend for tests.
+//!
+//! No safe runtime backend or public BLE API exists yet; the controller and
+//! GATT runtime build on this boundary in later work. Generated bindings come
+//! from the consuming application's actual ESP-IDF build configuration and
+//! remain private.
+
+// Consumed by the controller and GATT runtime in later tickets; host tests
+// exercise these modules today.
+#![cfg_attr(not(test), allow(dead_code))]
+
+pub(crate) mod dispatch;
+pub(crate) mod gap;
+pub(crate) mod mbuf;
+pub(crate) mod native;
+
+#[cfg(argyle_nimble_esp)]
+pub(crate) mod esp;
+
+#[cfg(test)]
+pub(crate) mod fake;
 
 #[cfg(argyle_nimble_esp)]
 #[allow(
