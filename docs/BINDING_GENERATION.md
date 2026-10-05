@@ -17,9 +17,11 @@ consumer configuration, then checks input mutations and failure cleanup. Its
 generic fixtures explicitly select `CONFIG_LIBC_NEWLIB=y`; the matrix does not
 claim support for Picolibc's GCC `-specs` options or arbitrary response files.
 Matrix Cargo commands run natively on the macOS host to exercise `build.rs`;
-this does not compile Rust for the ESP target or verify ABI, firmware linking,
-hardware, or BLE behavior. Full target compile/link evidence belongs to
-NIMBLERS-7.
+they do not compile Rust for the ESP target. Real target builds add runtime
+checks, GCC-reported ABI layout assertions, and the compiled C shim; these are
+described in the [idf.py integration guide](IDF_INTEGRATION.md#target-build-checks)
+and exercised by the firmware fixtures. Neither establishes hardware or BLE
+behavior.
 
 ## Cargo selection and invalidation
 
@@ -143,13 +145,15 @@ omits only these additional exact captured options because they control GCC
 diagnostics or emitted machine code rather than the declaration AST it parses:
 `-Wno-old-style-declaration`, `-fno-shrink-wrap`,
 `-fstrict-volatile-bitfields`, `-fno-tree-switch-conversion`,
-`-fzero-init-padding-bits=all`, and `-fno-malloc-dce`. GCC documents the
+`-fzero-init-padding-bits=all`, `-fno-malloc-dce`, and `-freorder-blocks`.
+ESP-IDF adds the last one with `-Os` for `CONFIG_COMPILER_OPTIMIZATION_SIZE`. GCC documents the
 optimization flags in its [optimization options](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/Optimize-Options.html)
 and the volatile-bitfield and padding-initialization flags in its
 [code-generation options](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/Code-Gen-Options.html).
-For the S3 context, bindgen also omits the exact captured `-mlongcalls` option:
-GCC documents it as an assembler call-instruction selection option, so it does
-not change the declarations bindgen parses ([Xtensa options](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/Xtensa-Options.html)).
+For the S3 context, bindgen also omits the exact captured `-mlongcalls` and
+`-mno-target-align` options. ESP-IDF adds `-mno-target-align` with `-Os` for
+size optimization. GCC documents both as assembler code-placement choices, so
+they do not change the declarations bindgen parses ([Xtensa options](https://gcc.gnu.org/onlinedocs/gcc-15.2.0/gcc/Xtensa-Options.html)).
 The context's raw/effective compiler arguments remain unchanged, and the
 selected-GCC shim syntax check uses the original consumer options. ABI, record
 layout, preprocessing, and include options are forwarded unchanged. No other
@@ -260,5 +264,5 @@ That fixture is SDK-free evidence about generator mechanics only; it does not
 claim an ESP target ABI, real NimBLE header compatibility, or hardware behavior.
 The configured C3/S3 fixtures and configuration-mutation checks run in the
 NIMBLERS-24 Azure matrix described above. They validate generation inputs and
-private output only. Full consumer firmware compilation/linking remains
-separate work under NIMBLERS-7.
+private output only. The firmware compile/link fixtures in the same Azure jobs
+cover real target compilation and linking; see [CI.md](CI.md#firmware-compilelink-fixtures).

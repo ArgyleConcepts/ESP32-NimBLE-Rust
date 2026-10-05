@@ -10,7 +10,9 @@ this guide records policy adapted from FSharp.MinimalApi.
 
 The crate's host compilation and SDK-free build-context contract tests run
 through Azure; see [CI.md](CI.md) for evidence. The contract tests do not verify
-target ABI compatibility, firmware compilation, or BLE behavior. Its version is
+target ABI compatibility, firmware compilation, or BLE behavior. The C3/S3 jobs
+add `idf.py` firmware compile/link fixtures with ABI layout checks; they do not
+execute firmware. Its version is
 an unpublished development identifier, and `publish = false` is an intentional
 guard.
 
@@ -79,9 +81,11 @@ accepting external contribution builds.
 Azure host validation compiles/tests build-context tooling without requiring
 ESP-IDF, inspects metadata/package contents, and verifies license inclusion and
 relative docs links. Separate C3/S3 jobs generate bindings from configured
-ESP-IDF 6.1 headers and retain their manifests. Those checks do not establish BLE
-behavior, target ABI compatibility, or firmware compilation. Follow the CI
-guide when extending or rerunning checks.
+ESP-IDF 6.1 headers and retain their manifests. The same jobs then build and
+link generic firmware fixtures through the reusable `idf.py` integration.
+These steps check target ABI layout and link inputs, but they do not establish
+on-device or BLE behavior. Follow the CI guide when extending or rerunning
+checks.
 
 The initial repository-policy check on 2026-10-02 used
 [PR #4 to develop](https://github.com/ArgyleConcepts/ESP32-NimBLE-Rust/pull/4) and
@@ -103,8 +107,8 @@ requirement was verified through configuration, not by impersonating a contribut
 Each implementation includes its own tests. The NIMBLERS-24 Azure matrix
 exercises configured C3/S3 binding generation, compiler/header/configuration
 mutation, lifecycle failures, and private-surface rejection. SDK-free host
-validation remains separate, and neither matrix establishes ESP target ABI or
-firmware compile/link evidence; those checks belong to NIMBLERS-7. Require 90%
+validation remains separate. The NIMBLERS-7 firmware fixtures add target
+compile/link, ABI layout, and compatibility-shim evidence for C3/S3. Require 90%
 line coverage of host-testable handwritten framework code with documented
 generated/target-only exclusions. These checks do not establish hardware
 verification. Package readiness also requires compiling a fresh external

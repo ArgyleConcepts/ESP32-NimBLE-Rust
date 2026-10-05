@@ -14,4 +14,15 @@
 )]
 mod bindings {
     include!(concat!(env!("OUT_DIR"), "/nimble_bindings.rs"));
+
+    // Real ESP target builds only: rustc checks the generated records and C
+    // scalar types against sizes, alignments, and offsets reported by the
+    // consumer's selected GCC. A mismatch fails compilation.
+    #[cfg(argyle_nimble_target_abi)]
+    include!(concat!(env!("OUT_DIR"), "/nimble_layout.rs"));
+
+    // Validation fixtures only: an uncalled linker root that references every
+    // bound C function so a retained firmware link must resolve each symbol.
+    #[cfg(argyle_nimble_link_audit)]
+    include!(concat!(env!("OUT_DIR"), "/nimble_link_audit.rs"));
 }

@@ -8,6 +8,8 @@ mod context;
 mod inputs;
 #[path = "build_support/lifecycle.rs"]
 mod lifecycle;
+#[path = "build_support/target.rs"]
+mod target;
 
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -23,6 +25,11 @@ const CONTEXT_ENV: &str = "ARGYLE_NIMBLE_BUILD_CONTEXT";
 const CLANG_ENV: &str = "ARGYLE_NIMBLE_ESP_CLANG";
 const RELEASE_ENV: &str = "ARGYLE_NIMBLE_ESP_CLANG_RELEASE";
 const RUSTC_CFG: &str = "argyle_nimble_esp";
+/// Set only when Cargo compiles for a real ESP target; enables the
+/// GCC-reported layout assertions and links the private shim archive.
+const TARGET_ABI_CFG: &str = "argyle_nimble_target_abi";
+/// Validation-only linker root requested through `ARGYLE_NIMBLE_LINK_AUDIT=1`.
+const LINK_AUDIT_CFG: &str = "argyle_nimble_link_audit";
 
 const TRACKED_ENVIRONMENT: &[&str] = &[
     "TARGET",
@@ -37,12 +44,15 @@ const TRACKED_ENVIRONMENT: &[&str] = &[
     "CARGO_CFG_TARGET_FEATURE",
     "CARGO_CFG_TARGET_OS",
     "CARGO_CFG_TARGET_VENDOR",
+    "CARGO_CFG_PANIC",
+    "CARGO_CFG_ESPIDF_TIME32",
     "CARGO_ENCODED_RUSTFLAGS",
     "CARGO_PKG_VERSION",
     MODE_ENV,
     CONTEXT_ENV,
     CLANG_ENV,
     RELEASE_ENV,
+    target::LINK_AUDIT_ENV,
     "LIBCLANG_PATH",
     "LIBCLANG_STATIC_PATH",
     "CLANG_PATH",
@@ -75,6 +85,8 @@ fn main() {
 
 fn run() -> Result<(), String> {
     println!("cargo:rustc-check-cfg=cfg({RUSTC_CFG})");
+    println!("cargo:rustc-check-cfg=cfg({TARGET_ABI_CFG})");
+    println!("cargo:rustc-check-cfg=cfg({LINK_AUDIT_CFG})");
     emit_environment_watches();
     emit_source_watches()?;
 
@@ -114,10 +126,34 @@ fn run() -> Result<(), String> {
     )
     .map_err(|error| error.to_string())?;
 
+    let link_audit = link_audit_requested()?;
     let context::BuildContext::Esp(context) = selected else {
         lifecycle::clear_outputs(&out_dir)?;
+        if link_audit {
+            return Err(format!(
+                "{} applies only to ESP target builds; unset it for host builds",
+                target::LINK_AUDIT_ENV
+            ));
+        }
         return Ok(());
     };
+    // An explicit `esp` request from the native host runs the generator only.
+    // Target artifacts, ABI assertions, and runtime checks apply when Cargo is
+    // actually compiling this crate for a supported ESP target.
+    let target_build = target != host && target::chip_for_target(&target).is_some();
+    if link_audit && !target_build {
+        lifecycle::clear_outputs(&out_dir)?;
+        return Err(format!(
+            "{} applies only when Cargo compiles for an ESP target",
+            target::LINK_AUDIT_ENV
+        ));
+    }
+    if target_build {
+        if let Err(error) = validate_target_runtime(&target, &context) {
+            lifecycle::clear_outputs(&out_dir)?;
+            return Err(error);
+        }
+    }
     let context_path = context_path.ok_or_else(|| {
         "ESP binding generation requires ARGYLE_NIMBLE_BUILD_CONTEXT to name the configured CMake export".to_owned()
     })?;
@@ -446,8 +482,77 @@ fn run() -> Result<(), String> {
             )),
         };
     }
+    if target_build {
+        let published =
+            target::publish_target_artifacts(&context, &out_dir, &manifest_dir, link_audit)
+                .and_then(|()| {
+                    out_dir
+                        .to_str()
+                        .filter(|path| !path.contains(['\n', '\r']))
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            "Cargo OUT_DIR cannot be passed to the linker search path".to_owned()
+                        })
+                });
+        let search_path = match published {
+            Ok(path) => path,
+            Err(error) => {
+                return match lifecycle::clear_outputs(&out_dir) {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(format!(
+                        "{error}; could not remove incomplete target artifacts: {cleanup}"
+                    )),
+                };
+            }
+        };
+        println!("cargo:rustc-link-search=native={search_path}");
+        println!("cargo:rustc-link-lib=static={}", target::SHIM_LIBRARY);
+        println!("cargo:rustc-cfg={TARGET_ABI_CFG}");
+        if link_audit {
+            println!("cargo:rustc-cfg={LINK_AUDIT_CFG}");
+        }
+    }
     println!("cargo:rustc-cfg={RUSTC_CFG}");
     Ok(())
+}
+
+fn link_audit_requested() -> Result<bool, String> {
+    match optional_utf8(target::LINK_AUDIT_ENV)?.as_deref() {
+        None | Some("") | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err(format!(
+            "{} must be 1 or 0 when set",
+            target::LINK_AUDIT_ENV
+        )),
+    }
+}
+
+/// Check Cargo's runtime selection and the consumer's C library before any
+/// target generation or cleanup work.
+fn validate_target_runtime(target: &str, context: &context::EspBuildContext) -> Result<(), String> {
+    let runtime = target::TargetRuntime {
+        target: target.to_owned(),
+        target_os: optional_utf8("CARGO_CFG_TARGET_OS")?,
+        target_env: optional_utf8("CARGO_CFG_TARGET_ENV")?,
+        panic: optional_utf8("CARGO_CFG_PANIC")?,
+        espidf_time32: env::var_os("CARGO_CFG_ESPIDF_TIME32").is_some(),
+    };
+    let read = |path: &Path| {
+        fs::read_to_string(path).map_err(|_| {
+            format!(
+                "configured ESP-IDF configuration file is unreadable: {}",
+                path.display()
+            )
+        })
+    };
+    let sdkconfig = read(&context.sdkconfig)?;
+    let headers = context
+        .generated_headers
+        .iter()
+        .filter(|path| path.extension() == Some(OsStr::new("h")))
+        .map(|path| read(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    target::validate_target_runtime(&runtime, &context.chip, &sdkconfig, &headers)
 }
 
 fn emit_environment_watches() {

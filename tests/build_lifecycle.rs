@@ -218,6 +218,7 @@ fn generator_sources_are_shared_by_watch_emission_and_identity_without_consumer_
             "build_support/bindings.rs",
             "build_support/inputs.rs",
             "build_support/lifecycle.rs",
+            "build_support/target.rs",
             "src/backend/nimble_shim.h",
             "src/backend/nimble_shim.c",
         ]

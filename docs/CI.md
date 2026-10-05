@@ -91,8 +91,70 @@ binary-directory guards, and consumer/probe dependency cycles. The positive
 case builds the configured consumer component and context probe, not the
 firmware executable. These checks exercise configured header generation and
 context capture; native-host Cargo execution does not validate the ESP target
-ABI. A complete firmware Cargo/`idf.py` compile-and-link remains NIMBLERS-7,
-and no hardware, BLE interoperability, or publication claim is made.
+ABI. No hardware, BLE interoperability, or publication claim is made.
+
+### Firmware compile/link fixtures
+
+After the generation matrix, each chip job does two things. First,
+[`eng/install-rust-esp-ci.sh`](../eng/install-rust-esp-ci.sh) installs
+Espressif's Rust toolchain into the job's `RUSTUP_HOME` as the `esp`
+toolchain. The release (`1.90.0.0`), macOS archive digests, and `rust-src`
+digest come from
+[`eng/rust-target-toolchain.lock.json`](../eng/rust-target-toolchain.lock.json).
+The script verifies both digests, the reported release and host, support for
+both target triples, and the presence of `rust-src` for `-Zbuild-std`.
+
+Second, [`eng/validate-firmware-link.py`](../eng/validate-firmware-link.py)
+packages the crate with `cargo package`. It instantiates the generic
+[firmware fixture](../eng/test/fixture/firmware/main/CMakeLists.txt) in the job directory against
+the extracted package, and Cargo metadata must resolve argyle-nimble there.
+The fixture lockfile must equal the repository lock plus the fixture package.
+The script then fetches host and `-Zbuild-std` sources once. Every build uses
+`--locked --offline`, its own `idf.py` build directory, and its own
+`SDKCONFIG`. The cases are:
+
+- **Clean build.** `CONFIG_COMPILER_OPTIMIZATION_SIZE` with the
+  [integration](IDF_INTEGRATION.md) and its `LINK_AUDIT` option. The checks
+  cover:
+  - the Cargo identity (target, profile, opt-level, `panic=abort`, pinned
+    rustc, SDK revision, lockfile digest);
+  - use of the packaged CMake assets;
+  - a chip-keyed Cargo directory under the build directory;
+  - the GCC-reported ABI layout assertion count;
+  - the ELF machine and the machine of every static-library member;
+  - every bound NimBLE/shim symbol defined in the ELF;
+  - the linker map's library input.
+- **No-op rebuild.** Bindings, layout assertions, and the Rust library must not
+  change.
+- **Second clean build in another directory.** It must agree on toolchain,
+  lockfile, bindings, layout, scalar ABI, shim, and link-audit identity.
+- **`CONFIG_COMPILER_OPTIMIZATION_DEBUG` build.** Cargo `dev` profile,
+  `opt-level = 1`.
+- **Target switch.** `idf.py set-target` to the other chip in the first build
+  directory. It must re-export the context and link only the new chip's Cargo
+  output.
+- **Compatibility-shim audit.**
+  - std facilities link without shims;
+  - `std::fs::symlink_metadata` fails with only `lstat` unresolved;
+  - an application-owned `lstat` shim links.
+- **Configuration failures.** Picolibc, an unsupported IDF target, and a
+  missing Espressif clang selection must fail CMake configuration.
+- **Cargo failures.** A missing compiler, a missing include directory, a
+  driver/context chip mismatch, a Cargo-target/context mismatch,
+  `-Cpanic=unwind`, and `--cfg espidf_time32` must fail with their
+  diagnostics.
+- **Source and package trees.** Both must be unchanged afterward.
+
+Each chip artifact's `firmware/` directory retains:
+
+- `firmware-link-report.json` (per-case identity summaries) and
+  `firmware-link.xml`;
+- command logs;
+- for each case: the Cargo identity, build context, `sdkconfig`, target
+  manifest, layout assertions, binding manifest and bindings, and linker map;
+- the first clean ELF.
+
+This is compile/link evidence only. Nothing is flashed or executed.
 
 To reproduce a pull-request result, open Pipeline 35 above and queue or rerun
 the reviewed branch/commit with maintainer access to its protected resources.
@@ -102,7 +164,9 @@ Confirm Azure's `system.pullRequest.sourceCommitId` matches the intended PR
 head, then download the `host-validation`, `esp32c3-binding-generation`, and
 `esp32s3-binding-generation` artifacts. Inspect each matrix report's
 `generation_states`, `acceptance_audit`, and retained command logs together
-with `generation-matrix.xml` before treating generation as verified.
+with `generation-matrix.xml` before treating generation as verified. Inspect
+each chip's `firmware/firmware-link-report.json` and `firmware-link.xml` before
+treating firmware compile/link as verified.
 
 Current checks are CI-helper regression tests, shell syntax, rustfmt, Clippy,
 host compilation, Cargo unit/integration tests, doctests, rustdoc with warnings
@@ -116,15 +180,19 @@ identity and transaction failure paths, private binding generation with
 generic host C fixtures, and compile the copied private C shim
 against controlled stubs to test its wrappers. They do not parse real
 ESP-IDF/NimBLE headers, establish a target ABI, compile firmware, or test BLE
-stack interoperability. The Python tests
+stack interoperability. The target-integration tests cover runtime-selection
+rejection, record selection, and the GCC probe-to-rustc assertion mechanism.
+They compile a host fixture with the host C compiler and rustc, including
+mismatches that must fail. The Python tests
 exercise context export/capture token handling as well as CI failure propagation,
 missing executables, diagnostic retention, report encoding, unexpected
 exceptions/interrupts, inherited configuration, exact-case tracked-file links,
-and invalid package contracts. Separate configured C3/S3 jobs and real CMake
-exporter regressions produce the `esp32c3-binding-generation` and
+invalid package contracts, and the CMake-invoked Cargo driver. Separate
+configured C3/S3 jobs, real CMake exporter regressions, and firmware
+compile/link fixtures produce the `esp32c3-binding-generation` and
 `esp32s3-binding-generation` artifacts. Both kinds of checks remain necessary:
-the configured generation jobs do not replace SDK-free host tests or establish
-target ABI, firmware-link, hardware, or BLE-interoperability evidence.
+the configured jobs do not replace SDK-free host tests, and neither establishes
+hardware or BLE-interoperability evidence.
 
 ## Reports, artifacts, and isolation
 
@@ -147,8 +215,9 @@ Checkout and the job workspace are cleaned, checkout does not persist credential
 and tools/Cargo home/target/Python cache directories are unique to each build
 job and attempt.
 There are no shared CI caches to restore. This run's temporary state is deleted
-after diagnostics are published. Future target caches must additionally isolate
-the chip, target toolchain, ESP-IDF revision, and configuration.
+after diagnostics are published. Within a job, each firmware fixture build has
+its own build directory, `sdkconfig`, and chip-keyed Cargo target directory,
+and the target Rust toolchain is installed under the job's `RUSTUP_HOME`.
 
 uv configuration discovery is disabled. Python installation uses `--no-bin`,
 with a run-specific bin directory as additional protection, so it does not create

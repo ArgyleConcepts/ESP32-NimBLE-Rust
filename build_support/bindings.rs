@@ -33,11 +33,14 @@ const BINDGEN_IRRELEVANT_GCC_OPTIONS: &[&str] = &[
     "-fno-tree-switch-conversion",
     "-fzero-init-padding-bits=all",
     "-fno-malloc-dce",
+    // Added with -Os for CONFIG_COMPILER_OPTIMIZATION_SIZE.
+    "-freorder-blocks",
 ];
 // ESP-IDF 6.1 adds this C3 GCC tuning choice; it does not affect declarations.
 const C3_BINDGEN_IRRELEVANT_GCC_OPTIONS: &[&str] = &["-mtune=esp-base"];
-// ESP-IDF 6.1 adds this S3 Xtensa assembler choice; it does not affect the AST.
-const S3_BINDGEN_IRRELEVANT_GCC_OPTIONS: &[&str] = &["-mlongcalls"];
+// ESP-IDF 6.1 adds these S3 Xtensa assembler choices (the second with -Os for
+// CONFIG_COMPILER_OPTIMIZATION_SIZE); neither affects the AST.
+const S3_BINDGEN_IRRELEVANT_GCC_OPTIONS: &[&str] = &["-mlongcalls", "-mno-target-align"];
 
 /// Exact public NimBLE and private shim declarations required by the initial
 /// peripheral-server backend. Keep this list explicit and review every
@@ -601,6 +604,20 @@ fn validate_declared_sysroot(
     Ok(configured)
 }
 
+/// The consumer's captured C compiler argv without the probe's compile action,
+/// source, object output, or dependency outputs. The single approved ESP-IDF
+/// response-file token is retained so GCC reads the configured flags itself.
+pub(crate) fn consumer_compiler_arguments(
+    context: &EspBuildContext,
+) -> Result<Vec<String>, BindingError> {
+    Ok(
+        strip_probe_action_arguments_from(context, &context.captured_compiler_arguments, true)?
+            .into_iter()
+            .map(|(_, argument)| argument)
+            .collect(),
+    )
+}
+
 pub(crate) fn strip_probe_action_arguments(
     context: &EspBuildContext,
 ) -> Result<Vec<(usize, String)>, BindingError> {
@@ -767,11 +784,7 @@ pub(crate) fn validate_shim_with_consumer_compiler(
                 "SDK response file changed or failed validation before the C compiler check: {context_error}"
             ))
         })?;
-    let arguments =
-        strip_probe_action_arguments_from(context, &context.captured_compiler_arguments, true)?
-            .into_iter()
-            .map(|(_, argument)| argument)
-            .collect::<Vec<_>>();
+    let arguments = consumer_compiler_arguments(context)?;
     let result = Command::new(&context.compiler)
         .args(arguments)
         .arg("-fsyntax-only")

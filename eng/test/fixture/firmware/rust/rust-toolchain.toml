@@ -1,0 +1,3 @@
+[toolchain]
+# Espressif's Rust 1.90.0.0 release, linked by the validation driver as "esp".
+channel = "esp"

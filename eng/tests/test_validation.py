@@ -60,12 +60,24 @@ class ValidationTests(unittest.TestCase):
             "Cargo.toml", "build.rs", "LICENSE", "README.md", "src/lib.rs", "CONTRIBUTING.md",
             "build_support/context.rs", "build_support/bindings.rs",
             "build_support/inputs.rs", "build_support/lifecycle.rs",
+            "build_support/target.rs",
             "src/backend/nimble_shim.h", "src/backend/nimble_shim.c",
             "cmake/ArgyleNimbleBuildContext.cmake",
             "cmake/capture_compiler.py", "cmake/export_build_context.py",
+            "cmake/ArgyleNimbleCargo.cmake", "cmake/argyle_nimble_cargo.py",
             "SECURITY.md", "CODE_OF_CONDUCT.md", "docs/MAINTAINING.md",
             "docs/BUILD_CONTEXT.md", "docs/BINDING_GENERATION.md",
+            "docs/IDF_INTEGRATION.md",
         ])
+
+    def test_package_listing_requires_the_idf_integration_assets(self):
+        for required in ("cmake/ArgyleNimbleCargo.cmake", "cmake/argyle_nimble_cargo.py",
+                         "build_support/target.rs"):
+            listing = "\n".join(
+                line for line in self.complete_package_listing().splitlines() if line != required
+            )
+            with self.assertRaisesRegex(ValueError, "Missing package files"):
+                validation.check_package_listing(listing)
 
     def test_failed_command_retains_status_and_diagnostics(self):
         with tempfile.TemporaryDirectory() as directory:

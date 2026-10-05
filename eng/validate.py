@@ -29,12 +29,14 @@ def check_package_listing(listing):
         "Cargo.toml", "build.rs", "LICENSE", "README.md", "src/lib.rs",
         "build_support/context.rs", "build_support/bindings.rs",
         "build_support/inputs.rs", "build_support/lifecycle.rs",
+        "build_support/target.rs",
         "src/backend/nimble_shim.h", "src/backend/nimble_shim.c",
         "cmake/ArgyleNimbleBuildContext.cmake",
         "cmake/capture_compiler.py", "cmake/export_build_context.py",
+        "cmake/ArgyleNimbleCargo.cmake", "cmake/argyle_nimble_cargo.py",
         "CONTRIBUTING.md", "SECURITY.md", "CODE_OF_CONDUCT.md",
         "docs/MAINTAINING.md", "docs/BUILD_CONTEXT.md",
-        "docs/BINDING_GENERATION.md",
+        "docs/BINDING_GENERATION.md", "docs/IDF_INTEGRATION.md",
     }
     entries = {line.strip() for line in listing.splitlines() if line.strip()}
     python_cache = sorted(
@@ -154,7 +156,7 @@ def main():
     reports.mkdir(parents=True, exist_ok=True)
     commands = [
         ("ci-tool-tests", [sys.executable, "-m", "unittest", "discover", "-s", "eng/tests", "-v"]),
-        ("shell-syntax", ["bash", "-c", "bash -n eng/bootstrap-ci.sh && bash -n eng/preflight-ci.sh && bash -n eng/install-idf-ci.sh"]),
+        ("shell-syntax", ["bash", "-c", "bash -n eng/bootstrap-ci.sh && bash -n eng/preflight-ci.sh && bash -n eng/install-idf-ci.sh && bash -n eng/install-rust-esp-ci.sh"]),
         ("format", ["cargo", "fmt", "--all", "--", "--check"]),
         ("clippy", ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"]),
         ("host-build", ["cargo", "build", "--locked"]),
