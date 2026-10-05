@@ -9,11 +9,15 @@ BLE API, implemented BLE behavior, or published package**. Its private,
 versioned ESP-IDF build-context contract can validate the configured SDK,
 consumer compiler arguments, and Bluetooth/NimBLE configuration for ESP32-C3
 and ESP32-S3. Private binding-generation code and narrow C shims define the
-current peripheral-server surface, but only generic host fixtures exercise
-generator mechanics today. They do not parse real SDK headers, establish a
-target ABI, compile firmware, or test BLE behavior. Ordinary host validation
-runs through [Azure validation](docs/CI.md). `publish = false`
+current peripheral-server surface. A reusable CMake module lets an `idf.py`
+application build a Rust static library that depends on this crate for
+ESP32-C3 and ESP32-S3 with std/Newlib. In Azure, binding generation runs
+against the real configured ESP-IDF 6.1 headers, and generic firmware fixtures
+compile, pass GCC-to-rustc ABI layout checks, and link. These fixtures are
+never flashed or run, so there is no hardware or BLE behavior evidence. Host
+validation also runs through [Azure validation](docs/CI.md). `publish = false`
 prevents accidental Cargo publication during development. See the
+[idf.py integration guide](docs/IDF_INTEGRATION.md), the
 [build-context contract](docs/BUILD_CONTEXT.md) for exporter and mode-selection
 details, and the [binding-generation contract](docs/BINDING_GENERATION.md) for
 the private generator boundary and current verification limits.
@@ -68,6 +72,10 @@ milestones.
 - `build_support/context.rs` and `cmake/`: private build-context validation and
   CMake export contract.
 - `build_support/bindings.rs`: private context-driven bindgen generator.
+- `build_support/target.rs`: private ESP target runtime checks, GCC-reported
+  ABI layout assertions, and C shim archive for real target builds.
+- `cmake/ArgyleNimbleCargo.cmake`: reusable `idf.py` integration that runs
+  Cargo for the IDF target and links the Rust static library.
 - `src/backend/`: private C shims; no safe/public BLE controller exists yet.
 - [CONTRIBUTING.md](CONTRIBUTING.md): contributor workflow and validation policy.
 - [Maintainer guide](docs/MAINTAINING.md): governance and external contributions.

@@ -15,6 +15,16 @@ pub(crate) const MANIFEST_FILE: &str = "nimble_bindings.manifest.json";
 const MANIFEST_TEMP_FILE: &str = ".nimble_bindings.manifest.json.tmp";
 pub(crate) const STAGING_DIRECTORY: &str = ".argyle-nimble-bindings-stage";
 pub(crate) const RERUN_SENTINEL: &str = ".argyle-nimble-header-watch";
+/// Target-only artifacts produced after bindings are published for a real ESP
+/// target build. They are owned by this build script and cleared together with
+/// the bindings, so a failed build cannot leave a usable stale shim archive.
+pub(crate) const TARGET_OUTPUT_FILES: &[&str] = &[
+    "nimble_layout.rs",
+    "nimble_link_audit.rs",
+    "libargyle_nimble_shim.a",
+    "argyle_nimble_target.json",
+];
+pub(crate) const TARGET_STAGING_DIRECTORY: &str = ".argyle-nimble-target-stage";
 
 /// Filesystem state for one explicit compiler include lookup directory.
 /// Existing paths keep their canonical target. A genuinely absent path keeps
@@ -449,7 +459,11 @@ pub(crate) fn clear_outputs(out_dir: &Path) -> Result<(), String> {
         out_dir.join(MANIFEST_TEMP_FILE),
         out_dir.join(STAGING_DIRECTORY),
         out_dir.join(RERUN_SENTINEL),
-    ] {
+        out_dir.join(TARGET_STAGING_DIRECTORY),
+    ]
+    .into_iter()
+    .chain(TARGET_OUTPUT_FILES.iter().map(|name| out_dir.join(name)))
+    {
         remove_owned_path(&out_dir, &path)?;
     }
     Ok(())
@@ -509,8 +523,8 @@ where
     result
 }
 
-/// Validate the fixed outputs and staging path before cleanup.
-fn remove_owned_path(out_dir: &Path, path: &Path) -> Result<(), String> {
+/// Validate the fixed outputs and staging paths before cleanup.
+pub(crate) fn remove_owned_path(out_dir: &Path, path: &Path) -> Result<(), String> {
     if path.parent() != Some(out_dir) {
         return Err("refusing to clean a path outside Cargo OUT_DIR".to_owned());
     }
@@ -522,7 +536,9 @@ fn remove_owned_path(out_dir: &Path, path: &Path) -> Result<(), String> {
     if metadata.file_type().is_symlink() {
         return Err("refusing to clean a symlinked generated binding path".to_owned());
     }
-    if path.file_name() == Some(std::ffi::OsStr::new(STAGING_DIRECTORY)) {
+    if path.file_name() == Some(std::ffi::OsStr::new(STAGING_DIRECTORY))
+        || path.file_name() == Some(std::ffi::OsStr::new(TARGET_STAGING_DIRECTORY))
+    {
         if !metadata.is_dir() {
             return Err("prior binding staging path is not a directory".to_owned());
         }

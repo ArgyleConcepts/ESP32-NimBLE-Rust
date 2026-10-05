@@ -1,0 +1,28 @@
+{
+  "toolchain": {
+    "name": "esp",
+    "version": "1.90.0.0",
+    "rustc_release": "1.90.0-nightly",
+    "release_url": "https://github.com/esp-rs/rust-build/releases/tag/v1.90.0.0",
+    "download_base": "https://github.com/esp-rs/rust-build/releases/download/v1.90.0.0",
+    "archives": {
+      "aarch64-apple-darwin": {
+        "file": "rust-1.90.0.0-aarch64-apple-darwin.tar.xz",
+        "sha256": "a9f52e02da53f66271ef7bf5c515a79d727060ab29171d2b2bd715e5d225c9c0"
+      },
+      "x86_64-apple-darwin": {
+        "file": "rust-1.90.0.0-x86_64-apple-darwin.tar.xz",
+        "sha256": "f052c94f3325537a40d34adc3ecdbb05c9dedab8a7d6fbc2d765f79476bb28e1"
+      }
+    },
+    "rust_src": {
+      "file": "rust-src-1.90.0.0.tar.xz",
+      "sha256": "06a4a40325f47ed286057233615dd6b53e738c5e7d404d93d4364ed9f64da599"
+    }
+  },
+  "build_std": ["std", "panic_abort"],
+  "targets": {
+    "esp32c3": "riscv32imc-esp-espidf",
+    "esp32s3": "xtensa-esp32s3-espidf"
+  }
+}

@@ -27,6 +27,7 @@ pub(crate) fn generator_source_paths(crate_root: &Path) -> Vec<PathBuf> {
         "build_support/bindings.rs",
         "build_support/inputs.rs",
         "build_support/lifecycle.rs",
+        "build_support/target.rs",
         "src/backend/nimble_shim.h",
         "src/backend/nimble_shim.c",
     ]

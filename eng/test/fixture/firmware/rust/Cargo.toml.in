@@ -1,0 +1,22 @@
+# Template: the validation driver substitutes the packaged argyle-nimble path.
+[package]
+name = "argyle-nimble-link-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[features]
+# Links std facilities that historically needed an atexit shim; ESP-IDF 6.1
+# Newlib must resolve them without one.
+std-audit = []
+# Links std::fs::symlink_metadata, which needs POSIX lstat. ESP-IDF 6.1 does
+# not provide it, so this links only with an application-owned shim.
+lstat-audit = []
+
+[dependencies]
+argyle-nimble = { path = "@ARGYLE_NIMBLE_PACKAGE@" }
+
+[workspace]

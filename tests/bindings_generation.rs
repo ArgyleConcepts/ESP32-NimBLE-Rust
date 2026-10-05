@@ -360,7 +360,9 @@ fn c3_bindgen_translation_omits_only_exact_tune_and_codegen_switches() {
         "-fno-tree-switch-conversion".into(),
         "-fzero-init-padding-bits=all".into(),
         "-fno-malloc-dce".into(),
+        "-freorder-blocks".into(),
         "-mlongcalls".into(),
+        "-mno-target-align".into(),
         "-fpack-struct=2".into(),
         "-fshort-enums".into(),
         "-fvisibility=hidden".into(),
@@ -385,6 +387,7 @@ fn c3_bindgen_translation_omits_only_exact_tune_and_codegen_switches() {
         "-fno-tree-switch-conversion",
         "-fzero-init-padding-bits=all",
         "-fno-malloc-dce",
+        "-freorder-blocks",
     ] {
         assert!(!arguments.iter().any(|argument| argument == gcc_only));
     }
@@ -396,6 +399,7 @@ fn c3_bindgen_translation_omits_only_exact_tune_and_codegen_switches() {
         "-fshort-enums",
         "-fvisibility=hidden",
         "-mlongcalls",
+        "-mno-target-align",
     ] {
         assert!(arguments.iter().any(|argument| argument == preserved));
     }
@@ -429,7 +433,9 @@ fn s3_bindgen_drops_shared_and_xtensa_assembler_switches() {
         "-fno-tree-switch-conversion".into(),
         "-fzero-init-padding-bits=all".into(),
         "-fno-malloc-dce".into(),
+        "-freorder-blocks".into(),
         "-mlongcalls".into(),
+        "-mno-target-align".into(),
         "-mno-longcalls".into(),
         "-fpack-struct=2".into(),
     ]);
@@ -448,6 +454,7 @@ fn s3_bindgen_drops_shared_and_xtensa_assembler_switches() {
     assert!(arguments.contains(&"-fpack-struct=2".to_owned()));
     assert!(arguments.contains(&"-mno-longcalls".to_owned()));
     assert!(!arguments.contains(&"-mlongcalls".to_owned()));
+    assert!(!arguments.contains(&"-mno-target-align".to_owned()));
     for gcc_only in [
         "-Wno-old-style-declaration",
         "-fno-shrink-wrap",
@@ -455,6 +462,7 @@ fn s3_bindgen_drops_shared_and_xtensa_assembler_switches() {
         "-fno-tree-switch-conversion",
         "-fzero-init-padding-bits=all",
         "-fno-malloc-dce",
+        "-freorder-blocks",
     ] {
         assert!(!arguments.iter().any(|argument| argument == gcc_only));
     }
