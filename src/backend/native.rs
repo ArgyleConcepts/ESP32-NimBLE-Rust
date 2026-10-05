@@ -12,6 +12,7 @@
 
 use super::dispatch::EventDispatcher;
 use super::gap::GapEvent;
+use crate::error::{BackendDetail, BackendError, Error, ErrorKind};
 use std::fmt;
 use std::sync::Arc;
 
@@ -34,6 +35,53 @@ pub(crate) enum Operation {
     Terminate,
     AdvertisingStop,
     Mtu,
+}
+
+impl Operation {
+    /// The SDK function or step, as reported in public error messages.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::HostInit => "nimble_port_init",
+            Self::HostDeinit => "nimble_port_deinit",
+            Self::InstallCallbacks => "install host callbacks",
+            Self::RemoveCallbacks => "remove host callbacks",
+            Self::HostStart => "nimble_port_freertos_init",
+            Self::HostStop => "nimble_port_stop",
+            Self::MbufFromFlat => "ble_hs_mbuf_from_flat",
+            Self::MbufLen => "os_mbuf_len",
+            Self::MbufAppend => "os_mbuf_append",
+            Self::MbufCopy => "os_mbuf_copydata",
+            Self::MbufFree => "os_mbuf_free_chain",
+            Self::Notify => "ble_gatts_notify_custom",
+            Self::Terminate => "ble_gap_terminate",
+            Self::AdvertisingStop => "ble_gap_adv_stop",
+            Self::Mtu => "ble_att_mtu",
+        }
+    }
+
+    /// Interpret a nonzero status in the family this operation returns.
+    fn status_detail(self, code: i32) -> BackendDetail {
+        match self {
+            // `nimble_port_init` and `nimble_port_deinit` return `esp_err_t`.
+            Self::HostInit | Self::HostDeinit => BackendDetail::EspError(code),
+            // The mbuf wrappers return `os_error_t` values or the shim's -1.
+            Self::MbufFromFlat
+            | Self::MbufLen
+            | Self::MbufAppend
+            | Self::MbufCopy
+            | Self::MbufFree => BackendDetail::OsStatus(code),
+            // `nimble_port_stop` returns a `ble_npl_error_t` if its semaphore
+            // cannot be created and a host status if the host cannot stop.
+            Self::HostStop => BackendDetail::PortStatus(code),
+            Self::InstallCallbacks
+            | Self::RemoveCallbacks
+            | Self::HostStart
+            | Self::Notify
+            | Self::Terminate
+            | Self::AdvertisingStop
+            | Self::Mtu => BackendDetail::HostStatus(code),
+        }
+    }
 }
 
 /// A failed native operation. Status codes are the SDK's own values; they are
@@ -111,6 +159,37 @@ impl fmt::Display for NativeError {
 }
 
 impl std::error::Error for NativeError {}
+
+/// Ownership conflicts become lifecycle errors; every other native failure
+/// becomes a [`BackendError`] that keeps the operation and SDK status.
+impl From<NativeError> for Error {
+    fn from(error: NativeError) -> Self {
+        let operation = error.operation().name();
+        let detail = match error {
+            NativeError::Status { operation, code } => operation.status_detail(code),
+            NativeError::OutOfMemory { .. } => BackendDetail::OutOfMemory,
+            NativeError::InvalidLength { length, .. } => BackendDetail::InvalidLength(length),
+            NativeError::OutOfRange { offset, length, .. } => {
+                BackendDetail::OutOfRange { offset, length }
+            }
+            NativeError::Busy { .. } => {
+                return Error::new(
+                    ErrorKind::Lifecycle,
+                    Some(operation),
+                    "the native host callbacks already have an owner",
+                )
+            }
+            NativeError::Reentrant { .. } => {
+                return Error::new(
+                    ErrorKind::Lifecycle,
+                    Some(operation),
+                    "the operation cannot run from inside a BLE callback",
+                )
+            }
+        };
+        BackendError::new(operation, detail).into()
+    }
+}
 
 pub(crate) type NativeResult<T> = Result<T, NativeError>;
 
@@ -240,5 +319,129 @@ mod tests {
                 .to_string()
                 .starts_with(&format!("{:?}", error.operation())));
         }
+    }
+
+    #[test]
+    fn native_errors_convert_to_framework_errors_with_their_causes() {
+        use crate::AttError;
+        use std::error::Error as _;
+
+        let unknown = Error::from(NativeError::Status {
+            operation: Operation::Terminate,
+            code: -31_337,
+        });
+        assert_eq!(unknown.kind(), ErrorKind::Backend);
+        let backend = unknown.backend().expect("a backend cause");
+        assert_eq!(backend.operation(), "ble_gap_terminate");
+        assert_eq!(backend.att_error(), None);
+        assert!(unknown.to_string().contains("ble_gap_terminate"));
+        assert!(unknown.to_string().contains("-31337"));
+        assert!(unknown.source().is_some());
+
+        // ESP_ERR_NO_MEM from the port and an OS status in the ATT numeric
+        // range keep their own meaning.
+        let esp = Error::from(NativeError::Status {
+            operation: Operation::HostInit,
+            code: 0x101,
+        });
+        assert_eq!(esp.backend().and_then(BackendError::att_error), None);
+        assert!(
+            esp.to_string().contains("ESP-IDF error 257 (0x101)"),
+            "{esp}"
+        );
+        let os = Error::from(NativeError::Status {
+            operation: Operation::MbufAppend,
+            code: 0x101,
+        });
+        assert_eq!(os.backend().and_then(BackendError::att_error), None);
+        assert!(os.to_string().contains("OS status"), "{os}");
+        let stop = Error::from(NativeError::Status {
+            operation: Operation::HostStop,
+            code: 3,
+        });
+        assert!(stop.to_string().contains("port status 3"), "{stop}");
+
+        let att = Error::from(NativeError::Status {
+            operation: Operation::Notify,
+            code: 0x111,
+        });
+        assert_eq!(
+            att.backend().and_then(BackendError::att_error),
+            Some(AttError::INSUFFICIENT_RESOURCES)
+        );
+
+        for (error, name) in [
+            (
+                NativeError::OutOfMemory {
+                    operation: Operation::MbufFromFlat,
+                },
+                "ble_hs_mbuf_from_flat",
+            ),
+            (
+                NativeError::InvalidLength {
+                    operation: Operation::MbufAppend,
+                    length: 70_000,
+                },
+                "os_mbuf_append",
+            ),
+            (
+                NativeError::OutOfRange {
+                    operation: Operation::MbufCopy,
+                    offset: 3,
+                    length: 9,
+                },
+                "os_mbuf_copydata",
+            ),
+        ] {
+            let converted = Error::from(error);
+            assert_eq!(converted.kind(), ErrorKind::Backend);
+            assert_eq!(converted.backend().map(BackendError::operation), Some(name));
+        }
+
+        for (error, name) in [
+            (
+                NativeError::Busy {
+                    operation: Operation::InstallCallbacks,
+                },
+                "install host callbacks",
+            ),
+            (
+                NativeError::Reentrant {
+                    operation: Operation::RemoveCallbacks,
+                },
+                "remove host callbacks",
+            ),
+        ] {
+            let converted = Error::from(error);
+            assert_eq!(converted.kind(), ErrorKind::Lifecycle);
+            assert!(converted.backend().is_none());
+            assert!(converted.to_string().contains(name), "{converted}");
+        }
+    }
+
+    #[test]
+    fn every_operation_has_a_distinct_name() {
+        let operations = [
+            Operation::HostInit,
+            Operation::HostDeinit,
+            Operation::InstallCallbacks,
+            Operation::RemoveCallbacks,
+            Operation::HostStart,
+            Operation::HostStop,
+            Operation::MbufFromFlat,
+            Operation::MbufLen,
+            Operation::MbufAppend,
+            Operation::MbufCopy,
+            Operation::MbufFree,
+            Operation::Notify,
+            Operation::Terminate,
+            Operation::AdvertisingStop,
+            Operation::Mtu,
+        ];
+        let names: std::collections::BTreeSet<_> = operations
+            .iter()
+            .map(|operation| operation.name())
+            .collect();
+        assert_eq!(names.len(), operations.len());
     }
 }

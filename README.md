@@ -4,8 +4,19 @@ A public MIT-licensed Rust framework for ESP-IDF's NimBLE stack.
 
 ## Current status
 
-This is an initial library crate and contribution structure. It has **no public
-BLE API, implemented BLE behavior, or published package**. Its private,
+This is an early library crate. Its public API covers the values that cross
+the BLE boundary:
+
+- `Uuid`: 16-, 32-, and 128-bit Bluetooth UUIDs with checked parsing and
+  explicit canonical (text) and wire (least significant byte first) orders.
+- `codec`: explicit little-endian scalar, IEEE 754 float, `bool`, byte, and
+  UTF-8 encodings, a `BigEndian` wrapper, and `Encode`/`Decode` traits for
+  application codecs over Rust-owned bytes only.
+- `AttError` for ATT results returned to a client, kept separate from
+  `Error` for framework lifecycle, backend, and encoding failures.
+
+It has **no BLE controller, GATT server, implemented BLE behavior, or published
+package**. See the rustdoc on each type for contracts and examples. Its private,
 versioned ESP-IDF build-context contract can validate the configured SDK,
 consumer compiler arguments, and Bluetooth/NimBLE configuration for ESP32-C3
 and ESP32-S3. Private binding-generation code and narrow C shims define the
@@ -69,6 +80,8 @@ milestones.
 - `build.rs` and `build_support/lifecycle.rs`: private Cargo mode selection,
   input tracking, and transactional `OUT_DIR` binding publication.
 - `src/lib.rs`: library entry point and crate documentation.
+- `src/uuid.rs`, `src/codec.rs`, and `src/error.rs`: public UUID, value codec,
+  and error types with their contracts and tests.
 - `build_support/context.rs` and `cmake/`: private build-context validation and
   CMake export contract.
 - `build_support/bindings.rs`: private context-driven bindgen generator.
