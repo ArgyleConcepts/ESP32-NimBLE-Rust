@@ -296,11 +296,16 @@
 //!   error and the transfer stays complete, so the client commits again
 //!   later. Nothing committed waits in the session to be discarded.
 //! - The session holds only an uncommitted transfer and belongs to the
-//!   client's connection. Call `Transfer::reset` when the connection ends so
-//!   a later client starts afresh; reset and Abort never affect committed
-//!   transfers. Connection events are planned for the framework's connection
-//!   handling and will be where an application makes that call; until they
-//!   exist, a client should abort before it begins.
+//!   client's connection. The application registers `reset_on_disconnect`
+//!   with [`Ble::connection_handler`](crate::Ble::connection_handler), so
+//!   [`ConnectionEvent::Disconnected`](crate::ConnectionEvent::Disconnected)
+//!   resets the session and a later client starts afresh. It also resets on
+//!   `ConnectionFailed` and `HostReset`, which end links that may have made
+//!   requests before their connection was reported and are reported only
+//!   while no client is connected, and ignores `ConnectionRejected`, which
+//!   leaves the served client connected. Reset and Abort never affect
+//!   committed transfers; a client that abandons a transfer while connected
+//!   aborts it before beginning another.
 //! - Data uses Write Requests so the client sees each result. Write Commands
 //!   are faster but carry no response, so a client using them must check the
 //!   status before committing.
@@ -321,8 +326,14 @@
 //!     let (completed, committed) = std::sync::mpsc::sync_channel(1);
 //!     let transfer = Arc::new(Transfer::new(completed));
 //!     let server = GattServer::new([transfer_service(&transfer)])?;
-//!     // `server` goes to the BLE owner. Here the client is simulated by
-//!     // calling the handlers with the values the framework would decode.
+//!     // `server` goes to the BLE owner, with the reset registered:
+//!     //
+//!     //     let ble = Ble::take()?
+//!     //         .connection_handler(reset_on_disconnect(&transfer))
+//!     //         .start(server, Access::Open)?;
+//!     //
+//!     // Here the client is simulated by calling the handlers with the
+//!     // values the framework would decode.
 //!     # let _ = server;
 //!     let control = Control(transfer.clone());
 //!     let status = Status(transfer.clone());
@@ -345,7 +356,8 @@
 //!     control.write(Command::Commit)?;
 //!     assert_eq!(committed.try_recv()?, image);
 //!
-//!     // The connection ends part-way through the next transfer.
+//!     // The connection ends part-way through the next transfer, and the
+//!     // registered handler resets the session.
 //!     control.write(Command::Begin { total: 10 })?;
 //!     data.write(Chunk { offset: 0, bytes: vec![1; 4] })?;
 //!     transfer.reset();
@@ -362,9 +374,13 @@
 //! `Arc<Mutex<_>>` or atomics. Handlers and application codec implementations
 //! ([`Encode`] and [`Decode`](crate::codec::Decode)) must not panic.
 //!
-//! Handlers receive no request context, such as the connection, yet. Phase 1
-//! serves one client with open access; if context is added, it will arrive
-//! as new provided trait methods so existing handlers keep compiling.
+//! Handlers receive no request context, such as the connection. The
+//! framework serves one client with open access; state tied to that client,
+//! such as a transfer session, is reset from a
+//! [`ConnectionHandler`](crate::ConnectionHandler) (see
+//! [Chunked transfers](#chunked-transfers)). If request context is added, it
+//! will arrive as new provided trait methods so existing handlers keep
+//! compiling.
 //!
 //! Sending notifications is not part of this module yet. Descriptor requests
 //! follow the same contract as characteristic requests.

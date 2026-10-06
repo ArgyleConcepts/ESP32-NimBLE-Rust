@@ -6,7 +6,7 @@
 
 use argyle_nimble::codec::{Decode, DecodeError, Encode, EncodeError, ValueReader, ValueWriter};
 use argyle_nimble::gatt::{Characteristic, CharacteristicDef, Readable, Service, Writable};
-use argyle_nimble::{AttError, Uuid};
+use argyle_nimble::{AttError, ConnectionEvent, ConnectionHandler, Uuid};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -126,8 +126,8 @@ impl Transfer {
     }
 
     /// Discard the transfer in progress, if any. Committed transfers were
-    /// already handed over and are unaffected. Call this when the client's
-    /// connection ends.
+    /// already handed over and are unaffected. `reset_on_disconnect` calls
+    /// this when the client's connection ends.
     pub fn reset(&self) {
         *self.session() = None;
     }
@@ -252,6 +252,26 @@ impl Characteristic for Data {
 impl Writable for Data {
     fn write(&self, chunk: Chunk) -> Result<(), AttError> {
         self.0.chunk(chunk)
+    }
+}
+
+/// A connection handler that resets `transfer` when the client's link
+/// ends, for `Ble::connection_handler`.
+///
+/// It resets on `Disconnected`, and also on `ConnectionFailed` and
+/// `HostReset`: GATT requests can arrive on a link before NimBLE reports its
+/// connection, and such a link can end with only a failure report, while a
+/// host reset ends every link. The framework reports those two only while no
+/// client is connected, so they never discard the served client's transfer.
+/// It ignores `ConnectionRejected`, which concerns a second link while the
+/// served client stays connected.
+pub fn reset_on_disconnect(transfer: &Arc<Transfer>) -> impl ConnectionHandler {
+    let transfer = transfer.clone();
+    move |event: ConnectionEvent| match event {
+        ConnectionEvent::Disconnected { .. }
+        | ConnectionEvent::ConnectionFailed { .. }
+        | ConnectionEvent::HostReset { .. } => transfer.reset(),
+        _ => {}
     }
 }
 

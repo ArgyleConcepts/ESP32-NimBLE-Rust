@@ -1,7 +1,10 @@
 //! The documented chunked-transfer example, served through the registration
 //! dispatch to clients modeled at several ATT MTUs, with failures, retries,
-//! a full hand-off channel, and disconnection. It checks the rules stated in
-//! the [module documentation](super#chunked-transfers).
+//! a full hand-off channel, and disconnection. Disconnection runs through a
+//! started host over the fake backend: a GAP disconnect event reaches the
+//! example's registered connection handler, which resets the session. It
+//! checks the rules stated in the
+//! [module documentation](super#chunked-transfers).
 
 /// The example exactly as documented, with its `argyle_nimble` paths
 /// resolving to this crate.
@@ -13,11 +16,13 @@ mod example {
 use super::registration::att_model::{AttModel, Handle};
 use super::GattServer;
 use crate::backend::fake::{FakeBackend, NativeCall};
-use crate::backend::native::Operation;
-use crate::AttError;
+use crate::backend::gap::GapEvent;
+use crate::backend::native::{NativeEvent, Operation};
+use crate::ble::{take, OwnerSlot, Started};
+use crate::{AttError, ConnectionEvent, ConnectionHandler};
 use example::*;
 use std::sync::mpsc::{sync_channel, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// The client's view of the transfer service.
 struct Client<'s> {
@@ -84,13 +89,83 @@ impl<'s> Client<'s> {
     }
 }
 
-/// Where the application learns that the connection ended: NimBLE drops
-/// queued long-write parts, and the application resets its session. The
-/// framework's connection events do not exist yet, so tests call this
-/// directly.
-fn on_disconnect(client: &mut Client<'_>, transfer: &Transfer) {
-    client.model.disconnect();
-    transfer.reset();
+/// A started host over the fake backend serving the example, with its
+/// reset registered as the connection handler, as an application would.
+struct Host {
+    fake: FakeBackend,
+    running: Started<FakeBackend>,
+    committed: Receiver<Vec<u8>>,
+    /// The kinds of event the handler received.
+    seen: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Host {
+    fn start() -> Self {
+        let (transfer, committed) = application(1);
+        let fake = FakeBackend::new();
+        let slot: &'static OwnerSlot = Box::leak(Box::new(OwnerSlot::new()));
+        let mut configured = take(fake.clone(), slot).unwrap();
+        // The example's handler, behind a recorder of what it was given.
+        let reset = reset_on_disconnect(&transfer);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        configured.set_handler(Box::new(move |event: ConnectionEvent| {
+            record.lock().unwrap().push(match event {
+                ConnectionEvent::Connected { .. } => "connected",
+                ConnectionEvent::Disconnected { .. } => "disconnected",
+                ConnectionEvent::ConnectionFailed { .. } => "failed",
+                ConnectionEvent::HostReset { .. } => "reset",
+                _ => "other",
+            });
+            reset.on_event(event);
+        }));
+        let server = GattServer::new([transfer_service(&transfer)]).unwrap();
+        // Deliver the sync once the host has been asked to start, as the
+        // host task would.
+        let gate = fake.hold(Operation::HostStart);
+        let starting = std::thread::spawn(move || configured.start(server));
+        gate.wait_entered();
+        fake.inject(NativeEvent::HostSynced);
+        gate.release();
+        let running = starting.join().unwrap().expect("startup completes");
+        Self {
+            fake,
+            running,
+            committed,
+            seen,
+        }
+    }
+
+    fn seen(&self) -> Vec<&'static str> {
+        std::mem::take(&mut *self.seen.lock().unwrap())
+    }
+
+    /// Deliver a GAP event as the NimBLE host task would.
+    fn gap(&self, event: GapEvent) {
+        assert!(self.fake.inject_gap(event).is_some(), "{event:?} delivered");
+    }
+
+    /// A client connects on native handle `connection`.
+    fn connect(&self, connection: u16, mtu: u16) -> Client<'_> {
+        self.gap(GapEvent::Connect {
+            connection,
+            status: 0,
+        });
+        assert!(self.running.connection().is_some());
+        Client::connect(&self.fake, self.running.server(), mtu)
+    }
+
+    /// The client's link ends (HCI 0x13, remote user termination): NimBLE
+    /// drops queued long-write parts and reports the disconnection, which
+    /// the registered handler turns into a reset.
+    fn disconnect(&self, client: &mut Client<'_>, connection: u16) {
+        client.model.disconnect();
+        self.gap(GapEvent::Disconnect {
+            connection,
+            reason: 0x213,
+        });
+        assert!(self.running.connection().is_none());
+    }
 }
 
 /// The application's state with a hand-off channel holding `waiting`
@@ -212,10 +287,8 @@ fn refused_and_failed_chunks_change_nothing_and_the_client_resumes() {
 
 #[test]
 fn committed_transfers_survive_a_later_begin_abort_or_disconnect() {
-    let (transfer, committed) = application(1);
-    let server = GattServer::new([transfer_service(&transfer)]).unwrap();
-    let fake = FakeBackend::new();
-    let mut client = Client::connect(&fake, &server, 23);
+    let host = Host::start();
+    let mut client = host.connect(1, 23);
     let first = image(50, 1);
     client.begin(50).unwrap();
     client.send(&first, 0).unwrap();
@@ -227,16 +300,16 @@ fn committed_transfers_survive_a_later_begin_abort_or_disconnect() {
     client.abort().unwrap();
     client.begin(30).unwrap();
     client.chunk(0, &[9; 16]).unwrap();
-    on_disconnect(&mut client, &transfer);
+    host.disconnect(&mut client, 1);
     assert_eq!(
         client.progress(),
         (0, 0),
         "only the uncommitted one is gone"
     );
 
-    assert_eq!(committed.try_recv(), Ok(first));
-    assert!(committed.try_recv().is_err());
-    assert_eq!(fake.assert_balanced(), Ok(()));
+    assert_eq!(host.committed.try_recv(), Ok(first));
+    assert!(host.committed.try_recv().is_err());
+    assert_eq!(host.fake.assert_balanced(), Ok(()));
 }
 
 #[test]
@@ -274,11 +347,21 @@ fn a_full_hand_off_refuses_commit_and_the_client_commits_again() {
 
 #[test]
 fn disconnect_and_abort_discard_the_uncommitted_transfer() {
-    let (transfer, committed) = application(1);
-    let server = GattServer::new([transfer_service(&transfer)]).unwrap();
-    let fake = FakeBackend::new();
-    let mut client = Client::connect(&fake, &server, 23);
+    let host = Host::start();
+    let mut client = host.connect(1, 23);
     let first = image(300, 1);
+
+    // A second link's failed attempt while the client is served is not
+    // reported to the application, and the session is untouched.
+    client.begin(300).unwrap();
+    client.chunk(0, &first[..16]).unwrap();
+    host.gap(GapEvent::Connect {
+        connection: 2,
+        status: 1,
+    });
+    assert_eq!(client.progress(), (16, 300));
+    assert_eq!(host.seen(), ["connected"]);
+    client.abort().unwrap();
 
     // The link drops mid-transfer, with a long-write part a client queued
     // anyway.
@@ -288,14 +371,32 @@ fn disconnect_and_abort_discard_the_uncommitted_transfer() {
         .model
         .prepare(client.data, 0, &(128_u32).to_le_bytes())
         .unwrap();
-    on_disconnect(&mut client, &transfer);
+    host.disconnect(&mut client, 1);
+    assert_eq!(host.seen(), ["disconnected"]);
     assert_eq!(client.model.execute(true), Ok(()), "nothing was queued");
     assert_eq!(client.progress(), (0, 0));
     assert_eq!(client.chunk(128, &first[128..144]), Err(NO_TRANSFER));
 
-    // A new client aborts, then begins, as the pattern recommends; an
-    // abort part-way discards that transfer too.
-    let client = Client::connect(&fake, &server, 247);
+    // A link that made requests before its connection was reported, then
+    // failed (BLE_HS_EAGAIN), and a host reset each reset the session.
+    for end in [
+        NativeEvent::Gap(GapEvent::Connect {
+            connection: 3,
+            status: 1,
+        }),
+        NativeEvent::HostReset { reason: 19 },
+    ] {
+        client.begin(300).unwrap();
+        client.chunk(0, &first[..16]).unwrap();
+        assert!(host.fake.inject(end).is_some());
+        assert_eq!(client.progress(), (0, 0));
+    }
+    assert_eq!(host.seen(), ["failed", "reset"]);
+    host.fake.inject(NativeEvent::HostSynced);
+
+    // A new client finds no session; an abort part-way discards its
+    // transfer too.
+    let client = host.connect(1, 247);
     client.abort().unwrap();
     client.begin(300).unwrap();
     client.send(&image(300, 2), 0).unwrap();
@@ -305,7 +406,7 @@ fn disconnect_and_abort_discard_the_uncommitted_transfer() {
     client.begin(300).unwrap();
     client.send(&first, 0).unwrap();
     client.commit().unwrap();
-    assert_eq!(committed.try_recv(), Ok(first));
-    assert!(committed.try_recv().is_err());
-    assert_eq!(fake.assert_balanced(), Ok(()));
+    assert_eq!(host.committed.try_recv(), Ok(first));
+    assert!(host.committed.try_recv().is_err());
+    assert_eq!(host.fake.assert_balanced(), Ok(()));
 }
