@@ -83,7 +83,8 @@
 //!   [`CharacteristicDef::notifiable`].
 //!
 //! **At runtime**, [`GattServer::new`] rejects a server without services, a
-//! characteristic without any capability, and a
+//! characteristic without any capability, a characteristic whose UUID is one
+//! of GATT's own declaration types (`0x2800`–`0x2803`, in any width), and a
 //! [`Characteristic::MAX_LEN`] above the 512-byte attribute limit.
 //!
 //! # Planned request handling
@@ -469,6 +470,15 @@ impl fmt::Debug for Service {
     }
 }
 
+/// Primary service, secondary service, include, and characteristic
+/// declaration types (Bluetooth Assigned Numbers), expanded to 128 bits.
+const GATT_DECLARATIONS: [u128; 4] = [
+    Uuid::Uuid16(0x2800).to_u128(),
+    Uuid::Uuid16(0x2801).to_u128(),
+    Uuid::Uuid16(0x2802).to_u128(),
+    Uuid::Uuid16(0x2803).to_u128(),
+];
+
 /// A validated, frozen set of services, ready to transfer to the BLE owner.
 ///
 /// It is `Send + Sync`, owns every characteristic, and offers no way to change
@@ -483,7 +493,8 @@ impl GattServer {
     ///
     /// Returns an [`ErrorKind::Definition`](crate::ErrorKind::Definition)
     /// error if there are no services, a characteristic declares no
-    /// capability, or a characteristic's `MAX_LEN` exceeds
+    /// capability, a characteristic uses a GATT declaration UUID
+    /// (`0x2800`–`0x2803`), or a characteristic's `MAX_LEN` exceeds
     /// [`MAX_ATTRIBUTE_VALUE_LEN`].
     pub fn new(services: impl IntoIterator<Item = Service>) -> Result<Self, Error> {
         let services: Box<[Service]> = services.into_iter().collect();
@@ -501,6 +512,12 @@ impl GattServer {
                 };
                 if characteristic.access().is_empty() {
                     return Err(located("no read, write, or notify capability is declared"));
+                }
+                // The characteristic UUID becomes the type of its value
+                // attribute; a declaration type there would corrupt service
+                // and characteristic discovery.
+                if GATT_DECLARATIONS.contains(&characteristic.uuid().to_u128()) {
+                    return Err(located("the UUID is a GATT declaration type"));
                 }
                 if characteristic.max_len() > MAX_ATTRIBUTE_VALUE_LEN {
                     return Err(located("MAX_LEN exceeds the 512-byte attribute limit"));
@@ -856,6 +873,44 @@ mod tests {
             .characteristic(CharacteristicDef::new(TooLong).readable());
         let error = GattServer::new([too_long]).unwrap_err();
         assert!(error.to_string().contains("characteristic fff1: MAX_LEN"));
+
+        struct Declaration(Uuid);
+        impl Characteristic for Declaration {
+            type Value = u8;
+            fn uuid(&self) -> Uuid {
+                self.0
+            }
+        }
+        impl Readable for Declaration {
+            fn read(&self) -> Result<u8, AttError> {
+                Ok(0)
+            }
+        }
+        for uuid in [
+            Uuid::Uuid16(0x2800),
+            Uuid::Uuid16(0x2801),
+            Uuid::Uuid32(0x2802),
+            Uuid::Uuid128(Uuid::Uuid16(0x2803).to_u128()),
+        ] {
+            let service = Service::primary(Uuid::Uuid16(0x1800))
+                .characteristic(CharacteristicDef::new(Declaration(uuid)).readable());
+            let error = GattServer::new([service]).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .ends_with("the UUID is a GATT declaration type"),
+                "{error}"
+            );
+        }
+        for uuid in [
+            Uuid::Uuid16(0x27ff),
+            Uuid::Uuid16(0x2804),
+            Uuid::Uuid16(0x2902),
+        ] {
+            let service = Service::primary(Uuid::Uuid16(0x1800))
+                .characteristic(CharacteristicDef::new(Declaration(uuid)).readable());
+            assert!(GattServer::new([service]).is_ok(), "{uuid}");
+        }
 
         // A service without characteristics is valid on its own.
         assert!(GattServer::new([Service::primary(Uuid::Uuid16(0x1801))]).is_ok());

@@ -1,0 +1,10 @@
+error[E0624]: method `characteristics` is private
+ --> tests/ui/gatt/fail/service_characteristics_private.rs:8:21
+  |
+8 |     let _ = service.characteristics();
+  |                     ^^^^^^^^^^^^^^^ private method
+  |
+ ::: src/gatt.rs
+  |
+  |     pub(crate) fn characteristics(&self) -> &[Box<dyn RegisteredCharacteristic>] {
+  |     ---------------------------------------------------------------------------- private method defined here

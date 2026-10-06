@@ -1,0 +1,10 @@
+error[E0624]: method `services` is private
+ --> tests/ui/gatt/fail/server_services_private.rs:8:20
+  |
+8 |     let _ = server.services();
+  |                    ^^^^^^^^ private method
+  |
+ ::: src/gatt.rs
+  |
+  |     pub(crate) fn services(&self) -> &[Service] {
+  |     ------------------------------------------- private method defined here

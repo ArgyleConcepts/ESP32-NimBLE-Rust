@@ -6,8 +6,8 @@
 //!   connected client, such as "write not permitted". It is a valid ATT error
 //!   code, not a failure of this framework.
 //! - [`Error`] reports a failure of the framework itself: lifecycle misuse,
-//!   native backend failures, or values that cannot be encoded. It is never
-//!   sent to the client.
+//!   native backend failures, values that cannot be encoded, or invalid GATT
+//!   definitions. It is never sent to the client.
 //!
 //! No conversion exists from [`AttError`] to [`Error`]. A decode failure in a
 //! handler converts to the ATT error the client should see with `?`; see the

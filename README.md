@@ -15,9 +15,9 @@ the BLE boundary and the declaration of a GATT server:
 - `AttError` for ATT results returned to a client, kept separate from
   `Error` for framework lifecycle, backend, encoding, and definition failures.
 - `gatt`: services and characteristics declared with application structs and
-  traits. Read, write, and notify capabilities require their handlers at
-  compile time, and `GattServer` freezes the validated definition with
-  typed notification endpoints.
+  traits. Read and write capabilities require their handlers, and notify
+  requires an encodable value, at compile time; `GattServer` freezes the
+  validated definition with typed notification endpoints.
 
 It has **no BLE controller, NimBLE registration of these definitions,
 implemented BLE behavior, or published package**. See the rustdoc on each type for contracts and examples. Its private,
