@@ -47,8 +47,8 @@ is merged and no open PR depends on them.
 ## Azure and external contributions
 
 All builds/tests use Azure DevOps's self-hosted `macOS` pool through
-[pipeline 35, argyle-nimble PR Validation](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build?definitionId=35).
-The verified GitHub check is `argyle-nimble PR Validation`, emitted by the
+[pipeline 35, Argyle NimBLE](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build?definitionId=35).
+The verified GitHub check is `Argyle NimBLE`, emitted by the
 Azure Pipelines GitHub App (app ID `9426`). Both branches require that exact
 name/App pair; see [CI.md](CI.md)
 for tooling, diagnostics, and server-side trigger configuration.

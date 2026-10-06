@@ -66,7 +66,7 @@ identify breaking changes, and include Azure run links when available. Update
 docs/examples for API changes. Draft PRs are welcome.
 
 Merging requires an up-to-date branch,
-the `argyle-nimble PR Validation` Azure check, resolved review conversations, and
+the `Argyle NimBLE` Azure check, resolved review conversations, and
 designated code-owner approval, subject to the documented review-only exception.
 [CODEOWNERS](https://github.com/ArgyleConcepts/ESP32-Nimble-Rust/blob/HEAD/.github/CODEOWNERS)
 assigns all files to `@david-cyman-argyle`.

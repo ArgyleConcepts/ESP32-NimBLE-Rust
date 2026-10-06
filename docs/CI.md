@@ -2,12 +2,12 @@
 
 ## Pipeline and check
 
-[Pipeline 35, argyle-nimble PR Validation](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build?definitionId=35)
+[Pipeline 35, Argyle NimBLE](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build?definitionId=35)
 runs in Azure DevOps organization `ArgyleConceptsLLC`, project `Argyle Converge`.
 Every build/test job selects the self-hosted `macOS` pool (pool ID 15, project
 queue ID 14) and demands a Darwin agent. There is no publishing job.
 
-The GitHub check name is **`argyle-nimble PR Validation`**, supplied by the
+The GitHub check name is **`Argyle NimBLE`**, supplied by the
 Azure Pipelines GitHub App, app ID **9426**. Branch protections require
 this exact name and App on `develop` and `master`. The initial successful
 validation is [run 7585](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build/results?buildId=7585).
