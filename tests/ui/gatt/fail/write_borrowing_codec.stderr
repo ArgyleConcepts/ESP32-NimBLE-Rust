@@ -1,0 +1,8 @@
+error: implementation of `Decode` is not general enough
+  --> tests/ui/gatt/fail/write_borrowing_codec.rs:32:6
+   |
+32 | impl Writable for Upload {
+   |      ^^^^^^^^ implementation of `Decode` is not general enough
+   |
+   = note: `Decode<'0>` would have to be implemented for the type `Frame<'static>`, for any lifetime `'0`...
+   = note: ...but `Decode<'1>` is actually implemented for the type `Frame<'1>`, for some specific lifetime `'1`

@@ -1,0 +1,8 @@
+error: implementation of `Decode` is not general enough
+  --> tests/ui/gatt/fail/descriptor_write_borrowed_bytes.rs:16:6
+   |
+16 | impl WritableDescriptor for Raw {
+   |      ^^^^^^^^^^^^^^^^^^ implementation of `Decode` is not general enough
+   |
+   = note: `Decode<'0>` would have to be implemented for the type `&'static [u8]`, for any lifetime `'0`...
+   = note: ...but `Decode<'1>` is actually implemented for the type `&'1 [u8]`, for some specific lifetime `'1`
