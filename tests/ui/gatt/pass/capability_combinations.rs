@@ -76,7 +76,7 @@ struct Everything;
 impl Characteristic for Everything {
     type Value = Sample;
     fn uuid(&self) -> Uuid {
-        Uuid::Uuid128(0x0000_a005_0000_1000_8000_0080_5f9b_34fb)
+        Uuid::Uuid128(0x7f1e_2d3c_4b5a_4968_8776_a5b4_c3d2_e1f0)
     }
 }
 impl Readable for Everything {

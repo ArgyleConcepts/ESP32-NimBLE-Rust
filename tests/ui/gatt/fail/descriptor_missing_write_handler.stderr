@@ -1,0 +1,14 @@
+error[E0277]: the trait bound `Label: WritableDescriptor` is not satisfied
+  --> tests/ui/gatt/fail/descriptor_missing_write_handler.rs:16:48
+   |
+16 |     let _ = DescriptorDef::new(Label).unwrap().writable();
+   |                                                ^^^^^^^^ the trait `WritableDescriptor` is not implemented for `Label`
+   |
+note: required by a bound in `DescriptorDef::<D>::writable`
+  --> src/gatt/descriptor.rs
+   |
+   |     pub fn writable(mut self) -> Self
+   |            -------- required by a bound in this associated function
+   |     where
+   |         D: WritableDescriptor,
+   |            ^^^^^^^^^^^^^^^^^^ required by this bound in `DescriptorDef::<D>::writable`

@@ -1,0 +1,5 @@
+error[E0599]: no method named `writable_without_response` found for struct `DescriptorDef` in the current scope
+  --> tests/ui/gatt/fail/descriptor_write_command_unsupported.rs:22:48
+   |
+22 |     let _ = DescriptorDef::new(Label).unwrap().writable_without_response();
+   |                                                ^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `DescriptorDef<Label>`

@@ -239,7 +239,8 @@ pub enum ErrorKind {
     /// [`source`](std::error::Error::source) is the [`EncodeError`].
     Encode,
     /// A GATT definition is structurally invalid, such as a characteristic
-    /// with no read, write, or notify capability.
+    /// with no read, write, or notify capability, or a reserved or repeated
+    /// descriptor UUID.
     Definition,
 }
 
@@ -273,11 +274,16 @@ enum Cause {
     },
     Backend(BackendError),
     Encode(EncodeError),
-    Definition {
-        service: Option<Uuid>,
-        characteristic: Option<Uuid>,
-        problem: &'static str,
-    },
+    // Boxed so the common error paths stay small.
+    Definition(Box<DefinitionLocation>),
+}
+
+#[derive(Debug)]
+struct DefinitionLocation {
+    service: Option<Uuid>,
+    characteristic: Option<Uuid>,
+    descriptor: Option<Uuid>,
+    problem: &'static str,
 }
 
 impl Error {
@@ -309,20 +315,22 @@ impl Error {
 }
 
 impl Error {
-    /// An invalid GATT definition, located by service and characteristic
-    /// UUID where known.
+    /// An invalid GATT definition, located by service, characteristic, and
+    /// descriptor UUID where known.
     pub(crate) fn definition(
         service: Option<Uuid>,
         characteristic: Option<Uuid>,
+        descriptor: Option<Uuid>,
         problem: &'static str,
     ) -> Self {
         Self {
             kind: ErrorKind::Definition,
-            cause: Cause::Definition {
+            cause: Cause::Definition(Box::new(DefinitionLocation {
                 service,
                 characteristic,
+                descriptor,
                 problem,
-            },
+            })),
         }
     }
 }
@@ -330,17 +338,22 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.cause {
-            Cause::Definition {
-                service,
-                characteristic,
-                problem,
-            } => {
+            Cause::Definition(location) => {
+                let DefinitionLocation {
+                    service,
+                    characteristic,
+                    descriptor,
+                    problem,
+                } = location.as_ref();
                 write!(formatter, "{}: ", self.kind)?;
                 if let Some(service) = service {
                     write!(formatter, "service {service}: ")?;
                 }
                 if let Some(characteristic) = characteristic {
                     write!(formatter, "characteristic {characteristic}: ")?;
+                }
+                if let Some(descriptor) = descriptor {
+                    write!(formatter, "descriptor {descriptor}: ")?;
                 }
                 formatter.write_str(problem)
             }
@@ -361,7 +374,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.cause {
-            Cause::Message { .. } | Cause::Definition { .. } => None,
+            Cause::Message { .. } | Cause::Definition(_) => None,
             Cause::Backend(error) => Some(error),
             Cause::Encode(error) => Some(error),
         }

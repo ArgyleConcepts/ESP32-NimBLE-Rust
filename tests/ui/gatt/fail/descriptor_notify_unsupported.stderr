@@ -1,0 +1,5 @@
+error[E0599]: no method named `notifiable` found for struct `DescriptorDef` in the current scope
+  --> tests/ui/gatt/fail/descriptor_notify_unsupported.rs:17:48
+   |
+17 |     let _ = DescriptorDef::new(Label).unwrap().notifiable();
+   |                                                ^^^^^^^^^^ method not found in `DescriptorDef<Label>`

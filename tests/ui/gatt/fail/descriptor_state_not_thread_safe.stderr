@@ -1,0 +1,35 @@
+error[E0277]: `Rc<Cell<u8>>` cannot be shared between threads safely
+  --> tests/ui/gatt/fail/descriptor_state_not_thread_safe.rs:11:21
+   |
+11 | impl Descriptor for Counter {
+   |                     ^^^^^^^ `Rc<Cell<u8>>` cannot be shared between threads safely
+   |
+   = help: within `Counter`, the trait `Sync` is not implemented for `Rc<Cell<u8>>`
+note: required because it appears within the type `Counter`
+  --> tests/ui/gatt/fail/descriptor_state_not_thread_safe.rs:9:8
+   |
+ 9 | struct Counter(Rc<Cell<u8>>);
+   |        ^^^^^^^
+note: required by a bound in `Descriptor`
+  --> src/gatt/descriptor.rs
+   |
+   | pub trait Descriptor: Send + Sync + 'static {
+   |                              ^^^^ required by this bound in `Descriptor`
+
+error[E0277]: `Rc<Cell<u8>>` cannot be sent between threads safely
+  --> tests/ui/gatt/fail/descriptor_state_not_thread_safe.rs:11:21
+   |
+11 | impl Descriptor for Counter {
+   |                     ^^^^^^^ `Rc<Cell<u8>>` cannot be sent between threads safely
+   |
+   = help: within `Counter`, the trait `Send` is not implemented for `Rc<Cell<u8>>`
+note: required because it appears within the type `Counter`
+  --> tests/ui/gatt/fail/descriptor_state_not_thread_safe.rs:9:8
+   |
+ 9 | struct Counter(Rc<Cell<u8>>);
+   |        ^^^^^^^
+note: required by a bound in `Descriptor`
+  --> src/gatt/descriptor.rs
+   |
+   | pub trait Descriptor: Send + Sync + 'static {
+   |                       ^^^^ required by this bound in `Descriptor`

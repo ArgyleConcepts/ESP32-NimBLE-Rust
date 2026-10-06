@@ -9,9 +9,9 @@
 //!   application codecs, over Rust-owned bytes only.
 //! - [`AttError`] for ATT results returned to a client, and [`Error`] for
 //!   framework failures; the two are deliberately separate.
-//! - [`gatt`]: declarative services and characteristics whose capabilities
-//!   are checked at compile time, frozen into a [`gatt::GattServer`]
-//!   definition.
+//! - [`gatt`]: declarative services, characteristics, and custom descriptors
+//!   whose capabilities are checked at compile time, frozen into a
+//!   [`gatt::GattServer`] definition.
 //!
 //! There is no BLE controller, NimBLE registration, or runtime behavior yet. Private
 //! tooling validates consumer build context and generates bindings from the

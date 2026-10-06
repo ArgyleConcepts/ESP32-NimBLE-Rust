@@ -1,0 +1,14 @@
+error[E0277]: the trait bound `Label: ReadableDescriptor` is not satisfied
+  --> tests/ui/gatt/fail/descriptor_missing_read_handler.rs:16:48
+   |
+16 |     let _ = DescriptorDef::new(Label).unwrap().readable();
+   |                                                ^^^^^^^^ the trait `ReadableDescriptor` is not implemented for `Label`
+   |
+note: required by a bound in `DescriptorDef::<D>::readable`
+  --> src/gatt/descriptor.rs
+   |
+   |     pub fn readable(mut self) -> Self
+   |            -------- required by a bound in this associated function
+   |     where
+   |         D: ReadableDescriptor,
+   |            ^^^^^^^^^^^^^^^^^^ required by this bound in `DescriptorDef::<D>::readable`

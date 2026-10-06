@@ -1,0 +1,37 @@
+error[E0478]: lifetime bound not satisfied
+  --> tests/ui/gatt/fail/descriptor_state_borrowed.rs:10:10
+   |
+10 | impl<'a> Descriptor for Setting<'a> {
+   |          ^^^^^^^^^^
+   |
+note: lifetime parameter instantiated with the lifetime `'a` as defined here
+  --> tests/ui/gatt/fail/descriptor_state_borrowed.rs:10:6
+   |
+10 | impl<'a> Descriptor for Setting<'a> {
+   |      ^^
+   = note: but lifetime parameter must outlive the static lifetime
+
+error[E0803]: cannot infer an appropriate lifetime for lifetime parameter `'a` due to conflicting requirements
+  --> tests/ui/gatt/fail/descriptor_state_borrowed.rs:10:25
+   |
+10 | impl<'a> Descriptor for Setting<'a> {
+   |                         ^^^^^^^^^^^
+   |
+note: first, the lifetime cannot outlive the lifetime `'a` as defined here...
+  --> tests/ui/gatt/fail/descriptor_state_borrowed.rs:10:6
+   |
+10 | impl<'a> Descriptor for Setting<'a> {
+   |      ^^
+note: ...so that the types are compatible
+  --> tests/ui/gatt/fail/descriptor_state_borrowed.rs:10:25
+   |
+10 | impl<'a> Descriptor for Setting<'a> {
+   |                         ^^^^^^^^^^^
+   = note: expected `<Setting<'a> as Descriptor>`
+              found `<Setting<'_> as Descriptor>`
+   = note: but, the lifetime must be valid for the static lifetime...
+note: ...so that the declared lifetime parameter bounds are satisfied
+  --> tests/ui/gatt/fail/descriptor_state_borrowed.rs:10:25
+   |
+10 | impl<'a> Descriptor for Setting<'a> {
+   |                         ^^^^^^^^^^^

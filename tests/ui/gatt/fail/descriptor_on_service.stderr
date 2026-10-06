@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/gatt/fail/descriptor_on_service.rs:23:67
+   |
+23 |     let _ = Service::primary(Uuid::Uuid16(0x180f)).characteristic(descriptor);
+   |                                                    -------------- ^^^^^^^^^^ expected `CharacteristicDef<_>`, found `DescriptorDef<Label>`
+   |                                                    |
+   |                                                    arguments to this method are incorrect
+   |
+   = note: expected struct `CharacteristicDef<_>`
+              found struct `DescriptorDef<Label>`
+note: method defined here
+  --> src/gatt.rs
+   |
+   |     pub fn characteristic<C: Characteristic>(mut self, definition: CharacteristicDef<C>) -> Self {
+   |            ^^^^^^^^^^^^^^
