@@ -86,9 +86,11 @@
 //!   [`CharacteristicDef::notifiable`].
 //!
 //! **At runtime**, [`GattServer::new`] rejects a server without services, a
-//! characteristic without any capability, a characteristic whose UUID is one
-//! of GATT's own declaration types (`0x2800`–`0x2803`, in any width), and a
-//! [`Characteristic::MAX_LEN`] above the 512-byte attribute limit.
+//! service that duplicates the stack's own GAP (`0x1800`) or GATT (`0x1801`)
+//! service, a characteristic without any capability, a characteristic whose
+//! UUID is one of GATT's own declaration types (`0x2800`–`0x2803`, in any
+//! width), and a [`Characteristic::MAX_LEN`] above the 512-byte attribute
+//! limit.
 //!
 //! # Descriptors
 //!
@@ -125,21 +127,29 @@
 //! support relies on NimBLE's; applications cannot supply one.
 //! Indications are not supported.
 //!
-//! # Planned request handling
+//! # Request handling
 //!
-//! Registering a server with NimBLE is not implemented yet, so no handler is
-//! called by the BLE stack today. The following is the contract the
-//! registration work will implement; the request logic it will use is in
-//! place and unit-tested:
+//! [`Ble::start`](crate::Ble::start) registers the server with NimBLE; every
+//! characteristic and descriptor then answers client requests through its
+//! handlers:
 //!
+//! - Reads encode the handler's value within `MAX_LEN`; a value that cannot
+//!   be encoded is reported to the client as [`AttError::UNLIKELY`], and one
+//!   NimBLE cannot buffer as [`AttError::INSUFFICIENT_RESOURCES`].
 //! - A written value longer than `MAX_LEN` is rejected with
-//!   [`AttError::INVALID_ATTRIBUTE_VALUE_LENGTH`] before decoding, decode
-//!   failures become the matching [`AttError`], and a read value that cannot
-//!   be encoded within `MAX_LEN` is reported to the client as
-//!   [`AttError::UNLIKELY`].
-//! - Handlers are synchronous and will run on the NimBLE host task. Keep them
+//!   [`AttError::INVALID_ATTRIBUTE_VALUE_LENGTH`] before it is copied or
+//!   decoded, and decode failures become the matching [`AttError`].
+//! - A request for an operation the attribute did not declare is refused
+//!   with [`AttError::READ_NOT_PERMITTED`] or
+//!   [`AttError::WRITE_NOT_PERMITTED`] even if it reaches the handler path,
+//!   independent of NimBLE's permission check.
+//! - Handlers never see native buffers or pointers. Written values are
+//!   decoded into owned values, so nothing a handler keeps refers to the
+//!   request's storage.
+//! - Handlers are synchronous and run on the NimBLE host task. Keep them
 //!   short and non-blocking: the host processes no other BLE events while a
-//!   handler runs.
+//!   handler runs. (NimBLE's own notification helpers would call read
+//!   handlers on whichever thread sends; this crate does not use them.)
 //! - The framework holds no locks of its own while calling a handler, so a
 //!   handler may take application locks; avoiding deadlocks between those
 //!   locks and other application threads is the application's
@@ -149,28 +159,32 @@
 //!   NimBLE reads values longer than one ATT packet in pieces and calls the
 //!   handler for each piece. A value that changes between calls can reach the
 //!   client mixed; keep long values stable or keep them within one packet.
+//! - A panic in a handler or codec is not caught: native callbacks are
+//!   `extern "C"` and ESP targets build with `panic=abort`, so it aborts the
+//!   program instead of unwinding into NimBLE.
 //!
 //! # Shared state
 //!
 //! Share state with the rest of the program through thread-safe types such as
 //! `Arc<Mutex<_>>` or atomics. Handlers and application codec implementations
-//! ([`Encode`] and [`Decode`](crate::codec::Decode)) must not panic; how a
-//! panic is contained will be defined when handlers are connected to NimBLE.
+//! ([`Encode`] and [`Decode`](crate::codec::Decode)) must not panic.
 //!
 //! Handlers receive no request context, such as the connection, yet. Phase 1
 //! serves one client with open access; if context is added, it will arrive
 //! as new provided trait methods so existing handlers keep compiling.
 //!
-//! Registration with NimBLE and sending notifications are not part of this
-//! module yet. Descriptor requests follow the same planned contract as
-//! characteristic requests.
+//! Sending notifications is not part of this module yet. Descriptor requests
+//! follow the same contract as characteristic requests.
 
 mod descriptor;
+pub(crate) mod registration;
 
 pub use descriptor::{Descriptor, DescriptorDef, ReadableDescriptor, WritableDescriptor};
 
 use crate::codec::{decode_value, DecodeOwned, Encode, ValueWriter, MAX_ATTRIBUTE_VALUE_LEN};
 use crate::{AttError, Error, Uuid};
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use descriptor::DescriptorAccess;
 use descriptor::RegisteredDescriptor;
 use std::fmt;
 use std::marker::PhantomData;
@@ -200,7 +214,7 @@ pub trait Characteristic: Send + Sync + 'static {
 pub trait Readable: Characteristic<Value: Encode> {
     /// Return the current value, or the ATT error to send to the client.
     /// One client read of a long value may call this more than once; see the
-    /// [module documentation](crate::gatt#planned-request-handling).
+    /// [module documentation](crate::gatt#request-handling).
     fn read(&self) -> Result<Self::Value, AttError>;
 }
 
@@ -264,7 +278,7 @@ pub struct NotifyEndpoint<V> {
 }
 
 impl<V> NotifyEndpoint<V> {
-    // Read by the notification runtime in a later ticket and by tests.
+    // Read by notification sending (a later ticket) and by tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn id(&self) -> &EndpointId {
         &self.id
@@ -318,8 +332,8 @@ fn write_thunk<C: Writable>(characteristic: &C, data: &[u8]) -> Result<(), AttEr
 /// an undeclarable capability fails to compile. Repeating a declaration has
 /// no further effect.
 pub struct CharacteristicDef<C: Characteristic> {
-    // Called through `RegisteredCharacteristic` by registration in a later
-    // ticket and by tests.
+    // Called through `RegisteredCharacteristic` by the registration access
+    // path, which host builds without NimBLE never run.
     #[cfg_attr(not(test), allow(dead_code))]
     characteristic: C,
     uuid: Uuid,
@@ -427,7 +441,7 @@ impl<C: Characteristic> fmt::Debug for CharacteristicDef<C> {
 }
 
 /// A characteristic definition with its type erased, as stored in a frozen
-/// server and dispatched by the registration code (a later ticket).
+/// server and dispatched by [`registration`].
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait RegisteredCharacteristic: Send + Sync {
     fn uuid(&self) -> Uuid;
@@ -507,7 +521,7 @@ impl Service {
         self
     }
 
-    // Read by registration in a later ticket and by tests.
+    // Read by `registration`; host builds without NimBLE only plan.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn uuid(&self) -> Uuid {
         self.uuid
@@ -550,6 +564,12 @@ const GATT_DECLARATIONS: [u128; 4] = [
     Uuid::Uuid16(0x2803).to_u128(),
 ];
 
+/// The GAP and GATT services, which NimBLE registers itself.
+const STACK_SERVICES: [u128; 2] = [
+    Uuid::Uuid16(0x1800).to_u128(),
+    Uuid::Uuid16(0x1801).to_u128(),
+];
+
 /// A validated, frozen set of services, ready to transfer to the BLE owner.
 ///
 /// It is `Send + Sync`, owns every characteristic, and offers no way to change
@@ -563,7 +583,9 @@ impl GattServer {
     /// Validate and freeze `services`, in order.
     ///
     /// Returns an [`ErrorKind::Definition`](crate::ErrorKind::Definition)
-    /// error if there are no services, a characteristic declares no
+    /// error if there are no services, a service is the GAP (`0x1800`) or
+    /// GATT (`0x1801`) service that the stack provides, a characteristic
+    /// declares no
     /// capability, a characteristic uses a GATT declaration UUID
     /// (`0x2800`–`0x2803`), a descriptor declares no access, a User
     /// Description (`0x2901`) or Presentation Format (`0x2904`) descriptor
@@ -582,6 +604,14 @@ impl GattServer {
             ));
         }
         for service in services.iter() {
+            if STACK_SERVICES.contains(&service.uuid.to_u128()) {
+                return Err(Error::definition(
+                    Some(service.uuid),
+                    None,
+                    None,
+                    "the GAP (0x1800) and GATT (0x1801) services are provided by the stack",
+                ));
+            }
             for characteristic in &service.characteristics {
                 let located = |problem| {
                     Error::definition(
@@ -638,7 +668,7 @@ impl GattServer {
         Ok(Self { services })
     }
 
-    // Read by registration in a later ticket and by tests.
+    // Read by `registration`; host builds without NimBLE only plan.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn services(&self) -> &[Service] {
         &self.services
@@ -980,7 +1010,7 @@ mod tests {
             "invalid GATT definition: service 180f: characteristic 2a19: no read, write, or notify capability is declared"
         );
 
-        let too_long = Service::primary(Uuid::Uuid16(0x1800))
+        let too_long = Service::primary(Uuid::Uuid16(0x181c))
             .characteristic(CharacteristicDef::new(TooLong).readable());
         let error = GattServer::new([too_long]).unwrap_err();
         assert!(error.to_string().contains("characteristic fff1: MAX_LEN"));
@@ -1003,7 +1033,7 @@ mod tests {
             Uuid::Uuid32(0x2802),
             Uuid::Uuid128(Uuid::Uuid16(0x2803).to_u128()),
         ] {
-            let service = Service::primary(Uuid::Uuid16(0x1800))
+            let service = Service::primary(Uuid::Uuid16(0x181c))
                 .characteristic(CharacteristicDef::new(Declaration(uuid)).readable());
             let error = GattServer::new([service]).unwrap_err();
             assert!(
@@ -1018,13 +1048,25 @@ mod tests {
             Uuid::Uuid16(0x2804),
             Uuid::Uuid16(0x2902),
         ] {
-            let service = Service::primary(Uuid::Uuid16(0x1800))
+            let service = Service::primary(Uuid::Uuid16(0x181c))
                 .characteristic(CharacteristicDef::new(Declaration(uuid)).readable());
             assert!(GattServer::new([service]).is_ok(), "{uuid}");
         }
 
         // A service without characteristics is valid on its own.
-        assert!(GattServer::new([Service::primary(Uuid::Uuid16(0x1801))]).is_ok());
+        assert!(GattServer::new([Service::primary(Uuid::Uuid16(0x181d))]).is_ok());
+
+        // The stack registers the GAP and GATT services itself, in any width.
+        for uuid in [
+            Uuid::Uuid16(0x1800),
+            Uuid::Uuid128(Uuid::Uuid16(0x1801).to_u128()),
+        ] {
+            let error = GattServer::new([Service::primary(uuid)]).unwrap_err();
+            assert!(
+                error.to_string().contains("provided by the stack"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -1322,7 +1364,7 @@ mod tests {
                 .descriptor(setting(0x2901, &value).readable()),
         );
         let server = GattServer::new([service]).unwrap();
-        // Registration (a later ticket) passes NimBLE a thin pointer, such as
+        // Registration passes NimBLE a thin pointer, such as
         // the address of a boxed entry's slot, so both the trait objects and
         // the slots that hold them must stay put once the server is built.
         let addresses = |server: &GattServer| {

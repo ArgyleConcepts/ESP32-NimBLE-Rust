@@ -141,7 +141,7 @@ extern "C" fn host_task(_argument: *mut c_void) {
 }
 
 /// An owned native buffer chain.
-pub(crate) struct EspMbuf(NonNull<bindings::os_mbuf>);
+pub(crate) struct EspMbuf(pub(super) NonNull<bindings::os_mbuf>);
 
 /// The ESP-IDF NimBLE host. There is one native host per firmware; the
 /// [`Ble`](crate::Ble) owner controls its lifecycle.
@@ -149,6 +149,19 @@ pub(crate) struct EspBackend;
 
 impl Backend for EspBackend {
     type Mbuf = EspMbuf;
+    type Registration = super::esp_gatt::EspRegistration;
+
+    fn prepare_gatt(&self, plan: &crate::gatt::registration::GattPlan) -> Self::Registration {
+        super::esp_gatt::prepare(plan)
+    }
+
+    fn register_gatt(&self, registration: &Self::Registration) -> NativeResult<()> {
+        super::esp_gatt::register(registration)
+    }
+
+    fn value_handles(&self, registration: &Self::Registration) -> Vec<u16> {
+        super::esp_gatt::value_handles(registration)
+    }
 
     fn host_init(&self) -> NativeResult<()> {
         // SAFETY: plain SDK call with no arguments.

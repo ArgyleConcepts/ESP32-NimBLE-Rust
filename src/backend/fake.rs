@@ -15,7 +15,10 @@ use super::gap::GapEvent;
 use super::native::{
     check, native_length, Backend, NativeError, NativeEvent, NativeResult, Operation,
 };
+use crate::gatt::registration::{CharacteristicSlot, DescriptorSlot, GattPlan};
+use crate::Uuid;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// One-shot rendezvous: a worker calls [`Gate::pass`] and blocks until the
@@ -111,6 +114,10 @@ pub(crate) enum NativeCall {
         connection: u16,
     },
     InferAddress,
+    GattCount,
+    GattAdd,
+    /// The registration's tables were freed.
+    RegistrationFreed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,9 +147,17 @@ pub(crate) struct FakeMbuf {
     id: u32,
 }
 
+impl FakeMbuf {
+    pub(crate) fn id(&self) -> u32 {
+        self.id
+    }
+}
+
 struct MbufRecord {
     data: Vec<u8>,
     state: MbufState,
+    /// Segment lengths of the chain, in order; they sum to `data.len()`.
+    segments: Vec<usize>,
 }
 
 struct Hold {
@@ -160,6 +175,58 @@ struct FakeState {
     notifications: Vec<(u16, u16, Vec<u8>)>,
     mtu: HashMap<u16, u16>,
     host_thread: Option<std::thread::ThreadId>,
+    /// Handle slots and layout of the last registration, filled in when the
+    /// host starts, as NimBLE does.
+    registered: Option<(Arc<[AtomicU16]>, Layout)>,
+    /// Leave value handles unassigned at host start, as when NimBLE's
+    /// attribute allocation fails with assertions disabled.
+    skip_handle_assignment: bool,
+}
+
+/// Per service, each characteristic's notify flag, descriptor count, and
+/// handle-slot index.
+type Layout = Vec<Vec<(bool, usize, usize)>>;
+
+/// A characteristic as the fake registered it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FakeCharacteristic {
+    pub(crate) uuid: Uuid,
+    pub(crate) access: crate::gatt::Access,
+    pub(crate) slot: CharacteristicSlot,
+    pub(crate) descriptors: Vec<(Uuid, crate::gatt::DescriptorAccess, DescriptorSlot)>,
+    pub(crate) handle_index: usize,
+}
+
+/// A service as the fake registered it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FakeService {
+    pub(crate) uuid: Uuid,
+    pub(crate) characteristics: Vec<FakeCharacteristic>,
+}
+
+/// The fake's tables: a snapshot of the plan and the value-handle slots it
+/// fills on registration. Dropping it records
+/// [`NativeCall::RegistrationFreed`].
+pub(crate) struct FakeRegistration {
+    pub(crate) services: Vec<FakeService>,
+    handles: Arc<[AtomicU16]>,
+    state: Arc<Mutex<FakeState>>,
+}
+
+// SAFETY: the slot pointers are only compared and dereferenced by tests while
+// the server they point into is alive, as native code would.
+unsafe impl Send for FakeRegistration {}
+// SAFETY: as above; the handles are atomics.
+unsafe impl Sync for FakeRegistration {}
+
+impl Drop for FakeRegistration {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .calls
+            .push(NativeCall::RegistrationFreed);
+    }
 }
 
 /// Cheaply cloneable handle to one shared fake host.
@@ -210,6 +277,11 @@ impl FakeBackend {
         gate
     }
 
+    /// Make the next host start leave every value handle unassigned.
+    pub(crate) fn skip_handle_assignment(&self) {
+        self.lock().skip_handle_assignment = true;
+    }
+
     /// Treat `thread` as the native host task.
     pub(crate) fn set_host_thread(&self, thread: std::thread::ThreadId) {
         self.lock().host_thread = Some(thread);
@@ -232,6 +304,31 @@ impl FakeBackend {
     }
 
     /// Current bytes of a buffer, including after it was released.
+    /// A live chained buffer holding `segments` in order, as NimBLE delivers
+    /// a long write; NimBLE created it, so no native call is recorded. The
+    /// test frees it, as NimBLE frees access buffers.
+    pub(crate) fn mbuf_from_segments(&self, segments: &[&[u8]]) -> FakeMbuf {
+        let mut state = self.lock();
+        state.next_mbuf += 1;
+        let id = state.next_mbuf;
+        state.mbufs.insert(
+            id,
+            MbufRecord {
+                data: segments.concat(),
+                state: MbufState::Live,
+                segments: segments.iter().map(|segment| segment.len()).collect(),
+            },
+        );
+        FakeMbuf { id }
+    }
+
+    pub(crate) fn mbuf_segments(&self, id: u32) -> Option<Vec<usize>> {
+        self.lock()
+            .mbufs
+            .get(&id)
+            .map(|record| record.segments.clone())
+    }
+
     pub(crate) fn mbuf_data(&self, id: u32) -> Option<Vec<u8>> {
         self.lock().mbufs.get(&id).map(|record| record.data.clone())
     }
@@ -341,6 +438,7 @@ impl FakeBackend {
 
 impl Backend for FakeBackend {
     type Mbuf = FakeMbuf;
+    type Registration = FakeRegistration;
 
     fn host_init(&self) -> NativeResult<()> {
         check(
@@ -379,11 +477,33 @@ impl Backend for FakeBackend {
         self.callbacks.remove(|| {}).map_err(|_| reentrant)
     }
 
+    /// Like NimBLE's host start, which runs `ble_gatts_start`: assigns the
+    /// registered attributes' handles, starting after the stack's own
+    /// services. Each service has a declaration, then per characteristic a
+    /// declaration, the value, the CCCD when notify-capable, and its
+    /// descriptors.
     fn host_start(&self) -> NativeResult<()> {
         check(
             Operation::HostStart,
             self.enter(Operation::HostStart, NativeCall::HostStart),
-        )
+        )?;
+        let registered = self.lock().registered.take();
+        if let Some((handles, layout)) = registered {
+            if self.lock().skip_handle_assignment {
+                return Ok(());
+            }
+            // `next` is the next free handle; the stack's services end at 0x10.
+            let mut next = 0x0011_u16;
+            for service in layout {
+                next += 1; // service declaration
+                for (notify, descriptors, slot) in service {
+                    let value = next + 1; // after the characteristic declaration
+                    handles[slot].store(value, Ordering::Relaxed);
+                    next = value + 1 + u16::from(notify) + descriptors as u16;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn host_stop(&self) -> NativeResult<()> {
@@ -418,6 +538,7 @@ impl Backend for FakeBackend {
             MbufRecord {
                 data: data.to_vec(),
                 state: MbufState::Live,
+                segments: vec![data.len()],
             },
         );
         Ok(FakeMbuf { id })
@@ -446,7 +567,8 @@ impl Backend for FakeBackend {
             data.len() / 2
         };
         self.with_live(mbuf.id, Operation::MbufAppend, |record| {
-            record.data.extend_from_slice(&data[..copied])
+            record.data.extend_from_slice(&data[..copied]);
+            record.segments.push(copied);
         })
         .ok_or(NativeError::Status {
             operation: Operation::MbufAppend,
@@ -543,6 +665,78 @@ impl Backend for FakeBackend {
     fn mtu(&self, connection: u16) -> Option<u16> {
         self.enter(Operation::Mtu, NativeCall::Mtu { connection });
         self.lock().mtu.get(&connection).copied()
+    }
+
+    fn prepare_gatt(&self, plan: &GattPlan) -> FakeRegistration {
+        let services: Vec<FakeService> = plan
+            .services
+            .iter()
+            .map(|service| FakeService {
+                uuid: service.uuid,
+                characteristics: service
+                    .characteristics
+                    .iter()
+                    .map(|characteristic| FakeCharacteristic {
+                        uuid: characteristic.uuid,
+                        access: characteristic.access,
+                        slot: characteristic.slot,
+                        handle_index: characteristic.handle_index,
+                        descriptors: characteristic
+                            .descriptors
+                            .iter()
+                            .map(|descriptor| (descriptor.uuid, descriptor.access, descriptor.slot))
+                            .collect(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let count = plan.characteristics().count();
+        FakeRegistration {
+            services,
+            handles: (0..count).map(|_| AtomicU16::new(0)).collect(),
+            state: self.state.clone(),
+        }
+    }
+
+    /// Like `ble_gatts_count_cfg` and `ble_gatts_add_svcs`: records the
+    /// tables for the host start, which assigns handles. Both calls are
+    /// all-or-nothing.
+    fn register_gatt(&self, registration: &FakeRegistration) -> NativeResult<()> {
+        check(
+            Operation::GattCount,
+            self.enter(Operation::GattCount, NativeCall::GattCount),
+        )?;
+        check(
+            Operation::GattAdd,
+            self.enter(Operation::GattAdd, NativeCall::GattAdd),
+        )?;
+        let layout = registration
+            .services
+            .iter()
+            .map(|service| {
+                service
+                    .characteristics
+                    .iter()
+                    .map(|characteristic| {
+                        (
+                            characteristic.access.notify,
+                            characteristic.descriptors.len(),
+                            characteristic.handle_index,
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        self.lock().registered = Some((registration.handles.clone(), layout));
+        Ok(())
+    }
+
+    fn value_handles(&self, registration: &FakeRegistration) -> Vec<u16> {
+        registration
+            .handles
+            .iter()
+            .map(|handle| handle.load(Ordering::Relaxed))
+            .collect()
     }
 
     fn is_host_task(&self) -> bool {

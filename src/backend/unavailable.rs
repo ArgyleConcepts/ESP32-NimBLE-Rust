@@ -5,6 +5,7 @@
 
 use super::dispatch::EventDispatcher;
 use super::native::{Backend, NativeResult};
+use crate::gatt::registration::GattPlan;
 use std::sync::Arc;
 
 /// An uninhabited backend.
@@ -12,6 +13,7 @@ pub(crate) enum Unavailable {}
 
 impl Backend for Unavailable {
     type Mbuf = Unavailable;
+    type Registration = Unavailable;
 
     fn host_init(&self) -> NativeResult<()> {
         match *self {}
@@ -62,6 +64,15 @@ impl Backend for Unavailable {
         match *self {}
     }
     fn is_host_task(&self) -> bool {
+        match *self {}
+    }
+    fn prepare_gatt(&self, _: &GattPlan) -> Unavailable {
+        match *self {}
+    }
+    fn register_gatt(&self, _: &Unavailable) -> NativeResult<()> {
+        match *self {}
+    }
+    fn value_handles(&self, _: &Unavailable) -> Vec<u16> {
         match *self {}
     }
 }

@@ -199,7 +199,11 @@ scripted SDK status codes, and keeps a buffer ledger that detects leaks,
 double frees, and double transfers. Its gates coordinate overlapping
 operations without sleeps. The `Ble` owner tests drive singleton contention,
 every startup stage, failure and cleanup at each stage, poisoning, and owner
-moves through the same fake. The tests show framework logic on the host only;
+moves through the same fake. GATT registration tests check the plan built
+from a server, value-handle mapping, callback-argument routing, malformed and
+undeclared requests, length checks before copying, buffer failures, and the
+buffer ledger on every path; the native table translation itself is only
+compiled for the targets. The tests show framework logic on the host only;
 they are not SDK, target, or hardware evidence. The firmware fixtures compile
 the real ESP backend for C3 and S3. `tests/compile_contracts.rs` uses
 [trybuild](https://docs.rs/trybuild) to compile the `tests/ui/gatt` and

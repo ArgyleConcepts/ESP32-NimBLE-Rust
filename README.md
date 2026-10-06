@@ -22,16 +22,19 @@ the BLE boundary and the declaration of a GATT server:
   notification endpoints.
 
 - `Ble`: the single owner of the NimBLE host. Its type tracks configuring
-  and running states; startup runs host initialization, callback
-  installation, host start, synchronization with a finite timeout, and
-  address inference, reporting a structured `StartError` per stage. Cleanup
-  never frees storage native code can reach and never touches NVS.
+  and running states; startup runs host initialization, GATT registration,
+  callback installation, host start, synchronization with a finite timeout,
+  and address inference, reporting a structured `StartError` per stage.
+  Cleanup never frees storage native code can reach and never touches NVS.
+- GATT registration builds NimBLE's service, characteristic, and descriptor
+  tables from the frozen server, and private access callbacks route client
+  reads and writes to the typed handlers through the codecs. Handlers never
+  see native buffers.
 
-The firmware fixtures compile the startup path for ESP32-C3 and ESP32-S3, and
-host tests drive it against a fake backend; it has **not been run on
-hardware**. It has **no NimBLE
-registration of GATT definitions, advertising, connection handling, or
-published package**. See the rustdoc on each type for contracts and examples. Its private,
+The firmware fixtures compile the startup and registration paths for
+ESP32-C3 and ESP32-S3, and host tests drive them against a fake backend; they
+have **not been run on hardware**. There is **no advertising, connection
+handling, notification sending, or published package**. See the rustdoc on each type for contracts and examples. Its private,
 versioned ESP-IDF build-context contract can validate the configured SDK,
 consumer compiler arguments, and Bluetooth/NimBLE configuration for ESP32-C3
 and ESP32-S3. Private binding-generation code and narrow C shims define the

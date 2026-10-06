@@ -13,6 +13,7 @@
 use super::dispatch::EventDispatcher;
 use super::gap::GapEvent;
 use crate::error::{BackendDetail, BackendError, Error, ErrorKind};
+use crate::gatt::registration::GattPlan;
 use std::fmt;
 use std::sync::Arc;
 
@@ -36,6 +37,8 @@ pub(crate) enum Operation {
     AdvertisingStop,
     Mtu,
     InferAddress,
+    GattCount,
+    GattAdd,
 }
 
 impl Operation {
@@ -58,6 +61,8 @@ impl Operation {
             Self::AdvertisingStop => "ble_gap_adv_stop",
             Self::Mtu => "ble_att_mtu",
             Self::InferAddress => "ble_hs_id_infer_auto",
+            Self::GattCount => "ble_gatts_count_cfg",
+            Self::GattAdd => "ble_gatts_add_svcs",
         }
     }
 
@@ -82,7 +87,9 @@ impl Operation {
             | Self::Terminate
             | Self::AdvertisingStop
             | Self::Mtu
-            | Self::InferAddress => BackendDetail::HostStatus(code),
+            | Self::InferAddress
+            | Self::GattCount
+            | Self::GattAdd => BackendDetail::HostStatus(code),
         }
     }
 }
@@ -230,6 +237,10 @@ pub(crate) trait Backend: Send + Sync {
     /// An owned native buffer handle. It is not `Clone`: each handle is freed
     /// or transferred exactly once.
     type Mbuf;
+    /// Native GATT tables built from a plan. They must stay alive, unmoved,
+    /// until the host is deinitialized, because NimBLE keeps pointers to
+    /// them, including after a failed registration.
+    type Registration: Send + Sync;
 
     /// Initialize the NimBLE port and controller.
     fn host_init(&self) -> NativeResult<()>;
@@ -284,6 +295,14 @@ pub(crate) trait Backend: Send + Sync {
     /// wait for the host task, such as stopping it, would wait for themselves
     /// there; this covers every native callback, not only dispatched events.
     fn is_host_task(&self) -> bool;
+    /// Build native tables for `plan` without any native call.
+    fn prepare_gatt(&self, plan: &GattPlan) -> Self::Registration;
+    /// Count and add the prepared services. Call after host
+    /// initialization and before the host starts.
+    fn register_gatt(&self, registration: &Self::Registration) -> NativeResult<()>;
+    /// Characteristic value handles in plan order, as assigned when the host
+    /// started; zero before then.
+    fn value_handles(&self, registration: &Self::Registration) -> Vec<u16>;
 }
 
 #[cfg(test)]
@@ -448,6 +467,8 @@ mod tests {
             Operation::AdvertisingStop,
             Operation::Mtu,
             Operation::InferAddress,
+            Operation::GattCount,
+            Operation::GattAdd,
         ];
         let names: std::collections::BTreeSet<_> = operations
             .iter()

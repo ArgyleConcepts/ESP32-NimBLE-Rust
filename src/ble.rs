@@ -55,9 +55,17 @@
 //!
 //! 1. [`StartStage::HostInit`]: `nimble_port_init`, which also initializes
 //!    the Bluetooth controller, then the standard GAP and GATT services.
-//! 2. [`StartStage::InstallCallbacks`]: the host sync and reset callbacks.
-//! 3. [`StartStage::HostStart`]: the NimBLE host task.
-//! 4. [`StartStage::Synchronization`]: wait until the host reports that it
+//! 2. [`StartStage::Registration`]: build NimBLE's GATT tables from the
+//!    server and hand them to NimBLE (`ble_gatts_count_cfg`,
+//!    `ble_gatts_add_svcs`). This only sizes and records the services.
+//! 3. [`StartStage::InstallCallbacks`]: the host sync and reset callbacks.
+//! 4. [`StartStage::HostStart`]: the NimBLE host task. When it starts, NimBLE
+//!    allocates the attributes and assigns their handles. In ESP-IDF 6.1 an
+//!    allocation failure there (for example a server too large for the
+//!    configured NimBLE memory) fails an assertion on the host task instead
+//!    of returning an error: with assertions enabled the firmware aborts, and
+//!    otherwise the host never synchronizes and startup times out.
+//! 5. [`StartStage::Synchronization`]: wait until the host reports that it
 //!    is synchronized with the controller. Host resets during the wait are
 //!    recorded, and NimBLE retries synchronization by itself. If the host
 //!    has not synchronized within the sync timeout ([`DEFAULT_SYNC_TIMEOUT`]
@@ -66,19 +74,22 @@
 //!    reason, and the host is shut down. Timeouts below
 //!    [`MIN_SYNC_TIMEOUT`] are raised to it, and a timeout too large to
 //!    represent as a deadline waits without a limit.
-//! 5. [`StartStage::AddressInference`]: choose the own-address type to
+//! 6. [`StartStage::AddressInference`]: choose the own-address type to
 //!    advertise with, without privacy.
 //!
 //! The GATT server is moved into heap storage owned by the running owner
 //! before any native call, so its address stays fixed however the owner
-//! moves. Registering it with NimBLE is not implemented yet; until then the
-//! host serves only the standard GAP and GATT services.
+//! moves. NimBLE's tables point into that storage, and the owner keeps them
+//! until NimBLE is deinitialized, including after a failed or partial
+//! registration; they are freed before the server. Requests are handled as
+//! described in [`gatt`](crate::gatt#request-handling).
 //!
 //! # Cleanup and ownership of shared resources
 //!
 //! On a failed start, on drop, and in [`Ble::shutdown`], the framework undoes
 //! only the stages it completed, in reverse: stop the host task,
-//! deinitialize the host, then remove the callbacks and free the storage.
+//! deinitialize the host (which also drops NimBLE's GATT registration), then
+//! remove the callbacks and free the GATT tables and the storage.
 //! If `nimble_port_init` fails, nothing is deinitialized, so resources the
 //! application owns are left alone. With the on-chip controller enabled
 //! (`CONFIG_BT_CONTROLLER_ENABLED`, the configuration Phase 1 targets), a
@@ -123,7 +134,8 @@
 
 use crate::backend::dispatch::{EventDispatcher, EventSink};
 use crate::backend::native::{Backend, NativeEvent};
-use crate::gatt::GattServer;
+use crate::gatt::registration::GattPlan;
+use crate::gatt::{EndpointId, GattServer};
 use crate::{Error, ErrorKind};
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -307,8 +319,6 @@ impl EventSink for HostEvents {
 /// Application definitions and callback state, boxed before native code is
 /// involved so their addresses stay fixed while the owner moves.
 struct Core {
-    // Registered with NimBLE by a later ticket.
-    #[cfg_attr(not(test), allow(dead_code))]
     server: GattServer,
     dispatcher: Arc<EventDispatcher>,
     events: Arc<HostEvents>,
@@ -363,6 +373,8 @@ impl<B: Backend> Configured<B> {
                 dispatcher,
                 events,
             })),
+            registration: None,
+            value_handles: Vec::new(),
             progress: Progress::default(),
             address_type: 0,
         };
@@ -371,6 +383,15 @@ impl<B: Backend> Configured<B> {
             return Err(started.fail(StartStage::HostInit, error.into(), None));
         }
         started.progress.initialized = true;
+
+        // The tables are owned before NimBLE sees them, so even a partial
+        // registration leaves NimBLE pointing at live storage.
+        let plan = GattPlan::new(&started.core().server);
+        started.registration = Some(started.backend.prepare_gatt(&plan));
+        let registration = started.registration.as_ref().expect("just prepared");
+        if let Err(error) = started.backend.register_gatt(registration) {
+            return Err(started.fail(StartStage::Registration, error.into(), None));
+        }
 
         let dispatcher = started.core().dispatcher.clone();
         if let Err(error) = started.backend.install_callbacks(dispatcher) {
@@ -398,6 +419,21 @@ impl<B: Backend> Configured<B> {
                 return Err(started.fail(StartStage::AddressInference, error.into(), None));
             }
         }
+
+        // NimBLE assigned the value handles when the host started. A zero
+        // means its attribute allocation failed without stopping the host
+        // (ESP-IDF assertions disabled); the database is unusable.
+        let registration = started.registration.as_ref().expect("registered");
+        let handles = started.backend.value_handles(registration);
+        if handles.contains(&0) {
+            let error = Error::new(
+                ErrorKind::Lifecycle,
+                Some("GATT registration"),
+                "NimBLE did not assign every attribute handle when the host started",
+            );
+            return Err(started.fail(StartStage::Registration, error, None));
+        }
+        started.value_handles = plan.endpoints().iter().cloned().zip(handles).collect();
         Ok(started)
     }
 }
@@ -416,6 +452,14 @@ pub(crate) struct Started<B: Backend> {
     backend: B,
     ownership: Option<Ownership>,
     core: Option<Box<Core>>,
+    /// NimBLE's GATT tables. They point into `core` and NimBLE points into
+    /// them, so they are freed after deinitialization and before `core`.
+    registration: Option<B::Registration>,
+    /// Characteristic value handles in registration order, with each
+    /// characteristic's notify endpoint.
+    // Used by notifications in a later ticket.
+    #[cfg_attr(not(test), allow(dead_code))]
+    value_handles: Vec<(Option<EndpointId>, u16)>,
     progress: Progress,
     // Used by advertising in a later ticket.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -456,12 +500,17 @@ impl<B: Backend> Started<B> {
         let core = self.core.take().expect("storage exists until shutdown");
         match self.undo(&core) {
             Ok(()) => {
+                // NimBLE no longer references the tables, and they no longer
+                // need the server.
+                drop(self.registration.take());
                 let Core { server, .. } = *core;
                 drop(ownership);
                 Ok(Some(server))
             }
             Err(cause) => {
-                // Native code may still reach the storage or the callbacks.
+                // Native code may still reach the tables, the storage, or the
+                // callbacks.
+                std::mem::forget(self.registration.take());
                 Box::leak(core);
                 ownership.poison();
                 Err(Error::poisoned(cause))
@@ -529,6 +578,8 @@ pub enum Access {
 pub enum StartStage {
     /// Initializing the NimBLE port and controller.
     HostInit,
+    /// Registering the GATT server's services with NimBLE.
+    Registration,
     /// Installing the host sync and reset callbacks.
     InstallCallbacks,
     /// Starting the host task.
@@ -543,6 +594,7 @@ impl fmt::Display for StartStage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::HostInit => "host initialization",
+            Self::Registration => "GATT registration",
             Self::InstallCallbacks => "callback installation",
             Self::HostStart => "host start",
             Self::Synchronization => "host synchronization",
@@ -817,17 +869,20 @@ mod tests {
         starting.join().unwrap()
     }
 
-    const STARTUP: [NativeCall; 4] = [
+    const STARTUP: [NativeCall; 6] = [
         NativeCall::HostInit,
+        NativeCall::GattCount,
+        NativeCall::GattAdd,
         NativeCall::InstallCallbacks,
         NativeCall::HostStart,
         NativeCall::InferAddress,
     ];
 
-    const TEARDOWN: [NativeCall; 3] = [
+    const TEARDOWN: [NativeCall; 4] = [
         NativeCall::HostStop,
         NativeCall::HostDeinit,
         NativeCall::RemoveCallbacks,
+        NativeCall::RegistrationFreed,
     ];
 
     #[test]
@@ -906,6 +961,8 @@ mod tests {
             fake.calls(),
             [
                 NativeCall::HostInit,
+                NativeCall::GattCount,
+                NativeCall::GattAdd,
                 NativeCall::InstallCallbacks,
                 NativeCall::HostStart
             ],
@@ -914,7 +971,7 @@ mod tests {
         // A reset while waiting wakes the waiter, which blocks again.
         fake.inject(NativeEvent::HostReset { reason: 19 });
         events.wait_until_parked(2);
-        assert_eq!(fake.calls().len(), 3);
+        assert_eq!(fake.calls().len(), 5);
         let synced_at = Instant::now();
         fake.inject(NativeEvent::HostSynced);
         let running = starting.join().unwrap().expect("ready after the sync");
@@ -938,11 +995,14 @@ mod tests {
             ],
             &[
                 HostInit,
+                GattCount,
+                GattAdd,
                 InstallCallbacks,
                 HostStart,
                 HostStop,
                 HostDeinit,
                 RemoveCallbacks,
+                RegistrationFreed,
             ],
         );
         assert_eq!(error.error().kind(), ErrorKind::Timeout);
@@ -1013,7 +1073,14 @@ mod tests {
             StartStage::InstallCallbacks,
             |fake| fake.fail_next(Operation::InstallCallbacks, 1),
             vec![],
-            &[HostInit, InstallCallbacks, HostDeinit],
+            &[
+                HostInit,
+                GattCount,
+                GattAdd,
+                InstallCallbacks,
+                HostDeinit,
+                RegistrationFreed,
+            ],
         );
         assert_eq!(error.cleanup(), Cleanup::Released);
 
@@ -1023,10 +1090,13 @@ mod tests {
             vec![],
             &[
                 HostInit,
+                GattCount,
+                GattAdd,
                 InstallCallbacks,
                 HostStart,
                 HostDeinit,
                 RemoveCallbacks,
+                RegistrationFreed,
             ],
         );
         assert_eq!(error.cleanup(), Cleanup::Released);
@@ -1037,16 +1107,148 @@ mod tests {
             vec![NativeEvent::HostSynced],
             &[
                 HostInit,
+                GattCount,
+                GattAdd,
                 InstallCallbacks,
                 HostStart,
                 InferAddress,
                 HostStop,
                 HostDeinit,
                 RemoveCallbacks,
+                RegistrationFreed,
             ],
         );
         assert_eq!(error.cleanup(), Cleanup::Released);
         assert!(take(FakeBackend::new(), slot).is_ok());
+    }
+
+    #[test]
+    fn registration_failures_keep_tables_until_deinit() {
+        use NativeCall::*;
+        // Counting failed: nothing was added, but the tables still outlive
+        // deinitialization.
+        let (error, slot) = failing_start(
+            StartStage::Registration,
+            |fake| fake.fail_next(Operation::GattCount, 3),
+            vec![],
+            &[HostInit, GattCount, HostDeinit, RegistrationFreed],
+        );
+        assert_eq!(error.cleanup(), Cleanup::Released);
+        assert!(error.to_string().contains("ble_gatts_count_cfg"), "{error}");
+        assert!(take(FakeBackend::new(), slot).is_ok());
+
+        // Adding failed (it is all-or-nothing); the tables still outlive
+        // deinitialization.
+        let (error, _) = failing_start(
+            StartStage::Registration,
+            |fake| fake.fail_next(Operation::GattAdd, 6),
+            vec![],
+            &[HostInit, GattCount, GattAdd, HostDeinit, RegistrationFreed],
+        );
+        assert_eq!(error.cleanup(), Cleanup::Released);
+        assert!(error.to_string().contains("GATT registration"), "{error}");
+
+        // If deinitialization then fails, the tables are never freed.
+        let fake = FakeBackend::new();
+        fake.fail_next(Operation::GattAdd, 6);
+        fake.fail_next(Operation::HostDeinit, 3);
+        let (server, _) = witness_server(&fake);
+        let error = take(fake.clone(), new_slot())
+            .unwrap()
+            .start(server)
+            .unwrap_err();
+        assert_eq!(error.cleanup(), Cleanup::Poisoned);
+        assert_eq!(fake.calls(), [HostInit, GattCount, GattAdd, HostDeinit]);
+    }
+
+    #[test]
+    fn unassigned_value_handles_fail_registration_after_sync() {
+        use NativeCall::*;
+        let (error, slot) = failing_start(
+            StartStage::Registration,
+            |fake| fake.skip_handle_assignment(),
+            vec![NativeEvent::HostSynced],
+            &[
+                HostInit,
+                GattCount,
+                GattAdd,
+                InstallCallbacks,
+                HostStart,
+                InferAddress,
+                HostStop,
+                HostDeinit,
+                RemoveCallbacks,
+                RegistrationFreed,
+            ],
+        );
+        assert_eq!(error.cleanup(), Cleanup::Released);
+        assert!(
+            error
+                .to_string()
+                .contains("did not assign every attribute handle"),
+            "{error}"
+        );
+        assert!(take(FakeBackend::new(), slot).is_ok());
+    }
+
+    #[test]
+    fn value_handles_map_to_their_characteristics_and_endpoints() {
+        use crate::gatt::{Characteristic, CharacteristicDef, Readable};
+
+        struct Value(u16);
+
+        impl Characteristic for Value {
+            type Value = u8;
+            fn uuid(&self) -> Uuid {
+                Uuid::Uuid16(self.0)
+            }
+        }
+
+        impl Readable for Value {
+            fn read(&self) -> Result<u8, AttError> {
+                Ok(0)
+            }
+        }
+
+        let (first, first_endpoint) = CharacteristicDef::new(Value(0xff01))
+            .readable()
+            .notifiable();
+        let (third, third_endpoint) = CharacteristicDef::new(Value(0xff03)).notifiable();
+        let server = GattServer::new([
+            Service::primary(Uuid::Uuid16(0x180f))
+                .characteristic(first)
+                .characteristic(CharacteristicDef::new(Value(0xff02)).readable()),
+            Service::primary(Uuid::Uuid16(0x181c)).characteristic(third),
+        ])
+        .unwrap();
+        let fake = FakeBackend::new();
+        let running = start_with(
+            &fake,
+            take(fake.clone(), new_slot()).unwrap(),
+            server,
+            vec![NativeEvent::HostSynced],
+        )
+        .unwrap();
+        // The fake assigns handles at host start, as NimBLE does, after the
+        // stack's services: service 0x11, then declaration/value (and a CCCD
+        // for notify) per characteristic.
+        assert_eq!(
+            running.value_handles,
+            [
+                (Some(first_endpoint.id().clone()), 0x13),
+                (None, 0x16),
+                (Some(third_endpoint.id().clone()), 0x19),
+            ]
+        );
+        let handle_of = |endpoint: &crate::gatt::NotifyEndpoint<u8>| {
+            running
+                .value_handles
+                .iter()
+                .find(|(id, _)| id.as_ref() == Some(endpoint.id()))
+                .map(|(_, handle)| *handle)
+        };
+        assert_eq!(handle_of(&third_endpoint), Some(0x19));
+        assert_eq!(handle_of(&first_endpoint), Some(0x13));
     }
 
     #[test]
@@ -1058,11 +1260,14 @@ mod tests {
             vec![NativeEvent::HostReset { reason: 19 }],
             &[
                 HostInit,
+                GattCount,
+                GattAdd,
                 InstallCallbacks,
                 HostStart,
                 HostStop,
                 HostDeinit,
                 RemoveCallbacks,
+                RegistrationFreed,
             ],
         );
         assert_eq!(error.error().kind(), ErrorKind::Timeout);
@@ -1099,7 +1304,15 @@ mod tests {
         );
         assert_eq!(
             fake.calls(),
-            [HostInit, InstallCallbacks, HostStart, HostStop]
+            [
+                HostInit,
+                GattCount,
+                GattAdd,
+                InstallCallbacks,
+                HostStart,
+                HostStop
+            ],
+            "the tables are never freed"
         );
         assert!(
             freed_after.lock().unwrap().is_none(),

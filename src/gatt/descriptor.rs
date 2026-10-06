@@ -41,7 +41,7 @@ pub trait Descriptor: Send + Sync + 'static {
 pub trait ReadableDescriptor: Descriptor<Value: Encode> {
     /// Return the current value, or the ATT error to send to the client.
     /// One client read of a long value may call this more than once; see the
-    /// [module documentation](crate::gatt#planned-request-handling).
+    /// [module documentation](crate::gatt#request-handling).
     fn read(&self) -> Result<Self::Value, AttError>;
 }
 
@@ -189,7 +189,7 @@ pub(super) fn write_restriction(uuid: Uuid) -> Option<&'static str> {
 /// # Ok::<(), argyle_nimble::Error>(())
 /// ```
 pub struct DescriptorDef<D: Descriptor> {
-    // Called through `RegisteredDescriptor` by registration in a later ticket
+    // Called through `RegisteredDescriptor` by the registration access path
     // and by tests.
     #[cfg_attr(not(test), allow(dead_code))]
     descriptor: D,
@@ -258,7 +258,7 @@ impl<D: Descriptor> fmt::Debug for DescriptorDef<D> {
 }
 
 /// A descriptor definition with its type erased, stored under its parent
-/// characteristic and dispatched by the registration code (a later ticket).
+/// characteristic and dispatched by `gatt::registration`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait RegisteredDescriptor: Send + Sync {
     fn uuid(&self) -> Uuid;
