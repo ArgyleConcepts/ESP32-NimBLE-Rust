@@ -186,7 +186,8 @@ pub enum ConnectionEvent {
     /// terminates the link and also reports
     /// [`ConnectionRejected`](Self::ConnectionRejected), unless the link is
     /// already gone. A link reported with `BLE_HS_EAGAIN` is being freed by
-    /// NimBLE and is not terminated.
+    /// NimBLE and is not terminated. ESP-IDF can report such a link failed
+    /// a second time, after freeing it; that report is not delivered.
     ConnectionFailed {
         /// Why it failed, classified like a disconnection: ESP-IDF 6.1
         /// reports either `BLE_HS_EAGAIN` (the link broke before it was
@@ -355,6 +356,10 @@ struct State {
     pending: Vec<(u16, Vec<EndpointId>)>,
     /// Whether a host reset was reported and its resynchronization not yet.
     reset_reported: bool,
+    /// Whether a host reset was reported (in any phase) and the following
+    /// synchronization not yet. Only a resynchronization restarts
+    /// advertising: the first synchronization is startup's, which starts it.
+    resynchronizing: bool,
 }
 
 /// Values known once the host has started.
@@ -394,12 +399,15 @@ struct Operations {
     ///
     /// Only one procedure runs at a time. Each ends in exactly one of these
     /// ways, each accounted once: the controller accepts a client, which
-    /// NimBLE reports later as exactly one connection, successful or failed
-    /// (with ESP-IDF's connection re-attempt disabled); NimBLE reports the
-    /// end of advertising; the framework stops it (a stop reports whether a
-    /// procedure was active); or the host resets, ending all of them. Starts
-    /// that find a procedure already running start nothing and are not
-    /// counted.
+    /// NimBLE reports later as a connection, successful or failed (with
+    /// ESP-IDF's connection re-attempt disabled; a duplicate failure report
+    /// is recognized and ignored, see `on_gap`); NimBLE reports the end of
+    /// advertising (for example `BLE_HS_EPREEMPTED` from
+    /// `ble_gap_preempt_done`, which NimBLE's own address-rotation and
+    /// privacy code can trigger); the framework stops it (a stop reports
+    /// whether a procedure was active); or the host resets, ending all of
+    /// them. Starts that find a procedure already running start nothing and
+    /// are not counted.
     ///
     /// So when a connection is reported and its procedure accounted for, a
     /// remaining count means either a procedure that is still running or
@@ -487,6 +495,7 @@ impl<B: Backend> Runtime<B> {
                 active: None,
                 pending: Vec::new(),
                 reset_reported: false,
+                resynchronizing: false,
             }),
         }
     }
@@ -548,7 +557,16 @@ impl<B: Backend> Runtime<B> {
                     lock(&self.state).phase = Phase::Running;
                     return Ok(());
                 }
-                Err(_) if !self.backend.is_synced() || self.host.syncs() != syncs => {
+                // NimBLE is not synchronized, or was not while this attempt
+                // ran: it marks itself synchronized before it reports the
+                // synchronization (`ble_hs_sync`), so the host's own flag,
+                // false from a reset report until the sync report, and the
+                // sync count cover the rest of a resynchronization.
+                Err(_)
+                    if !self.backend.is_synced()
+                        || !self.host.synced()
+                        || self.host.syncs() != syncs =>
+                {
                     // Wait without `operations`: the host task takes it while
                     // it reports the reset.
                     drop(operations);
@@ -703,16 +721,31 @@ impl<B: Backend> Runtime<B> {
         // task changes the connection record, and it is here, so the answer
         // still holds when the lock is taken.
         let mtu = match event {
-            GapEvent::Connect {
-                connection,
-                status: 0,
-            } => self.backend.mtu(connection),
+            GapEvent::Connect { connection, status } if status != HOST_EAGAIN => {
+                self.backend.mtu(connection)
+            }
             _ => None,
         };
+        // ESP-IDF 6.1 can report a peripheral connection twice: when the link
+        // breaks before it is reported, `ble_gap_conn_broken` reports it
+        // failed (BLE_HS_EAGAIN) and frees it, and the controller's answer to
+        // the feature request NimBLE sent for that link can still arrive;
+        // `ble_gap_rx_rd_rem_sup_feat_complete` then reports it failed again
+        // with the raw HCI status, for a link it no longer holds. Every other
+        // report is for a link NimBLE still holds: it creates the link before
+        // requesting features, a failed feature exchange leaves it open, and
+        // `ble_gap_conn_broken` reports before freeing it. So a failure
+        // report for a link NimBLE does not hold is that duplicate, and
+        // changes nothing.
+        if let GapEvent::Connect { status, .. } = event {
+            if status != 0 && status != HOST_EAGAIN && mtu.is_none() {
+                return;
+            }
+        }
         // A connection report or the end of advertising is handled under
         // `operations`: a start in progress finishes first, so the record and
-        // the start count below include it, and starts that follow see the
-        // client.
+        // the procedure count below include it, and starts that follow see
+        // the client.
         let operations = match event {
             GapEvent::Connect { .. } | GapEvent::AdvertisingComplete { .. } => {
                 Some(lock(&self.operations))
@@ -735,7 +768,9 @@ impl<B: Backend> Runtime<B> {
             // advertising when it accepted the client; a start in between
             // (by the application or a restart) is still running.
             operations.running = operations.running.saturating_sub(1);
-            if outcome.stop_advertising && operations.running > 0 {
+            // While the host is not synchronized (a reset is under way), the
+            // stop would be refused, and the reset ends advertising anyway.
+            if outcome.stop_advertising && operations.running > 0 && self.backend.is_synced() {
                 match self.backend.advertising_stop() {
                     Ok(true) => operations.running -= 1,
                     Ok(false) => {}
@@ -939,14 +974,18 @@ impl<B: Backend> Runtime<B> {
     }
 
     fn on_synced(&self) {
-        let reported = {
+        let (reported, resynchronized) = {
             let mut state = lock(&self.state);
-            state.phase == Phase::Running && std::mem::take(&mut state.reset_reported)
+            let reported =
+                state.phase == Phase::Running && std::mem::take(&mut state.reset_reported);
+            (reported, std::mem::take(&mut state.resynchronizing))
         };
         if reported {
             self.emit(vec![ConnectionEvent::HostSynced]);
         }
-        self.restart_and_report();
+        if resynchronized {
+            self.restart_and_report();
+        }
     }
 
     fn on_reset(&self, reason: i32) {
@@ -961,6 +1000,7 @@ impl<B: Backend> Runtime<B> {
             if let Some(active) = state.active.take() {
                 active.end(DisconnectReason(reason), &mut events);
             }
+            state.resynchronizing = true;
             if state.phase == Phase::Running {
                 state.reset_reported = true;
                 events.push(ConnectionEvent::HostReset { reason });
@@ -1527,7 +1567,7 @@ mod tests {
             [Seen::Failed(0x23b), Seen::Rejected(None)],
             "the HCI status is offset into the HCI range"
         );
-        let calls = fixture.calls_since(mark);
+        let calls = without_queries(&fixture.calls_since(mark));
         assert_eq!(calls[0], NativeCall::Terminate { connection: 2 });
         assert!(is_advertising_start(&calls[1..]));
         // Its events are ignored until NimBLE reports it ending, which is not
@@ -1563,7 +1603,7 @@ mod tests {
             status: 0x3b,
         });
         assert_eq!(fixture.seen.take(), [Seen::Failed(0x23b)]);
-        let calls = fixture.calls_since(mark);
+        let calls = without_queries(&fixture.calls_since(mark));
         assert_eq!(calls[0], NativeCall::Terminate { connection: 2 });
         assert!(is_advertising_start(&calls[1..]));
         // Not tracked: a new link with that handle is served.
@@ -2336,6 +2376,94 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_failure_report_for_a_freed_link_is_ignored() {
+        // The controller accepts client 1, whose link breaks before NimBLE
+        // reports it (reported failed with BLE_HS_EAGAIN and freed); the
+        // controller's late answer to the feature request reports it failed
+        // again. Client 2 is then accepted from the restart's procedure, the
+        // application starts advertising again, and client 2 is reported:
+        // that start is still running and must be stopped.
+        let fixture = fixture();
+        fixture.fake.create_link(1);
+        fixture.deliver(GapEvent::Connect {
+            connection: 1,
+            status: HOST_EAGAIN,
+        });
+        assert!(fixture.fake.is_advertising(), "restarted");
+        let mark = fixture.mark();
+        assert!(fixture.fake.late_feature_failure(1, 0x08).is_some());
+        assert_eq!(
+            fixture.seen.take(),
+            [Seen::Failed(HOST_EAGAIN)],
+            "one failure per attempt"
+        );
+        assert!(
+            without_queries(&fixture.calls_since(mark)).is_empty(),
+            "no termination or restart"
+        );
+        fixture.fake.create_link(2);
+        fixture.running.start_advertising().unwrap();
+        let mark = fixture.mark();
+        fixture.deliver(connect(2));
+        assert!(stopped_since(&fixture, mark));
+        assert!(!fixture.fake.is_advertising());
+    }
+
+    #[test]
+    fn the_end_of_advertising_does_not_hide_a_restart_before_a_report() {
+        // The controller accepts A, the application starts advertising
+        // again, NimBLE ends that advertising (for example preempted), the
+        // restart starts it again, and then A is reported: the restart is
+        // still running.
+        let fixture = fixture();
+        fixture.fake.create_link(1);
+        fixture.running.start_advertising().unwrap();
+        fixture.deliver(GapEvent::AdvertisingComplete { reason: 30 });
+        assert!(fixture.fake.is_advertising(), "restarted");
+        let mark = fixture.mark();
+        fixture.deliver(connect(1));
+        assert!(stopped_since(&fixture, mark));
+        assert!(!fixture.fake.is_advertising());
+    }
+
+    #[test]
+    fn a_stop_that_found_nothing_keeps_the_count_for_later_reports() {
+        // P1 is ended by accepting A, P2 by accepting B. A's report stops
+        // nothing (nothing runs) and keeps P2 counted. A disconnects before B
+        // is reported, so the restart runs P3; B's report must stop it.
+        let fixture = fixture();
+        fixture.fake.create_link(1);
+        fixture.running.start_advertising().unwrap();
+        fixture.fake.create_link(2);
+        fixture.deliver(connect(1));
+        assert!(!fixture.fake.is_advertising());
+        fixture.deliver(disconnect(1));
+        assert!(fixture.fake.is_advertising(), "restarted");
+        let mark = fixture.mark();
+        fixture.deliver(connect(2));
+        assert!(stopped_since(&fixture, mark));
+        assert!(!fixture.fake.is_advertising());
+    }
+
+    #[test]
+    fn a_report_during_a_reset_does_not_try_to_stop_advertising() {
+        let fixture = fixture_with(Some(
+            demo_advertising().remain_available(false).build().unwrap(),
+        ));
+        let (gate, starting) = start_before_connection_report(&fixture);
+        gate.release();
+        starting.join().unwrap().unwrap();
+        // NimBLE marks itself unsynchronized at the start of a reset, then
+        // reports what the reset ends.
+        fixture.fake.set_synced(false);
+        let mark = fixture.mark();
+        fixture.deliver(connect(2));
+        assert!(!stopped_since(&fixture, mark));
+        let id = fixture.id();
+        assert_eq!(fixture.seen.take(), [Seen::Connected(id)]);
+    }
+
+    #[test]
     fn a_failed_stop_for_a_new_client_is_reported() {
         let fixture = fixture_with(Some(
             demo_advertising().remain_available(false).build().unwrap(),
@@ -2537,9 +2665,11 @@ mod tests {
     fn host_synced_is_reported_only_after_a_reported_reset() {
         let fixture = fixture();
         // A sync without a reset (possible on a second core) is not
-        // reported, and advertising is only re-sent.
+        // reported and changes nothing.
+        let mark = fixture.mark();
         fixture.fake.inject(NativeEvent::HostSynced);
         assert!(fixture.seen.take().is_empty());
+        assert!(fixture.calls_since(mark).is_empty());
         fixture.fake.inject(NativeEvent::HostReset { reason: 19 });
         fixture.fake.inject(NativeEvent::HostSynced);
         fixture.fake.inject(NativeEvent::HostSynced);
@@ -2725,8 +2855,10 @@ mod tests {
             .filter(|(_, call)| matches!(call, NativeCall::AdvertisingData(_)))
             .map(|(index, _)| index)
             .collect();
-        assert_eq!(data.len(), 2, "tried again: {calls:?}");
-        assert!(is_advertising_start(&calls[data[1]..]));
+        // Tried again; the resynchronization's own restart may also send
+        // the payloads again, which NimBLE treats as success.
+        assert!(data.len() >= 2, "tried again: {calls:?}");
+        assert!(is_advertising_start(&calls[data[1]..data[1] + 3]));
         assert!(fake.is_advertising());
         drop(running);
     }
@@ -2757,6 +2889,78 @@ mod tests {
         assert_eq!(error.last_host_reset(), Some(19));
         assert_eq!(error.cleanup(), Cleanup::Released);
         assert!(!fake.is_advertising());
+    }
+
+    /// Start until address inference is held, report a reset there (so the
+    /// sync flag of the host events is false), and return what is needed to
+    /// continue.
+    fn reset_during_inference(
+        fake: &FakeBackend,
+    ) -> (Arc<HostEvents>, Starting, Arc<crate::backend::fake::Gate>) {
+        let mut configured = take(fake.clone(), slot()).unwrap();
+        configured.set_advertising(demo_advertising().build().unwrap());
+        configured.set_sync_timeout(std::time::Duration::from_secs(3600));
+        let events = configured.events.clone();
+        let (gatt, _, _) = server();
+        let started = fake.hold(Operation::HostStart);
+        let inferring = fake.hold(Operation::InferAddress);
+        let starting = thread::spawn(move || configured.start(gatt));
+        started.wait_entered();
+        fake.inject(NativeEvent::HostSynced);
+        started.release();
+        inferring.wait_entered();
+        fake.inject(NativeEvent::HostReset { reason: 19 });
+        (events, starting, inferring)
+    }
+
+    #[test]
+    fn startup_retries_when_nimble_is_synchronized_but_has_not_reported_it() {
+        // NimBLE marks itself synchronized before it reports the
+        // synchronization; an attempt refused during bring-up is retried
+        // once the report arrives.
+        let fake = FakeBackend::new();
+        let (events, starting, inferring) = reset_during_inference(&fake);
+        fake.set_synced(true);
+        fake.fail_next(Operation::AdvertisingStart, 22);
+        inferring.release();
+        events.wait_until_parked(1);
+        fake.inject(NativeEvent::HostSynced);
+        let running = starting.join().unwrap().expect("startup completes");
+        assert!(fake.is_advertising());
+        drop(running);
+    }
+
+    #[test]
+    fn startup_retries_when_the_host_resynchronized_during_the_attempt() {
+        // The resynchronization is reported while the refused attempt is
+        // still returning.
+        let fake = FakeBackend::new();
+        let (events, starting, inferring) = reset_during_inference(&fake);
+        fake.fail_next(Operation::AdvertisingData, 22);
+        let data = fake.hold(Operation::AdvertisingData);
+        inferring.release();
+        data.wait_entered();
+        let before = events.syncs();
+        let syncing = {
+            let fake = fake.clone();
+            thread::spawn(move || fake.inject(NativeEvent::HostSynced))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while events.syncs() == before {
+            assert!(std::time::Instant::now() < deadline, "no sync report");
+            thread::yield_now();
+        }
+        data.release();
+        let running = starting.join().unwrap().expect("startup completes");
+        syncing.join().unwrap();
+        let tries = fake
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, NativeCall::AdvertisingData(_)))
+            .count();
+        assert!(tries >= 2, "tried again");
+        assert!(fake.is_advertising());
+        drop(running);
     }
 
     #[test]

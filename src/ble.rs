@@ -429,6 +429,12 @@ impl HostEvents {
 }
 
 impl HostEvents {
+    /// Whether the host's last report was a synchronization rather than a
+    /// reset.
+    pub(crate) fn synced(&self) -> bool {
+        self.lock().synced
+    }
+
     /// The reason of the last host reset, if any.
     pub(crate) fn last_reset(&self) -> Option<i32> {
         self.lock().last_reset

@@ -483,6 +483,19 @@ impl FakeBackend {
         self.lock().advertising
     }
 
+    /// Model the controller's late answer to the feature request for a
+    /// peripheral link NimBLE already reported failed and freed
+    /// (`ble_gap_conn_broken`): `ble_gap_rx_rd_rem_sup_feat_complete` finds
+    /// no link and reports the connection failed again with the raw HCI
+    /// `status`.
+    pub(crate) fn late_feature_failure(&self, connection: u16, status: i32) -> Option<Delivery> {
+        assert!(
+            !self.lock().links.contains_key(&connection),
+            "NimBLE reports this only for a link it freed"
+        );
+        self.inject_gap(GapEvent::Connect { connection, status })
+    }
+
     /// Deliver a GAP event, as the NimBLE host task would.
     pub(crate) fn inject_gap(&self, event: GapEvent) -> Option<Delivery> {
         self.inject(NativeEvent::Gap(event))
