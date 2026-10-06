@@ -1,5 +1,5 @@
 error[E0277]: the trait bound `Level: Writable` is not satisfied
-  --> tests/ui/gatt/fail/missing_write_handler.rs:16:43
+  --> tests/ui/gatt/fail/missing_write_command_handler.rs:16:43
    |
 16 |     let _ = CharacteristicDef::new(Level).writable_without_response();
    |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Writable` is not implemented for `Level`

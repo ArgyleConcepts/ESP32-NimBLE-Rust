@@ -109,8 +109,9 @@ packages the crate with `cargo package`. It instantiates the generic
 [firmware fixture](../eng/test/fixture/firmware/main/CMakeLists.txt) in the job directory against
 the extracted package, and Cargo metadata must resolve argyle-nimble there.
 Apart from the fixture package, every package in the fixture lockfile must
-match the repository lock exactly. Packages the fixture does not use, such as
-the crate's dev-dependencies, drop out of the fixture lock.
+match the repository lock exactly. The only repository packages allowed to
+drop out are those reachable solely through the crate's dev-dependencies,
+which a consumer never resolves.
 The script then fetches host and `-Zbuild-std` sources once. Every build uses
 `--locked --offline`, its own `idf.py` build directory, and its own
 `SDKCONFIG`. The cases are:

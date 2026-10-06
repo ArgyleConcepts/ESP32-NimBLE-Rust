@@ -1,4 +1,4 @@
-//! Declaring write access requires a `Writable` handler.
+//! Declaring write commands requires a `Writable` handler.
 
 use argyle_nimble::gatt::{Characteristic, CharacteristicDef};
 use argyle_nimble::Uuid;

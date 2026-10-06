@@ -77,30 +77,49 @@
 //! - Definitions move into their service and services into the server, so
 //!   nothing can change after [`GattServer::new`]: the server has no methods
 //!   that add, remove, or mutably borrow its contents.
-//! - Native permissions are derived from the declared capabilities. No public
-//!   flag mask, native definition, pointer, or attribute handle exists, and a
-//!   [`NotifyEndpoint`] can only come from [`CharacteristicDef::notifiable`].
+//! - The declared capabilities are the only source of the characteristic's
+//!   properties and access. No public flag mask, native definition, pointer,
+//!   or attribute handle exists, and a [`NotifyEndpoint`] can only come from
+//!   [`CharacteristicDef::notifiable`].
 //!
 //! **At runtime**, [`GattServer::new`] rejects a server without services, a
 //! characteristic without any capability, and a
-//! [`Characteristic::MAX_LEN`] above the 512-byte attribute limit. When a
-//! request is dispatched, a written value longer than `MAX_LEN` is rejected
-//! with [`AttError::INVALID_ATTRIBUTE_VALUE_LENGTH`] before decoding, decode
-//! failures become the matching [`AttError`], and a read value that cannot be
-//! encoded within `MAX_LEN` is reported to the client as
-//! [`AttError::UNLIKELY`].
+//! [`Characteristic::MAX_LEN`] above the 512-byte attribute limit.
 //!
-//! # Handler context and shared state
+//! # Planned request handling
 //!
-//! Handlers are synchronous and run on the NimBLE host task once the server is
-//! registered. Keep them short and non-blocking: the host processes no other
-//! BLE events while a handler runs. The framework holds no locks of its own
-//! while calling a handler, so a handler may take application locks; avoiding
-//! deadlocks between those locks and other application threads is the
-//! application's responsibility. Share state with the rest of the program
-//! through thread-safe types such as `Arc<Mutex<_>>` or atomics. Handlers must
-//! not panic; how a panic is contained is defined when handlers are connected
-//! to NimBLE.
+//! Registering a server with NimBLE is not implemented yet, so no handler is
+//! called by the BLE stack today. The following is the contract the
+//! registration work will implement; the request logic it will use is in
+//! place and unit-tested:
+//!
+//! - A written value longer than `MAX_LEN` is rejected with
+//!   [`AttError::INVALID_ATTRIBUTE_VALUE_LENGTH`] before decoding, decode
+//!   failures become the matching [`AttError`], and a read value that cannot
+//!   be encoded within `MAX_LEN` is reported to the client as
+//!   [`AttError::UNLIKELY`].
+//! - Handlers are synchronous and will run on the NimBLE host task. Keep them
+//!   short and non-blocking: the host processes no other BLE events while a
+//!   handler runs.
+//! - The framework holds no locks of its own while calling a handler, so a
+//!   handler may take application locks; avoiding deadlocks between those
+//!   locks and other application threads is the application's
+//!   responsibility.
+//! - [`Readable::read`] may be called more than once for one client read:
+//!   NimBLE reads values longer than one ATT packet in pieces and calls the
+//!   handler for each piece. A value that changes between calls can reach the
+//!   client mixed; keep long values stable or keep them within one packet.
+//!
+//! # Shared state
+//!
+//! Share state with the rest of the program through thread-safe types such as
+//! `Arc<Mutex<_>>` or atomics. Handlers and application codec implementations
+//! ([`Encode`] and [`Decode`](crate::codec::Decode)) must not panic; how a
+//! panic is contained will be defined when handlers are connected to NimBLE.
+//!
+//! Handlers receive no request context, such as the connection, yet. Phase 1
+//! serves one client with open access; if context is added, it will arrive
+//! as new provided trait methods so existing handlers keep compiling.
 //!
 //! Registration with NimBLE, descriptors, and sending notifications are not
 //! part of this module yet.
@@ -134,6 +153,8 @@ pub trait Characteristic: Send + Sync + 'static {
 /// Handles reads of a characteristic's value.
 pub trait Readable: Characteristic<Value: Encode> {
     /// Return the current value, or the ATT error to send to the client.
+    /// One client read of a long value may call this more than once; see the
+    /// [module documentation](crate::gatt#planned-request-handling).
     fn read(&self) -> Result<Self::Value, AttError>;
 }
 
@@ -287,8 +308,13 @@ impl<C: Characteristic> CharacteristicDef<C> {
         self
     }
 
-    /// Allow write requests, which the client sees acknowledged, through
-    /// [`Writable::write`].
+    /// Advertise write requests, which the client sees acknowledged, handled
+    /// by [`Writable::write`].
+    ///
+    /// NimBLE grants write access for both write requests and write commands
+    /// once either is declared, and the handler cannot tell them apart. The
+    /// two declarations therefore choose the advertised properties, not
+    /// separately enforced permissions.
     pub fn writable(mut self) -> Self
     where
         C: Writable,
@@ -298,9 +324,12 @@ impl<C: Characteristic> CharacteristicDef<C> {
         self
     }
 
-    /// Allow write commands, which are not acknowledged, through
-    /// [`Writable::write`]. A rejected command is dropped, since the
-    /// protocol has no response to carry the error.
+    /// Advertise write commands, which are not acknowledged, handled by
+    /// [`Writable::write`]. The protocol carries no response to a command, so
+    /// the client never sees an error the handler returns for one.
+    ///
+    /// As with [`writable`](Self::writable), NimBLE grants write access for
+    /// both kinds of write once either is declared.
     pub fn writable_without_response(mut self) -> Self
     where
         C: Writable,
@@ -347,7 +376,12 @@ pub(crate) trait RegisteredCharacteristic: Send + Sync {
     fn access(&self) -> Access;
     fn max_len(&self) -> usize;
     fn endpoint(&self) -> Option<&EndpointId>;
-    /// Encode the current value into `output`.
+    /// Encode the current value into `output`. A notify-only characteristic
+    /// has no read handler, but NimBLE's own notification paths
+    /// (`ble_gatts_notify`, `ble_gatts_chr_updated`, and CCCD restore) read
+    /// the value through the access callback. Notification sending must
+    /// therefore always supply its payload explicitly
+    /// (`ble_gatts_notify_custom`) or keep the last value to serve here.
     fn read(&self, output: &mut Vec<u8>) -> Result<(), AttError>;
     /// Validate, decode, and deliver a written value.
     fn write(&self, data: &[u8]) -> Result<(), AttError>;
@@ -757,6 +791,21 @@ mod tests {
             Err(AttError::WRITE_NOT_PERMITTED)
         );
         assert_eq!(*shared.level.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn write_commands_reach_the_same_handler_and_checks() {
+        let shared = Arc::new(Shared::default());
+        let commands = CharacteristicDef::new(Level(shared.clone())).writable_without_response();
+        assert_eq!(commands.write(&[9]), Ok(()));
+        assert_eq!(*shared.level.lock().unwrap(), 9);
+        assert_eq!(commands.write(&[200]), Err(AttError::VALUE_NOT_ALLOWED));
+        assert_eq!(
+            commands.write(&[1, 2]),
+            Err(AttError::INVALID_ATTRIBUTE_VALUE_LENGTH)
+        );
+        assert_eq!(read(&commands), Err(AttError::READ_NOT_PERMITTED));
+        assert_eq!(*shared.level.lock().unwrap(), 9);
     }
 
     #[test]

@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import tomllib
 import traceback
 import xml.etree.ElementTree as ET
 
@@ -71,6 +72,55 @@ def tree_digest(path: Path) -> str:
         if item.is_file() and not item.is_symlink():
             digest.update(bytes.fromhex(sha256(item)))
     return digest.hexdigest()
+
+
+def dev_only_packages(manifest_text: str, lock_text: str) -> set[tuple[str, str]]:
+    """Return (name, version) of lock packages that the manifest's package
+    reaches only through dev-dependencies, so a consumer's lock omits them."""
+    manifest = tomllib.loads(manifest_text)
+    if "target" in manifest:
+        raise ValueError("target-specific dependency tables are not supported")
+    entries = tomllib.loads(lock_text)["package"]
+    by_name: dict[str, list[dict]] = {}
+    for entry in entries:
+        by_name.setdefault(entry["name"], []).append(entry)
+
+    def resolve(spec: str) -> dict:
+        # Lock dependency specs are "name", "name version", or
+        # "name version (source)" when a name alone is ambiguous.
+        name, *rest = spec.split(" ")
+        candidates = [
+            entry for entry in by_name.get(name, [])
+            if not rest or entry["version"] == rest[0]
+        ]
+        if len(candidates) != 1:
+            raise ValueError(f"lock entry {spec!r} is missing or ambiguous")
+        return candidates[0]
+
+    root_name = manifest["package"]["name"]
+    root = resolve(root_name)
+    root_specs = {spec.split(" ")[0]: spec for spec in root.get("dependencies", [])}
+
+    def roots(section: str) -> list[str]:
+        names = [
+            spec.get("package", name) if isinstance(spec, dict) else name
+            for name, spec in manifest.get(section, {}).items()
+        ]
+        return [root_specs[name] for name in names]
+
+    def closure(specs: list[str]) -> set[tuple[str, str]]:
+        seen: set[tuple[str, str]] = set()
+        pending = [resolve(spec) for spec in specs]
+        while pending:
+            entry = pending.pop()
+            key = (entry["name"], entry["version"])
+            if key not in seen:
+                seen.add(key)
+                pending.extend(resolve(spec) for spec in entry.get("dependencies", []))
+        return seen
+
+    runtime = closure(roots("dependencies") + roots("build-dependencies"))
+    return closure(roots("dev-dependencies")) - runtime
 
 
 def read_json(path: Path) -> dict:
@@ -338,17 +388,24 @@ class Validation:
                 result.add((fields.get("name", ""), fields.get("version", ""), fields.get("checksum", "")))
             return result
 
-        # Cargo drops repository packages the fixture does not use, such as
-        # argyle-nimble's dev-dependencies. Every package the fixture does
-        # resolve must match the repository lock exactly, apart from the
-        # fixture itself, so no dependency is added or changes version.
+        # Cargo drops packages the fixture does not use, which are exactly
+        # argyle-nimble's dev-only dependencies. Every other repository
+        # package must remain, and every package the fixture resolves must
+        # match the repository lock, apart from the fixture itself.
         repository = packages(ROOT / "Cargo.lock")
         fixture = packages(self.manifest.with_name("Cargo.lock"))
         added = {package[0] for package in fixture - repository}
+        dropped = {package[:2] for package in repository - fixture}
+        dev_only = dev_only_packages(
+            (ROOT / "Cargo.toml").read_text(encoding="utf-8"),
+            (ROOT / "Cargo.lock").read_text(encoding="utf-8"),
+        )
+        unexpected = sorted(dropped - dev_only)
         self.runner.check(
             "fixture-lock-matches-repository",
-            added == {FIXTURE_PACKAGE},
-            f"fixture lock adds only the fixture package; added {sorted(added)}",
+            added == {FIXTURE_PACKAGE} and not unexpected,
+            f"fixture lock adds only the fixture package and drops only dev-only packages; "
+            f"added {sorted(added)}, dropped non-dev {unexpected}",
         )
 
     def git_status(self) -> str:
