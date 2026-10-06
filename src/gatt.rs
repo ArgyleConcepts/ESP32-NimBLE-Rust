@@ -102,12 +102,16 @@
 //!   [`CharacteristicDef`]; and descriptor types have the same thread,
 //!   lifetime, and owned-value bounds as characteristics.
 //! - **Construction:** [`DescriptorDef::new`] rejects the Client
-//!   Characteristic Configuration descriptor (CCCD, `0x2902`) and GATT
-//!   declaration types (`0x2800`–`0x2803`), in any UUID width. UUIDs are
-//!   runtime values, so this cannot happen at compile time; it does happen
-//!   before the definition can reach a server or NimBLE.
+//!   Characteristic Configuration descriptor (CCCD, `0x2902`), GATT
+//!   declaration types (`0x2800`–`0x2803`), and descriptors whose values
+//!   would describe state this crate controls (`0x2900`, `0x2903`,
+//!   `0x2905`), in any UUID width. UUIDs are runtime values, so this cannot
+//!   happen at compile time; it does happen before the definition can reach
+//!   a server or NimBLE.
 //! - **[`GattServer::new`]:** every descriptor must declare read or write
-//!   access, and its `MAX_LEN` must not exceed 512 bytes.
+//!   access, its `MAX_LEN` must not exceed 512 bytes, and no two
+//!   descriptors of one characteristic may share a UUID, since clients look
+//!   descriptors up by UUID.
 //!
 //! NimBLE adds and manages the CCCD of every notify-capable characteristic,
 //! including client subscription state. This crate never creates a CCCD or
@@ -133,7 +137,8 @@
 //!   handler may take application locks; avoiding deadlocks between those
 //!   locks and other application threads is the application's
 //!   responsibility.
-//! - [`Readable::read`] may be called more than once for one client read:
+//! - [`Readable::read`] and [`ReadableDescriptor::read`] may be called more
+//!   than once for one client read:
 //!   NimBLE reads values longer than one ATT packet in pieces and calls the
 //!   handler for each piece. A value that changes between calls can reach the
 //!   client mixed; keep long values stable or keep them within one packet.
@@ -553,9 +558,9 @@ impl GattServer {
     /// Returns an [`ErrorKind::Definition`](crate::ErrorKind::Definition)
     /// error if there are no services, a characteristic declares no
     /// capability, a characteristic uses a GATT declaration UUID
-    /// (`0x2800`–`0x2803`), a descriptor declares no access, or a
-    /// characteristic's or descriptor's `MAX_LEN` exceeds
-    /// [`MAX_ATTRIBUTE_VALUE_LEN`]. Reserved descriptor UUIDs were already
+    /// (`0x2800`–`0x2803`), a descriptor declares no access, two descriptors
+    /// of one characteristic share a UUID, or a characteristic's or
+    /// descriptor's `MAX_LEN` exceeds [`MAX_ATTRIBUTE_VALUE_LEN`]. Reserved descriptor UUIDs were already
     /// rejected by [`DescriptorDef::new`].
     pub fn new(services: impl IntoIterator<Item = Service>) -> Result<Self, Error> {
         let services: Box<[Service]> = services.into_iter().collect();
@@ -589,7 +594,7 @@ impl GattServer {
                 if characteristic.max_len() > MAX_ATTRIBUTE_VALUE_LEN {
                     return Err(located("MAX_LEN exceeds the 512-byte attribute limit"));
                 }
-                for descriptor in characteristic.descriptors() {
+                for (index, descriptor) in characteristic.descriptors().iter().enumerate() {
                     let located = |problem| {
                         Error::definition(
                             Some(service.uuid),
@@ -603,6 +608,15 @@ impl GattServer {
                     }
                     if descriptor.max_len() > MAX_ATTRIBUTE_VALUE_LEN {
                         return Err(located("MAX_LEN exceeds the 512-byte attribute limit"));
+                    }
+                    let uuid = descriptor.uuid().to_u128();
+                    if characteristic.descriptors()[..index]
+                        .iter()
+                        .any(|earlier| earlier.uuid().to_u128() == uuid)
+                    {
+                        return Err(located(
+                            "another descriptor of this characteristic has the same UUID",
+                        ));
                     }
                 }
             }
@@ -1219,6 +1233,48 @@ mod tests {
         assert!(error
             .to_string()
             .ends_with("descriptor 2901: MAX_LEN exceeds the 512-byte attribute limit"));
+
+        // Duplicate UUIDs are compared in their 128-bit form; the same UUID on
+        // different characteristics is fine.
+        let duplicate = Service::primary(Uuid::Uuid16(0x180f)).characteristic(
+            CharacteristicDef::new(Level(Arc::default()))
+                .readable()
+                .descriptor(setting(0x2904, &value).readable())
+                .descriptor(
+                    DescriptorDef::new(Setting {
+                        uuid: 0x2904,
+                        value: Arc::clone(&value),
+                    })
+                    .unwrap()
+                    .writable(),
+                ),
+        );
+        let error = GattServer::new([duplicate]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid GATT definition: service 180f: characteristic 2a19: descriptor 2904: another descriptor of this characteristic has the same UUID"
+        );
+        let spread = Service::primary(Uuid::Uuid16(0x180f))
+            .characteristic(
+                CharacteristicDef::new(Level(Arc::default()))
+                    .readable()
+                    .descriptor(setting(0x2904, &value).readable()),
+            )
+            .characteristic(
+                CharacteristicDef::new(Level(Arc::default()))
+                    .readable()
+                    .descriptor(setting(0x2904, &value).readable()),
+            );
+        assert!(GattServer::new([spread]).is_ok());
+        let oversized = Service::primary(Uuid::Uuid16(0x180f)).characteristic(
+            CharacteristicDef::new(Level(Arc::default()))
+                .readable()
+                .descriptor(DescriptorDef::new(Oversized).unwrap().readable()),
+        );
+        let error = GattServer::new([oversized]).unwrap_err();
+        assert!(error
+            .to_string()
+            .ends_with("descriptor 2901: MAX_LEN exceeds the 512-byte attribute limit"));
     }
 
     #[test]
@@ -1230,12 +1286,18 @@ mod tests {
                 .descriptor(setting(0x2901, &value).readable()),
         );
         let server = GattServer::new([service]).unwrap();
+        // Registration (a later ticket) passes NimBLE a thin pointer, such as
+        // the address of a boxed entry's slot, so both the trait objects and
+        // the slots that hold them must stay put once the server is built.
         let addresses = |server: &GattServer| {
             let characteristic = &server.services()[0].characteristics()[0];
-            (
+            let descriptor = &characteristic.descriptors()[0];
+            [
                 std::ptr::from_ref(characteristic.as_ref()).cast::<()>(),
-                std::ptr::from_ref(characteristic.descriptors()[0].as_ref()).cast::<()>(),
-            )
+                std::ptr::from_ref(characteristic).cast::<()>(),
+                std::ptr::from_ref(descriptor.as_ref()).cast::<()>(),
+                std::ptr::from_ref(descriptor).cast::<()>(),
+            ]
         };
         let before = addresses(&server);
         let moved = Box::new(server);

@@ -8,6 +8,9 @@ use std::fmt;
 /// The Client Characteristic Configuration descriptor (CCCD). NimBLE adds
 /// and manages it for every notify-capable characteristic.
 const CCCD: u128 = Uuid::Uuid16(0x2902).to_u128();
+const EXTENDED_PROPERTIES: u128 = Uuid::Uuid16(0x2900).to_u128();
+const SERVER_CONFIGURATION: u128 = Uuid::Uuid16(0x2903).to_u128();
+const AGGREGATE_FORMAT: u128 = Uuid::Uuid16(0x2905).to_u128();
 
 /// An application descriptor: its UUID and the type of its value.
 ///
@@ -35,6 +38,8 @@ pub trait Descriptor: Send + Sync + 'static {
 /// Handles reads of a descriptor's value.
 pub trait ReadableDescriptor: Descriptor<Value: Encode> {
     /// Return the current value, or the ATT error to send to the client.
+    /// One client read of a long value may call this more than once; see the
+    /// [module documentation](crate::gatt#planned-request-handling).
     fn read(&self) -> Result<Self::Value, AttError>;
 }
 
@@ -76,12 +81,33 @@ fn write_thunk<D: WritableDescriptor>(descriptor: &D, data: &[u8]) -> Result<(),
 }
 
 /// Why a descriptor UUID is reserved, if it is.
+///
+/// Besides the CCCD and declaration types, descriptors whose values describe
+/// state this crate owns are reserved, since an application value could
+/// contradict it:
+///
+/// - Characteristic Extended Properties (`0x2900`) mirrors property bits
+///   (reliable and auxiliary writes) that are derived from the declared
+///   capabilities and never set.
+/// - Server Characteristic Configuration (`0x2903`) configures broadcast,
+///   which is not supported.
+/// - Characteristic Aggregate Format (`0x2905`) lists attribute handles,
+///   which applications never see.
+///
+/// User Description (`0x2901`), Presentation Format (`0x2904`), and other
+/// descriptors are application-defined.
 fn reserved(uuid: Uuid) -> Option<&'static str> {
     let value = uuid.to_u128();
     if value == CCCD {
         Some("the Client Characteristic Configuration descriptor (0x2902) is managed by the stack for notify-capable characteristics")
     } else if GATT_DECLARATIONS.contains(&value) {
         Some("the UUID is a GATT declaration type")
+    } else if value == EXTENDED_PROPERTIES {
+        Some("the Characteristic Extended Properties descriptor (0x2900) is derived from declared capabilities")
+    } else if value == SERVER_CONFIGURATION {
+        Some("the Server Characteristic Configuration descriptor (0x2903) requires broadcast, which is not supported")
+    } else if value == AGGREGATE_FORMAT {
+        Some("the Characteristic Aggregate Format descriptor (0x2905) lists attribute handles, which applications cannot see")
     } else {
         None
     }
@@ -109,9 +135,12 @@ impl<D: Descriptor> DescriptorDef<D> {
     /// Returns an [`ErrorKind::Definition`](crate::ErrorKind::Definition)
     /// error if the UUID is reserved: the Client Characteristic Configuration
     /// descriptor (`0x2902`), which NimBLE manages for notify-capable
-    /// characteristics, or a GATT declaration type (`0x2800`–`0x2803`). Every
-    /// UUID width is checked by its 128-bit form. UUIDs are runtime values,
-    /// so this is the earliest point the check can run.
+    /// characteristics; a GATT declaration type (`0x2800`–`0x2803`); or a
+    /// descriptor whose value would describe state this crate controls
+    /// (`0x2900` Extended Properties, `0x2903` Server Characteristic
+    /// Configuration, `0x2905` Aggregate Format). Every UUID width is checked
+    /// by its 128-bit form. UUIDs are runtime values, so this is the earliest
+    /// point the check can run.
     pub fn new(descriptor: D) -> Result<Self, Error> {
         let uuid = descriptor.uuid();
         if let Some(problem) = reserved(uuid) {
@@ -268,6 +297,12 @@ mod tests {
                 Uuid::Uuid128(Uuid::Uuid16(0x2803).to_u128()),
                 "GATT declaration type",
             ),
+            (Uuid::Uuid16(0x2900), "Extended Properties"),
+            (Uuid::Uuid32(0x2903), "Server Characteristic Configuration"),
+            (
+                Uuid::Uuid128(Uuid::Uuid16(0x2905).to_u128()),
+                "Aggregate Format",
+            ),
         ];
         for (uuid, reason) in reserved {
             let error = DescriptorDef::new(Runtime(uuid)).unwrap_err();
@@ -284,10 +319,9 @@ mod tests {
     #[test]
     fn custom_and_standard_descriptors_are_accepted() {
         for uuid in [
-            Uuid::Uuid16(0x2900),
             Uuid::Uuid16(0x2901),
-            Uuid::Uuid16(0x2903),
             Uuid::Uuid16(0x2904),
+            Uuid::Uuid16(0x2906),
             Uuid::Uuid16(0x2804),
             Uuid::Uuid32(0x0001_2902),
             Uuid::parse("00002902-0000-1000-8000-00805f9b34fc").unwrap(),

@@ -17,8 +17,8 @@ the BLE boundary and the declaration of a GATT server:
 - `gatt`: services, characteristics, and custom descriptors declared with
   application structs and traits. Read and write capabilities require their
   handlers, and notify requires an encodable value, at compile time; the
-  stack-managed CCCD and GATT declaration UUIDs cannot be used as custom
-  descriptors. `GattServer` freezes the validated definition with typed
+  stack-managed CCCD, GATT declaration types, and descriptors describing
+  framework-controlled state cannot be used as custom descriptors. `GattServer` freezes the validated definition with typed
   notification endpoints.
 
 It has **no BLE controller, NimBLE registration of these definitions,

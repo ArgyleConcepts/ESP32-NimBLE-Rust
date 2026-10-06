@@ -1,0 +1,8 @@
+error: implementation of `Decode` is not general enough
+  --> tests/ui/gatt/fail/descriptor_write_borrowed_value.rs:15:6
+   |
+15 | impl WritableDescriptor for Label {
+   |      ^^^^^^^^^^^^^^^^^^ implementation of `Decode` is not general enough
+   |
+   = note: `Decode<'0>` would have to be implemented for the type `&'static str`, for any lifetime `'0`...
+   = note: ...but `Decode<'1>` is actually implemented for the type `&'1 str`, for some specific lifetime `'1`
