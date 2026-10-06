@@ -15,6 +15,7 @@ use super::gap::GapEvent;
 use super::native::{
     check, native_length, Backend, NativeError, NativeEvent, NativeResult, Operation,
 };
+use crate::ble::advertising::{ad, AdvertisingFields, LEGACY_PAYLOAD_CAPACITY};
 use crate::gatt::registration::{CharacteristicSlot, DescriptorSlot, GattPlan};
 use crate::Uuid;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -43,28 +44,32 @@ impl Gate {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Mark arrival and wait for release.
-    pub(crate) fn pass(&self) {
+    /// Wait until `done` holds, failing the test after a generous limit
+    /// instead of hanging when the awaited step never happens.
+    fn wait_for(&self, what: &str, done: impl Fn(&(bool, bool)) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut state = self.lock();
-        state.0 = true;
-        self.changed.notify_all();
-        while !state.1 {
+        while !done(&state) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "gate: {what} did not happen");
             state = self
                 .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
         }
+    }
+
+    /// Mark arrival and wait for release.
+    pub(crate) fn pass(&self) {
+        self.lock().0 = true;
+        self.changed.notify_all();
+        self.wait_for("the release", |state| state.1);
     }
 
     /// Block until a worker has arrived at the gate.
     pub(crate) fn wait_entered(&self) {
-        let mut state = self.lock();
-        while !state.0 {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
+        self.wait_for("the worker's arrival", |state| state.0);
     }
 
     pub(crate) fn release(&self) {
@@ -181,7 +186,14 @@ struct FakeState {
     violations: Vec<LedgerViolation>,
     holds: HashMap<Operation, Hold>,
     notifications: Vec<(u16, u16, Vec<u8>)>,
-    mtu: HashMap<u16, u16>,
+    /// Links NimBLE knows, by handle, with their ATT MTU, as `ble_att_mtu`
+    /// reports it.
+    links: HashMap<u16, u16>,
+    /// Whether an advertising procedure is active.
+    advertising: bool,
+    /// The fields NimBLE keeps for its connection re-attempt, and the
+    /// address type of the last advertising start.
+    reattempt: Option<(AdvertisingFields, u8)>,
     host_thread: Option<std::thread::ThreadId>,
     /// Handle slots and layout of the last registration, filled in when the
     /// host starts, as NimBLE does.
@@ -304,8 +316,9 @@ impl FakeBackend {
         self.lock().synced = synced;
     }
 
+    /// Model a link NimBLE knows, with its ATT MTU (23 until an exchange).
     pub(crate) fn set_mtu(&self, connection: u16, mtu: u16) {
-        self.lock().mtu.insert(connection, mtu);
+        self.lock().links.insert(connection, mtu);
     }
 
     pub(crate) fn calls(&self) -> Vec<NativeCall> {
@@ -386,12 +399,69 @@ impl FakeBackend {
     /// NimBLE host task would. Sync and reset callbacks first update the
     /// sync state, as NimBLE does before calling them.
     pub(crate) fn inject(&self, event: NativeEvent) -> Option<Delivery> {
-        match event {
-            NativeEvent::HostSynced => self.set_synced(true),
-            NativeEvent::HostReset { .. } => self.set_synced(false),
-            NativeEvent::Gap(_) => {}
+        {
+            let mut state = self.lock();
+            match &event {
+                NativeEvent::HostSynced => state.synced = true,
+                NativeEvent::HostReset { .. } => {
+                    state.synced = false;
+                    state.links.clear();
+                    state.advertising = false;
+                }
+                // NimBLE creates the link, ending advertising, before it
+                // reports the connection, and frees it before reporting a
+                // disconnection.
+                NativeEvent::Gap(GapEvent::Connect {
+                    connection,
+                    status: 0,
+                }) => {
+                    state.links.entry(*connection).or_insert(23);
+                    state.advertising = false;
+                }
+                NativeEvent::Gap(GapEvent::Connect { .. }) => state.advertising = false,
+                NativeEvent::Gap(GapEvent::Disconnect { connection, .. }) => {
+                    state.links.remove(connection);
+                }
+                NativeEvent::Gap(GapEvent::AdvertisingComplete { .. }) => {
+                    state.advertising = false;
+                }
+                NativeEvent::Gap(_) => {}
+            }
         }
         self.callbacks.deliver(event)
+    }
+
+    /// Whether an advertising procedure is active.
+    pub(crate) fn is_advertising(&self) -> bool {
+        self.lock().advertising
+    }
+
+    /// Model ESP-IDF's connection re-attempt (`ble_hs_hci_evt_disconn_complete`
+    /// and `ble_gap_slave_adv_reattempt`): a peripheral link that failed to
+    /// establish is freed without any GAP event, then advertising is stopped
+    /// and restarted from the fields last set, recorded like any other
+    /// call. A failure is only logged by NimBLE, so it is not returned.
+    /// (NimBLE first reports the end of the link's subscriptions; tests
+    /// inject those.)
+    pub(crate) fn silent_reattempt(&self, connection: u16) {
+        let stored = {
+            let mut state = self.lock();
+            state.links.remove(&connection);
+            state.reattempt.clone()
+        };
+        let _ = self.advertising_stop();
+        let Some((fields, address_type)) = stored else {
+            return;
+        };
+        let encoded = nimble_encode(&fields).expect("stored fields encode");
+        if self.enter(
+            Operation::AdvertisingData,
+            NativeCall::AdvertisingData(encoded),
+        ) != 0
+        {
+            return;
+        }
+        let _ = self.advertising_start(address_type);
     }
 
     /// Deliver a GAP event, as the NimBLE host task would.
@@ -464,9 +534,59 @@ impl FakeBackend {
     }
 }
 
+/// A model of NimBLE's `ble_hs_adv_set_fields` (`ble_hs_adv.c`) for the
+/// fields this crate sets: flags when nonzero, then the 16-bit and 128-bit
+/// UUID lists when nonempty, each as a length byte, the type, and the
+/// little-endian values; any structure that would pass 31 bytes fails with
+/// `BLE_HS_EMSGSIZE` (4), as `ble_hs_adv_set_hdr` does.
+pub(crate) fn nimble_encode(fields: &AdvertisingFields) -> Result<Vec<u8>, i32> {
+    const EMSGSIZE: i32 = 4;
+    let mut encoded = Vec::new();
+    let mut append = |kind: u8, data: &[u8]| {
+        if encoded.len() + 2 + data.len() > LEGACY_PAYLOAD_CAPACITY {
+            return Err(EMSGSIZE);
+        }
+        encoded.push(data.len() as u8 + 1);
+        encoded.push(kind);
+        encoded.extend_from_slice(data);
+        Ok(())
+    };
+    if fields.flags != 0 {
+        append(ad::FLAGS, &[fields.flags])?;
+    }
+    if !fields.uuids16.is_empty() {
+        let data: Vec<u8> = fields
+            .uuids16
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let kind = if fields.uuids16_complete {
+            ad::COMPLETE_UUIDS16
+        } else {
+            ad::INCOMPLETE_UUIDS16
+        };
+        append(kind, &data)?;
+    }
+    if !fields.uuids128.is_empty() {
+        let data: Vec<u8> = fields
+            .uuids128
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let kind = if fields.uuids128_complete {
+            ad::COMPLETE_UUIDS128
+        } else {
+            ad::INCOMPLETE_UUIDS128
+        };
+        append(kind, &data)?;
+    }
+    Ok(encoded)
+}
+
 impl Backend for FakeBackend {
     type Mbuf = FakeMbuf;
     type Registration = FakeRegistration;
+    type AdvertisingFields = AdvertisingFields;
 
     fn host_init(&self) -> NativeResult<()> {
         check(
@@ -676,10 +796,14 @@ impl Backend for FakeBackend {
         check(Operation::Notify, code)
     }
 
+    /// Like `ble_gap_terminate`: an unknown link fails with
+    /// `BLE_HS_ENOTCONN` (7) unless another result is scripted.
     fn terminate(&self, connection: u16) -> NativeResult<()> {
+        let code = self.enter(Operation::Terminate, NativeCall::Terminate { connection });
+        let known = self.lock().links.contains_key(&connection);
         check(
             Operation::Terminate,
-            self.enter(Operation::Terminate, NativeCall::Terminate { connection }),
+            if code == 0 && !known { 7 } else { code },
         )
     }
 
@@ -693,14 +817,26 @@ impl Backend for FakeBackend {
         )
     }
 
-    fn set_advertising_data(&self, data: &[u8]) -> NativeResult<()> {
-        check(
+    fn prepare_advertising_fields(&self, fields: &AdvertisingFields) -> AdvertisingFields {
+        fields.clone()
+    }
+
+    /// Like `ble_gap_adv_set_fields`: encodes with [`nimble_encode`],
+    /// records the bytes, and keeps the fields for the re-attempt.
+    fn set_advertising_fields(&self, fields: &AdvertisingFields) -> NativeResult<()> {
+        let encoded = nimble_encode(fields).map_err(|code| NativeError::Status {
+            operation: Operation::AdvertisingData,
+            code,
+        })?;
+        let code = self.enter(
             Operation::AdvertisingData,
-            self.enter(
-                Operation::AdvertisingData,
-                NativeCall::AdvertisingData(data.to_vec()),
-            ),
-        )
+            NativeCall::AdvertisingData(encoded),
+        );
+        let mut state = self.lock();
+        let address_type = state.reattempt.as_ref().map_or(0, |(_, address)| *address);
+        state.reattempt = Some((fields.clone(), address_type));
+        drop(state);
+        check(Operation::AdvertisingData, code)
     }
 
     fn set_scan_response_data(&self, data: &[u8]) -> NativeResult<()> {
@@ -713,21 +849,29 @@ impl Backend for FakeBackend {
         )
     }
 
+    /// Starting while advertising succeeds, as the ESP backend maps
+    /// `BLE_HS_EALREADY`.
     fn advertising_start(&self, address_type: u8) -> NativeResult<()> {
-        check(
+        let code = self.enter(
             Operation::AdvertisingStart,
-            self.enter(
-                Operation::AdvertisingStart,
-                NativeCall::AdvertisingStart { address_type },
-            ),
-        )
+            NativeCall::AdvertisingStart { address_type },
+        );
+        let mut state = self.lock();
+        if let Some((_, address)) = state.reattempt.as_mut() {
+            *address = address_type;
+        }
+        if code == 0 {
+            state.advertising = true;
+        }
+        drop(state);
+        check(Operation::AdvertisingStart, code)
     }
 
     fn advertising_stop(&self) -> NativeResult<()> {
-        check(
-            Operation::AdvertisingStop,
-            self.enter(Operation::AdvertisingStop, NativeCall::AdvertisingStop),
-        )
+        let code = self.enter(Operation::AdvertisingStop, NativeCall::AdvertisingStop);
+        // NimBLE stops the controller before it can fail.
+        self.lock().advertising = false;
+        check(Operation::AdvertisingStop, code)
     }
 
     fn is_synced(&self) -> bool {
@@ -736,7 +880,7 @@ impl Backend for FakeBackend {
 
     fn mtu(&self, connection: u16) -> Option<u16> {
         self.enter(Operation::Mtu, NativeCall::Mtu { connection });
-        self.lock().mtu.get(&connection).copied()
+        self.lock().links.get(&connection).copied()
     }
 
     fn prepare_gatt(&self, plan: &GattPlan) -> FakeRegistration {

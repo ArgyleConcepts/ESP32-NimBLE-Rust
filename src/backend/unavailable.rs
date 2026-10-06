@@ -5,6 +5,7 @@
 
 use super::dispatch::EventDispatcher;
 use super::native::{Backend, NativeResult};
+use crate::ble::advertising::AdvertisingFields;
 use crate::gatt::registration::GattPlan;
 use std::ffi::CStr;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ pub(crate) enum Unavailable {}
 impl Backend for Unavailable {
     type Mbuf = Unavailable;
     type Registration = Unavailable;
+    type AdvertisingFields = Unavailable;
 
     fn host_init(&self) -> NativeResult<()> {
         match *self {}
@@ -59,7 +61,10 @@ impl Backend for Unavailable {
     fn set_device_name(&self, _: &CStr) -> NativeResult<()> {
         match *self {}
     }
-    fn set_advertising_data(&self, _: &[u8]) -> NativeResult<()> {
+    fn prepare_advertising_fields(&self, _: &AdvertisingFields) -> Unavailable {
+        match *self {}
+    }
+    fn set_advertising_fields(&self, _: &Unavailable) -> NativeResult<()> {
         match *self {}
     }
     fn set_scan_response_data(&self, _: &[u8]) -> NativeResult<()> {

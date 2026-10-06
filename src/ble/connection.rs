@@ -8,8 +8,8 @@
 //! application's [`ConnectionHandler`] runs:
 //!
 //! - `operations` serializes advertising decisions with the native calls that
-//!   carry them out, so two threads never both decide to start advertising,
-//!   and shutdown never races a restart. It is held across HCI commands.
+//!   carry them out, so two starts never interleave their payloads and
+//!   shutdown never races a restart. It is held across HCI commands.
 //!   That cannot deadlock with the host task: NimBLE acknowledges HCI
 //!   commands from the transport, not the host task
 //!   (`ble_hs_hci_rx_evt` in `ble_hs_hci.c`), and calls GAP callbacks
@@ -22,7 +22,7 @@ use super::advertising::AdvertisingPlan;
 use super::{HostEvents, OwnerSlot};
 use crate::backend::dispatch::EventSink;
 use crate::backend::gap::GapEvent;
-use crate::backend::native::{Backend, NativeEvent};
+use crate::backend::native::{Backend, NativeError, NativeEvent};
 use crate::gatt::{EndpointId, EndpointKey, NotifyEndpoint};
 use crate::{Error, ErrorKind};
 use std::fmt;
@@ -41,6 +41,23 @@ pub(crate) const ATT_CHANNEL: u16 = 0x0004;
 /// NimBLE offsets HCI status codes into host statuses from this base
 /// (`BLE_HS_ERR_HCI_BASE`). ESP builds check it against the SDK.
 pub(crate) const HCI_STATUS_BASE: i32 = 0x200;
+
+/// NimBLE's `BLE_HS_EAGAIN`, the status of a peripheral connection that broke
+/// before it was reported. ESP builds check it against the SDK.
+pub(crate) const HOST_EAGAIN: i32 = 1;
+
+/// NimBLE's `BLE_HS_ENOTCONN`: the host knows no such link. It is also the
+/// disconnection status reported for a client whose link NimBLE freed
+/// without an event. ESP builds check it against the SDK.
+pub(crate) const HOST_ENOTCONN: i32 = 7;
+
+/// The HCI Unknown Connection Identifier status (Core Specification Vol 1,
+/// Part F, 1.3): the controller knows no such link.
+const HCI_UNKNOWN_CONNECTION: i32 = 0x02;
+
+/// The most links whose subscriptions are remembered before NimBLE reports
+/// their connection; beyond it the oldest link's are dropped.
+const PENDING_LINKS: usize = 4;
 
 /// The identity of one client connection.
 ///
@@ -154,16 +171,23 @@ pub enum ConnectionEvent {
         reason: DisconnectReason,
     },
     /// A client's connection attempt failed before it was established; no
-    /// connection identity was assigned.
+    /// connection identity was assigned. If NimBLE left the link open, the
+    /// framework terminates it and also reports
+    /// [`ConnectionRejected`](Self::ConnectionRejected).
     ConnectionFailed {
-        /// NimBLE's status: a host status, or in ESP-IDF's NimBLE an HCI
-        /// status from the connection's feature exchange.
-        status: i32,
+        /// Why it failed, classified like a disconnection: ESP-IDF 6.1
+        /// reports either `BLE_HS_EAGAIN` (the link broke before it was
+        /// reported; [`DisconnectReason::status`] is 1) or the raw HCI status
+        /// of the connection's feature exchange, which the framework offsets
+        /// into the HCI range so [`DisconnectReason::hci_reason`] returns it.
+        reason: DisconnectReason,
     },
-    /// A second client connected while one was already connected. Only one
-    /// client is supported, so the framework asked NimBLE to terminate the
-    /// new link; the connected client is unaffected. `termination` reports
-    /// whether that request failed.
+    /// The framework asked NimBLE to terminate a link it does not serve: a
+    /// second client that connected while one was already connected (only
+    /// one client is supported), or a link whose connection attempt NimBLE
+    /// reported as failed but left open. The connected client is
+    /// unaffected. `termination` reports whether NimBLE refused the request;
+    /// a link it already freed counts as terminated.
     ConnectionRejected {
         /// The result of requesting the termination.
         termination: Result<(), Error>,
@@ -195,13 +219,16 @@ pub enum ConnectionEvent {
         error: Error,
     },
     /// The host reset, ending any connection (reported first) and
-    /// advertising. NimBLE resynchronizes by itself.
+    /// advertising. NimBLE resynchronizes by itself. A reset while the host
+    /// is still starting is not reported; startup waits for the
+    /// resynchronization instead.
     HostReset {
         /// The NimBLE host status that caused the reset.
         reason: i32,
     },
-    /// The host resynchronized with the controller after a reset. Advertising
-    /// restarts if it remains available.
+    /// The host resynchronized with the controller after a reported
+    /// [`HostReset`](Self::HostReset). Advertising restarts if it remains
+    /// available.
     HostSynced,
 }
 
@@ -295,15 +322,23 @@ impl Active {
 
 struct State {
     phase: Phase,
-    /// Whether advertising is believed active. It is set before a start is
-    /// requested and cleared when NimBLE reports a connection or the end of
-    /// advertising, so a connection that arrives while a start is still
-    /// returning is never mistaken for advertising.
-    advertising: bool,
     active: Option<Active>,
-    /// Handles of extra links the framework asked NimBLE to terminate, so
-    /// their disconnection is recognized.
-    rejected: Vec<u16>,
+    /// Links the framework asked NimBLE to terminate and that NimBLE has not
+    /// reported ending yet, so their events are recognized and ignored.
+    terminating: Vec<u16>,
+    /// Subscriptions of links NimBLE has not reported as connected yet.
+    /// ESP-IDF reports a peripheral connection only after reading the
+    /// client's version and features (`ble_gap_rx_conn_complete` and
+    /// `ble_gap_rx_rd_rem_sup_feat_complete` in `ble_gap.c`), while ATT
+    /// already serves the client. Entries are applied when the link is
+    /// reported connected and dropped when it is reported failed, rejected,
+    /// or disconnected, when NimBLE reports the subscriptions ending (it
+    /// does before freeing a link, including without a disconnection event
+    /// in ESP-IDF's connection re-attempt), and on a host reset, so they
+    /// never reach a later link that reuses the handle.
+    pending: Vec<(u16, Vec<EndpointId>)>,
+    /// Whether a host reset was reported and its resynchronization not yet.
+    reset_reported: bool,
 }
 
 /// Values known once the host has started.
@@ -314,12 +349,31 @@ struct Prepared {
     value_handles: Vec<(Option<EndpointId>, u16)>,
 }
 
+/// What NimBLE reports about the links involved in a connection event,
+/// queried before the state lock is taken.
+#[derive(Clone, Copy, Default)]
+struct Links {
+    /// The new link's ATT MTU, if NimBLE knows the link.
+    mtu: Option<u16>,
+    /// Whether NimBLE still knows the connected client's link.
+    active_alive: bool,
+}
+
+/// Why the framework terminates a link.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Unserved {
+    /// A second client.
+    Extra,
+    /// A link whose connection attempt NimBLE reported as failed.
+    Failed,
+}
+
 /// What handling one GAP event under the state lock decided.
 #[derive(Default)]
 struct Outcome {
     events: Vec<ConnectionEvent>,
-    /// An extra link to terminate.
-    terminate: Option<u16>,
+    /// A link to terminate.
+    terminate: Option<(u16, Unserved)>,
     /// Whether advertising may need to restart.
     restart: bool,
 }
@@ -333,6 +387,10 @@ pub(crate) struct Runtime<B: Backend> {
     host: Arc<HostEvents>,
     handler: Option<Box<dyn ConnectionHandler>>,
     advertising: Option<AdvertisingPlan>,
+    /// The native advertising fields. NimBLE keeps pointers into them for
+    /// its connection re-attempt, so they live as long as the runtime, which
+    /// outlives host deinitialization (see [`Backend::AdvertisingFields`]).
+    fields: Option<B::AdvertisingFields>,
     prepared: OnceLock<Prepared>,
     operations: Mutex<()>,
     state: Mutex<State>,
@@ -351,6 +409,25 @@ fn lifecycle(message: &'static str) -> Error {
     Error::new(ErrorKind::Lifecycle, Some("start advertising"), message)
 }
 
+/// Classify a failed connection's status; see
+/// [`ConnectionEvent::ConnectionFailed`].
+fn failure_reason(status: i32) -> DisconnectReason {
+    if status != HOST_EAGAIN && (1..0x100).contains(&status) {
+        DisconnectReason(HCI_STATUS_BASE + status)
+    } else {
+        DisconnectReason(status)
+    }
+}
+
+/// Whether a termination failed only because the link is already gone.
+fn already_gone(error: &NativeError) -> bool {
+    matches!(
+        error,
+        NativeError::Status { code, .. }
+            if *code == HOST_ENOTCONN || *code == HCI_STATUS_BASE + HCI_UNKNOWN_CONNECTION
+    )
+}
+
 impl<B: Backend> Runtime<B> {
     pub(crate) fn new(
         backend: B,
@@ -359,19 +436,24 @@ impl<B: Backend> Runtime<B> {
         handler: Option<Box<dyn ConnectionHandler>>,
         advertising: Option<AdvertisingPlan>,
     ) -> Self {
+        let fields = advertising
+            .as_ref()
+            .map(|plan| backend.prepare_advertising_fields(&plan.fields));
         Self {
             backend,
             slot,
             host,
             handler,
             advertising,
+            fields,
             prepared: OnceLock::new(),
             operations: Mutex::new(()),
             state: Mutex::new(State {
                 phase: Phase::Starting,
-                advertising: false,
                 active: None,
-                rejected: Vec::new(),
+                terminating: Vec::new(),
+                pending: Vec::new(),
+                reset_reported: false,
             }),
         }
     }
@@ -409,25 +491,22 @@ impl<B: Backend> Runtime<B> {
     /// phase. On failure the phase stays `Starting` until [`stop`](Self::stop).
     pub(crate) fn begin(&self) -> Result<(), Error> {
         let operations = lock(&self.operations);
-        if let Some(plan) = &self.advertising {
-            self.advertise(&operations, plan)?;
+        if self.advertising.is_some() {
+            self.advertise(&operations)?;
         }
         lock(&self.state).phase = Phase::Running;
         Ok(())
     }
 
     /// Enter the stopping phase, after which advertising never starts, and
-    /// stop advertising if it is active. Stopping is best effort: stopping
-    /// the host also ends advertising (`ble_hs_stop` preempts every GAP
-    /// procedure), and the GAP callback refers to no storage.
+    /// stop advertising. Stopping is best effort and skipped while the host
+    /// is not synchronized: stopping the host also ends advertising
+    /// (`ble_hs_stop` preempts every GAP procedure), and the GAP callback
+    /// refers to no storage.
     pub(crate) fn stop(&self) {
         let _operations = lock(&self.operations);
-        let advertising = {
-            let mut state = lock(&self.state);
-            state.phase = Phase::Stopping;
-            std::mem::replace(&mut state.advertising, false)
-        };
-        if advertising {
+        lock(&self.state).phase = Phase::Stopping;
+        if self.advertising.is_some() && self.backend.is_synced() {
             let _ = self.backend.advertising_stop();
         }
     }
@@ -450,12 +529,16 @@ impl<B: Backend> Runtime<B> {
     }
 
     /// Start advertising at the application's request; see
-    /// [`Ble::start_advertising`](crate::Ble::start_advertising).
+    /// [`Ble::start_advertising`](crate::Ble::start_advertising). The request
+    /// is always sent to NimBLE, which treats a running advertising procedure
+    /// as success, so it also recovers advertising that NimBLE stopped
+    /// without telling the framework.
     pub(crate) fn start_advertising(&self) -> Result<(), Error> {
-        let plan = self
-            .advertising
-            .as_ref()
-            .ok_or_else(|| lifecycle("no advertising was configured before the host started"))?;
+        if self.advertising.is_none() {
+            return Err(lifecycle(
+                "no advertising was configured before the host started",
+            ));
+        }
         let operations = lock(&self.operations);
         {
             let state = lock(&self.state);
@@ -467,29 +550,26 @@ impl<B: Backend> Runtime<B> {
                     "a client is connected, and only one client is supported",
                 ));
             }
-            if state.advertising {
-                return Ok(());
-            }
         }
         if !self.backend.is_synced() {
             return Err(lifecycle(
                 "the host is not synchronized with the controller",
             ));
         }
-        self.advertise(&operations, plan)
+        self.advertise(&operations)
     }
 
     /// Restart advertising by itself, if it remains available and nothing
-    /// prevents it, returning the failure to report.
+    /// prevents it, returning the failure to report. Like an application
+    /// request, it is sent even if advertising may be running.
     fn restart(&self) -> Option<Error> {
-        let plan = self.advertising.as_ref()?;
-        if !plan.remain_available {
+        if !self.advertising.as_ref()?.remain_available {
             return None;
         }
         let operations = lock(&self.operations);
         {
             let state = lock(&self.state);
-            if state.phase != Phase::Running || state.active.is_some() || state.advertising {
+            if state.phase != Phase::Running || state.active.is_some() {
                 return None;
             }
         }
@@ -499,35 +579,28 @@ impl<B: Backend> Runtime<B> {
         if !self.backend.is_synced() {
             return None;
         }
-        self.advertise(&operations, plan).err()
+        self.advertise(&operations).err()
     }
 
     /// Send the payloads and start advertising. The caller holds
     /// `operations` and has checked that nothing prevents it.
-    fn advertise(
-        &self,
-        _operations: &MutexGuard<'_, ()>,
-        plan: &AdvertisingPlan,
-    ) -> Result<(), Error> {
+    fn advertise(&self, _operations: &MutexGuard<'_, ()>) -> Result<(), Error> {
+        let (Some(plan), Some(fields)) = (&self.advertising, &self.fields) else {
+            return Ok(());
+        };
         let address_type = self
             .prepared
             .get()
             .expect("prepared before advertising")
             .address_type;
-        lock(&self.state).advertising = true;
         // The payloads are sent every time: resynchronizing after a host
         // reset also resets the controller (`ble_hs_startup_go` sends HCI
         // Reset), which forgets them.
-        let result = self
-            .backend
-            .set_advertising_data(&plan.advertising_data)
+        self.backend
+            .set_advertising_fields(fields)
             .and_then(|()| self.backend.set_scan_response_data(&plan.scan_response))
-            .and_then(|()| self.backend.advertising_start(address_type));
-        if result.is_err() {
-            // A failed start cannot have accepted a connection.
-            lock(&self.state).advertising = false;
-        }
-        result.map_err(Error::from)
+            .and_then(|()| self.backend.advertising_start(address_type))
+            .map_err(Error::from)
     }
 
     fn emit(&self, events: Vec<ConnectionEvent>) {
@@ -552,14 +625,46 @@ impl<B: Backend> Runtime<B> {
     }
 
     fn on_gap(&self, event: GapEvent) {
+        // Native queries happen before the state lock is taken. Only the host
+        // task changes the connection record, and it is here, so the answers
+        // still hold when the lock is taken.
+        let mut links = Links::default();
+        if let GapEvent::Connect {
+            connection,
+            status: 0,
+        } = event
+        {
+            links.mtu = self.backend.mtu(connection);
+            let active = lock(&self.state)
+                .active
+                .as_ref()
+                .map(|active| active.handle);
+            links.active_alive = match active {
+                Some(handle) if handle != connection => self.backend.mtu(handle).is_some(),
+                _ => true,
+            };
+        }
         let outcome = {
             let mut state = lock(&self.state);
-            self.decide(&mut state, event)
+            self.decide(&mut state, event, links)
         };
         let mut events = outcome.events;
-        if let Some(handle) = outcome.terminate {
-            let termination = self.backend.terminate(handle).map_err(Error::from);
-            events.push(ConnectionEvent::ConnectionRejected { termination });
+        if let Some((handle, reason)) = outcome.terminate {
+            let termination = match self.backend.terminate(handle) {
+                Ok(()) => {
+                    lock(&self.state).terminating.push(handle);
+                    Some(Ok(()))
+                }
+                // A failed connection attempt whose link is already gone
+                // needs no termination and is not reported as one.
+                Err(error) if already_gone(&error) => (reason == Unserved::Extra).then_some(Ok(())),
+                // The link may stay open; it is not tracked, so a later link
+                // that reuses the handle is handled afresh.
+                Err(error) => Some(Err(Error::from(error))),
+            };
+            if let Some(termination) = termination {
+                events.push(ConnectionEvent::ConnectionRejected { termination });
+            }
         }
         self.emit(events);
         if outcome.restart {
@@ -567,64 +672,105 @@ impl<B: Backend> Runtime<B> {
         }
     }
 
+    /// Remove and return the pending subscriptions of `handle`.
+    fn take_pending(state: &mut State, handle: u16) -> Vec<EndpointId> {
+        match state.pending.iter().position(|(link, _)| *link == handle) {
+            Some(index) => state.pending.remove(index).1,
+            None => Vec::new(),
+        }
+    }
+
     /// Apply one GAP event to the connection record.
-    fn decide(&self, state: &mut State, event: GapEvent) -> Outcome {
+    fn decide(&self, state: &mut State, event: GapEvent, links: Links) -> Outcome {
         let mut outcome = Outcome::default();
         match event {
             GapEvent::Connect {
                 connection,
                 status: 0,
             } => {
-                // Legacy advertising ends when it accepts a connection.
-                state.advertising = false;
+                if state.terminating.contains(&connection) {
+                    return outcome;
+                }
+                if let Some(active) = state
+                    .active
+                    .take_if(|active| active.handle != connection && !links.active_alive)
+                {
+                    // NimBLE freed the client's link without reporting it
+                    // (ESP-IDF's connection re-attempt does so for a link
+                    // that failed to establish).
+                    active.end(DisconnectReason(HOST_ENOTCONN), &mut outcome.events);
+                }
                 match &state.active {
                     None => {
+                        let pending = Self::take_pending(state, connection);
                         let active = Active {
                             handle: connection,
                             generation: self.slot.next_generation(),
-                            mtu: ATT_DEFAULT_MTU,
-                            subscriptions: Vec::new(),
+                            mtu: links.mtu.unwrap_or(ATT_DEFAULT_MTU),
+                            subscriptions: pending,
                         };
-                        outcome.events.push(ConnectionEvent::Connected {
-                            connection: active.id(),
-                        });
+                        let id = active.id();
+                        outcome
+                            .events
+                            .push(ConnectionEvent::Connected { connection: id });
+                        // Changes that happened before NimBLE reported the
+                        // connection follow it.
+                        if active.mtu != ATT_DEFAULT_MTU {
+                            outcome.events.push(ConnectionEvent::MtuChanged {
+                                connection: id,
+                                mtu: active.mtu,
+                            });
+                        }
+                        outcome
+                            .events
+                            .extend(active.subscriptions.iter().map(|endpoint| {
+                                ConnectionEvent::SubscriptionChanged {
+                                    connection: id,
+                                    endpoint: EndpointKey::from_id(endpoint.clone()),
+                                    notify: true,
+                                }
+                            }));
                         state.active = Some(active);
                     }
                     // A repeated report of the connected client.
                     Some(active) if active.handle == connection => {}
                     Some(_) => {
-                        if !state.rejected.contains(&connection) {
-                            state.rejected.push(connection);
-                            outcome.terminate = Some(connection);
-                        }
+                        Self::take_pending(state, connection);
+                        outcome.terminate = Some((connection, Unserved::Extra));
                     }
                 }
             }
-            GapEvent::Connect { status, .. } => {
-                state.advertising = false;
-                // While a client is connected, a failed second link changes
-                // nothing.
+            GapEvent::Connect { connection, status } => {
+                Self::take_pending(state, connection);
+                if state.terminating.contains(&connection)
+                    || state
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| active.handle == connection)
+                {
+                    return outcome;
+                }
+                // ESP-IDF can report a failed connection for a link it leaves
+                // open (a failed feature exchange); end it so it is not
+                // served untracked.
+                outcome.terminate = Some((connection, Unserved::Failed));
                 if state.active.is_none() {
-                    outcome
-                        .events
-                        .push(ConnectionEvent::ConnectionFailed { status });
+                    outcome.events.push(ConnectionEvent::ConnectionFailed {
+                        reason: failure_reason(status),
+                    });
                     outcome.restart = true;
                 }
             }
             GapEvent::Disconnect { connection, reason } => {
-                if state
-                    .active
-                    .as_ref()
-                    .is_some_and(|active| active.handle == connection)
-                {
-                    let active = state.active.take().expect("checked above");
+                Self::take_pending(state, connection);
+                if let Some(active) = state.active.take_if(|active| active.handle == connection) {
                     active.end(DisconnectReason(reason), &mut outcome.events);
                 } else if let Some(index) = state
-                    .rejected
+                    .terminating
                     .iter()
                     .position(|handle| *handle == connection)
                 {
-                    state.rejected.swap_remove(index);
+                    state.terminating.swap_remove(index);
                 }
                 // A disconnection of an unknown link (such as one whose
                 // connection attempt was already reported as failed) is
@@ -637,36 +783,43 @@ impl<B: Backend> Runtime<B> {
                 notify,
                 ..
             } => {
-                let Some(active) = state
-                    .active
-                    .as_mut()
-                    .filter(|active| active.handle == connection)
-                else {
-                    return outcome;
-                };
                 // The stack's own characteristics (such as Service Changed)
                 // and unknown attributes have no endpoint.
                 let Some(endpoint) = self.endpoint(attribute) else {
                     return outcome;
                 };
-                let position = active.subscriptions.iter().position(|id| *id == endpoint);
-                let changed = match (notify, position) {
-                    (true, None) => {
-                        active.subscriptions.push(endpoint.clone());
-                        true
+                if let Some(active) = state
+                    .active
+                    .as_mut()
+                    .filter(|active| active.handle == connection)
+                {
+                    if update(&mut active.subscriptions, &endpoint, notify) {
+                        outcome.events.push(ConnectionEvent::SubscriptionChanged {
+                            connection: active.id(),
+                            endpoint: EndpointKey::from_id(endpoint),
+                            notify,
+                        });
                     }
-                    (false, Some(index)) => {
-                        active.subscriptions.remove(index);
-                        true
+                } else if !state.terminating.contains(&connection) {
+                    let position = state
+                        .pending
+                        .iter()
+                        .position(|(link, _)| *link == connection);
+                    let index = match position {
+                        Some(index) => index,
+                        None if notify => {
+                            if state.pending.len() == PENDING_LINKS {
+                                state.pending.remove(0);
+                            }
+                            state.pending.push((connection, Vec::new()));
+                            state.pending.len() - 1
+                        }
+                        None => return outcome,
+                    };
+                    update(&mut state.pending[index].1, &endpoint, notify);
+                    if state.pending[index].1.is_empty() {
+                        state.pending.remove(index);
                     }
-                    _ => false,
-                };
-                if changed {
-                    outcome.events.push(ConnectionEvent::SubscriptionChanged {
-                        connection: active.id(),
-                        endpoint: EndpointKey::from_id(endpoint),
-                        notify,
-                    });
                 }
             }
             GapEvent::Mtu {
@@ -674,6 +827,8 @@ impl<B: Backend> Runtime<B> {
                 channel,
                 mtu,
             } => {
+                // An exchange before NimBLE reports the connection is read
+                // from NimBLE when it does.
                 if channel != ATT_CHANNEL {
                     return outcome;
                 }
@@ -690,7 +845,6 @@ impl<B: Backend> Runtime<B> {
                 }
             }
             GapEvent::AdvertisingComplete { .. } => {
-                state.advertising = false;
                 outcome.restart = state.active.is_none();
             }
             // Connection parameters are not tracked, and notification
@@ -701,7 +855,11 @@ impl<B: Backend> Runtime<B> {
     }
 
     fn on_synced(&self) {
-        if lock(&self.state).phase == Phase::Running {
+        let reported = {
+            let mut state = lock(&self.state);
+            state.phase == Phase::Running && std::mem::take(&mut state.reset_reported)
+        };
+        if reported {
             self.emit(vec![ConnectionEvent::HostSynced]);
         }
         self.restart_and_report();
@@ -711,18 +869,36 @@ impl<B: Backend> Runtime<B> {
         let mut events = Vec::new();
         {
             let mut state = lock(&self.state);
-            state.advertising = false;
-            state.rejected.clear();
+            state.terminating.clear();
+            state.pending.clear();
             // NimBLE reports each connection's end before the reset; any it
             // did not report ends here.
             if let Some(active) = state.active.take() {
                 active.end(DisconnectReason(reason), &mut events);
             }
             if state.phase == Phase::Running {
+                state.reset_reported = true;
                 events.push(ConnectionEvent::HostReset { reason });
             }
         }
         self.emit(events);
+    }
+}
+
+/// Enable or disable `endpoint` in `subscriptions`, returning whether that
+/// changed anything.
+fn update(subscriptions: &mut Vec<EndpointId>, endpoint: &EndpointId, notify: bool) -> bool {
+    let position = subscriptions.iter().position(|id| id == endpoint);
+    match (notify, position) {
+        (true, None) => {
+            subscriptions.push(endpoint.clone());
+            true
+        }
+        (false, Some(index)) => {
+            subscriptions.remove(index);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -748,7 +924,6 @@ impl<B: Backend> fmt::Debug for Runtime<B> {
         formatter
             .debug_struct("Runtime")
             .field("phase", &state.phase)
-            .field("advertising", &state.advertising)
             .field("connected", &state.active.is_some())
             .finish_non_exhaustive()
     }
@@ -793,7 +968,7 @@ mod tests {
                 ConnectionEvent::Disconnected { connection, reason } => {
                     Self::Disconnected(connection, reason.status())
                 }
-                ConnectionEvent::ConnectionFailed { status } => Self::Failed(status),
+                ConnectionEvent::ConnectionFailed { reason } => Self::Failed(reason.status()),
                 ConnectionEvent::ConnectionRejected { termination } => {
                     Self::Rejected(termination.err().as_ref().map(describe))
                 }
@@ -886,13 +1061,22 @@ mod tests {
     /// the start.
     fn is_advertising_start(calls: &[NativeCall]) -> bool {
         matches!(
-            calls,
+            &without_queries(calls)[..],
             [
                 NativeCall::AdvertisingData(_),
                 NativeCall::ScanResponseData(_),
                 NativeCall::AdvertisingStart { address_type: 0 }
             ]
         )
+    }
+
+    /// `calls` without MTU queries, which only read NimBLE's link state.
+    fn without_queries(calls: &[NativeCall]) -> Vec<NativeCall> {
+        calls
+            .iter()
+            .filter(|call| !matches!(call, NativeCall::Mtu { .. }))
+            .cloned()
+            .collect()
     }
 
     struct Fixture {
@@ -1227,22 +1411,93 @@ mod tests {
     #[test]
     fn a_failed_connection_restarts_advertising() {
         let fixture = fixture();
+        // The link broke before NimBLE reported it (`BLE_HS_EAGAIN`) and is
+        // already gone, so there is nothing to terminate.
         let mark = fixture.mark();
         fixture.deliver(GapEvent::Connect {
             connection: 2,
-            status: 13,
+            status: HOST_EAGAIN,
         });
-        assert_eq!(fixture.seen.take(), [Seen::Failed(13)]);
+        assert_eq!(fixture.seen.take(), [Seen::Failed(HOST_EAGAIN)]);
         assert!(fixture.running.connection().is_none());
-        assert!(is_advertising_start(&fixture.calls_since(mark)));
+        let calls = fixture.calls_since(mark);
+        assert_eq!(calls[0], NativeCall::Terminate { connection: 2 });
+        assert!(is_advertising_start(&calls[1..]));
+    }
 
-        // ESP-IDF can report a failed connection for a link that still
-        // exists and later disconnects; that disconnection restarts
-        // advertising again if it is not active.
+    #[test]
+    fn a_failed_connection_left_open_is_terminated_and_tracked() {
+        let fixture = fixture();
+        // ESP-IDF reports a failed feature exchange (raw HCI status 0x3b)
+        // for a link it leaves open.
+        fixture.fake.set_mtu(2, ATT_DEFAULT_MTU);
         let mark = fixture.mark();
+        fixture.deliver(GapEvent::Connect {
+            connection: 2,
+            status: 0x3b,
+        });
+        assert_eq!(
+            fixture.seen.take(),
+            [Seen::Failed(0x23b), Seen::Rejected(None)],
+            "the HCI status is offset into the HCI range"
+        );
+        let calls = fixture.calls_since(mark);
+        assert_eq!(calls[0], NativeCall::Terminate { connection: 2 });
+        assert!(is_advertising_start(&calls[1..]));
+        // Its events are ignored until NimBLE reports it ending.
+        let (_, level_handle) = fixture.level.clone();
+        fixture.deliver(connect(2));
+        fixture.deliver(subscribe(2, level_handle, true));
         fixture.deliver(disconnect(2));
         assert!(fixture.seen.take().is_empty());
-        assert!(fixture.calls_since(mark).is_empty(), "already advertising");
+        assert!(fixture.running.connection().is_none());
+        // Afterwards the handle is a new link like any other.
+        fixture.deliver(connect(2));
+        let id = fixture.id();
+        assert_eq!(fixture.seen.take(), [Seen::Connected(id)]);
+        assert!(fixture
+            .running
+            .connection()
+            .unwrap()
+            .subscriptions()
+            .is_empty());
+    }
+
+    #[test]
+    fn connection_failure_statuses_are_classified() {
+        assert_eq!(failure_reason(HOST_EAGAIN).status(), HOST_EAGAIN);
+        assert_eq!(failure_reason(HOST_EAGAIN).hci_reason(), None);
+        assert_eq!(failure_reason(0x3e).status(), 0x23e);
+        assert_eq!(failure_reason(0x3e).hci_reason(), Some(0x3e));
+        assert_eq!(failure_reason(0xff).hci_reason(), Some(0xff));
+        // Statuses already in a host range are kept.
+        assert_eq!(failure_reason(0x213).hci_reason(), Some(0x13));
+        assert_eq!(failure_reason(-5).status(), -5);
+    }
+
+    #[test]
+    fn a_failed_second_link_while_connected_changes_nothing_but_is_terminated() {
+        let fixture = fixture();
+        let (level, level_handle) = fixture.level.clone();
+        fixture.deliver(connect(1));
+        let id = fixture.id();
+        fixture.deliver(subscribe(1, level_handle, true));
+        fixture.seen.take();
+        fixture.fake.set_mtu(2, ATT_DEFAULT_MTU);
+        let mark = fixture.mark();
+        fixture.deliver(GapEvent::Connect {
+            connection: 2,
+            status: 0x3b,
+        });
+        assert_eq!(fixture.seen.take(), [Seen::Rejected(None)]);
+        assert_eq!(
+            without_queries(&fixture.calls_since(mark)),
+            [NativeCall::Terminate { connection: 2 }],
+            "no advertising while connected"
+        );
+        let info = fixture.running.connection().unwrap();
+        assert_eq!(info.id(), id);
+        assert_eq!(info.subscriptions(), std::slice::from_ref(&level));
     }
 
     #[test]
@@ -1263,20 +1518,32 @@ mod tests {
         fixture.deliver(disconnect(1));
         fixture.deliver(GapEvent::Connect {
             connection: 1,
-            status: 13,
+            status: HOST_EAGAIN,
         });
         fixture.deliver(GapEvent::AdvertisingComplete { reason: 0 });
         assert_eq!(
             fixture.seen.take(),
-            [Seen::Disconnected(id, REMOTE_USER), Seen::Failed(13)]
+            [
+                Seen::Disconnected(id, REMOTE_USER),
+                Seen::Failed(HOST_EAGAIN)
+            ]
         );
-        assert!(fixture.calls_since(mark).is_empty(), "no automatic restart");
+        assert_eq!(
+            fixture.calls_since(mark),
+            [NativeCall::Terminate { connection: 1 }],
+            "no automatic restart"
+        );
+        assert!(!fixture.fake.is_advertising());
 
-        fixture.running.start_advertising().unwrap();
-        assert!(is_advertising_start(&fixture.calls_since(mark)));
         let mark = fixture.mark();
         fixture.running.start_advertising().unwrap();
-        assert!(fixture.calls_since(mark).is_empty(), "already advertising");
+        assert!(is_advertising_start(&fixture.calls_since(mark)));
+        assert!(fixture.fake.is_advertising());
+        // A request while advertising is sent again; NimBLE treats it as
+        // success.
+        let mark = fixture.mark();
+        fixture.running.start_advertising().unwrap();
+        assert!(is_advertising_start(&fixture.calls_since(mark)));
     }
 
     #[test]
@@ -1331,7 +1598,7 @@ mod tests {
         fixture.deliver(mtu(2, 100));
         assert_eq!(fixture.seen.take(), [Seen::Rejected(None)]);
         assert_eq!(
-            fixture.calls_since(mark),
+            without_queries(&fixture.calls_since(mark)),
             [NativeCall::Terminate { connection: 2 }],
             "one termination, and no advertising"
         );
@@ -1344,14 +1611,23 @@ mod tests {
         assert_eq!(info.subscriptions(), [level]);
         assert_eq!(info.mtu(), ATT_DEFAULT_MTU);
 
-        // A termination NimBLE refuses is reported.
-        fixture.fake.fail_next(Operation::Terminate, 7);
+        // A termination NimBLE refuses is reported, and the link is not
+        // tracked: a later link reusing its handle is rejected afresh
+        // rather than ignored.
+        fixture.fake.fail_next(Operation::Terminate, 6);
         fixture.deliver(connect(3));
         assert_eq!(
             fixture.seen.take(),
             [Seen::Rejected(Some("ble_gap_terminate".into()))]
         );
         assert_eq!(fixture.id(), first);
+        let mark = fixture.mark();
+        fixture.deliver(connect(3));
+        assert_eq!(fixture.seen.take(), [Seen::Rejected(None)]);
+        assert_eq!(
+            without_queries(&fixture.calls_since(mark)),
+            [NativeCall::Terminate { connection: 3 }]
+        );
     }
 
     #[test]
@@ -1375,7 +1651,10 @@ mod tests {
         });
         assert!(fixture.seen.take().is_empty());
         assert!(fixture.running.connection().is_none());
-        assert!(fixture.calls_since(mark).is_empty(), "still advertising");
+        // The stale disconnection only re-sends advertising, which NimBLE
+        // treats as success.
+        assert!(is_advertising_start(&fixture.calls_since(mark)));
+        assert!(fixture.fake.is_advertising());
 
         fixture.deliver(connect(1));
         let id = fixture.id();
@@ -1486,12 +1765,13 @@ mod tests {
         assert_eq!(
             calls[start + 1..],
             [
+                NativeCall::AdvertisingStop,
                 NativeCall::HostStop,
                 NativeCall::HostDeinit,
                 NativeCall::RemoveCallbacks,
                 NativeCall::RegistrationFreed,
             ],
-            "nothing is advertising, so nothing is stopped"
+            "advertising is stopped (NimBLE reports nothing to stop) before the host"
         );
         assert!(error.into_server().is_some());
         assert!(take(fake, slot).is_ok());
@@ -1589,7 +1869,7 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::Backend);
         assert_eq!(
             error.backend().map(crate::BackendError::operation),
-            Some("ble_gap_adv_set_data")
+            Some("ble_gap_adv_set_fields")
         );
         // Nothing was left claiming that advertising is active.
         let mark = fixture.mark();
@@ -1624,29 +1904,60 @@ mod tests {
         assert_eq!(
             fake.calls()[mark..],
             [
-                NativeCall::HostStop,
-                NativeCall::HostDeinit,
-                NativeCall::RemoveCallbacks,
-                NativeCall::RegistrationFreed,
-            ],
-            "not advertising while connected, so nothing to stop"
-        );
-        assert!(take(fake, slot).is_ok());
-
-        // An advertising host stops advertising before the host.
-        let Fixture { fake, running, .. } = fixture();
-        let mark = fake.calls().len();
-        drop(running);
-        assert_eq!(
-            fake.calls()[mark..],
-            [
                 NativeCall::AdvertisingStop,
                 NativeCall::HostStop,
                 NativeCall::HostDeinit,
                 NativeCall::RemoveCallbacks,
                 NativeCall::RegistrationFreed,
-            ]
+            ],
+            "advertising is stopped before the host and never restarted"
         );
+        assert!(take(fake, slot).is_ok());
+
+        // A host that is not synchronized is not asked to stop advertising.
+        let Fixture { fake, running, .. } = fixture();
+        fake.set_synced(false);
+        let mark = fake.calls().len();
+        drop(running);
+        assert_eq!(fake.calls()[mark], NativeCall::HostStop);
+    }
+
+    #[test]
+    fn start_advertising_fails_while_the_host_shuts_down() {
+        type Shared = Arc<OnceLock<Arc<Runtime<FakeBackend>>>>;
+        let fake = FakeBackend::new();
+        let cell: Shared = Arc::default();
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let mut configured = take(fake.clone(), slot()).unwrap();
+        configured.set_advertising(demo_advertising().build().unwrap());
+        let (handler_cell, handler_results) = (cell.clone(), results.clone());
+        configured.set_handler(Box::new(move |event: ConnectionEvent| {
+            if let ConnectionEvent::Disconnected { .. } = event {
+                let runtime = handler_cell.get().expect("set after startup");
+                let result = runtime
+                    .start_advertising()
+                    .map_err(|error| error.to_string());
+                handler_results.lock().unwrap().push(result);
+            }
+        }));
+        let (server, _, _) = server();
+        let running = start_with(&fake, configured, server).unwrap();
+        assert!(cell.set(running.core().runtime.clone()).is_ok());
+        fake.inject_gap(connect(1));
+        let gate = fake.hold(Operation::HostStop);
+        let stopping = thread::spawn(move || drop(running));
+        gate.wait_entered();
+        let mark = fake.calls().len();
+        fake.inject_gap(disconnect(1));
+        gate.release();
+        stopping.join().unwrap();
+        let results = results.lock().unwrap();
+        assert_eq!(results.len(), 1);
+        let error = results[0].as_ref().unwrap_err();
+        assert!(error.contains("shutting down"), "{error}");
+        assert!(!fake.calls()[mark..]
+            .iter()
+            .any(|call| matches!(call, NativeCall::AdvertisingStart { .. })));
     }
 
     #[test]
@@ -1696,13 +2007,10 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_during_an_advertising_start_is_not_mistaken_for_advertising() {
+    fn a_connection_during_an_advertising_start_is_still_tracked() {
         let fixture = fixture_with(Some(
             demo_advertising().remain_available(false).build().unwrap(),
         ));
-        fixture.deliver(connect(1));
-        fixture.deliver(disconnect(1));
-        fixture.seen.take();
         let runtime = fixture.running.core().runtime.clone();
         let gate = fixture.fake.hold(Operation::AdvertisingStart);
         let starting = thread::spawn(move || runtime.start_advertising());
@@ -1713,8 +2021,6 @@ mod tests {
         starting.join().unwrap().unwrap();
         let id = fixture.id();
         assert_eq!(fixture.seen.take(), [Seen::Connected(id)]);
-        // Advertising ended with that connection, so it can start again
-        // after it.
         fixture.deliver(disconnect(2));
         let mark = fixture.mark();
         fixture.running.start_advertising().unwrap();
@@ -1722,7 +2028,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_start_requests_start_advertising_once() {
+    fn concurrent_start_requests_never_interleave() {
         for _ in 0..20 {
             let fixture = fixture();
             fixture.deliver(connect(1));
@@ -1735,21 +2041,218 @@ mod tests {
             let application = thread::spawn(move || runtime.start_advertising());
             gate.wait_entered();
             // A restart trigger on the host task while the application's
-            // start is in progress waits for it, then finds advertising
-            // active.
+            // start is in progress waits for it, then sends its own.
             let fake = fixture.fake.clone();
             let host = thread::spawn(move || fake.inject_gap(disconnect(9)));
             gate.release();
             application.join().unwrap().unwrap();
             host.join().unwrap();
-            let starts = fixture
-                .calls_since(mark)
-                .iter()
-                .filter(|call| matches!(call, NativeCall::AdvertisingStart { .. }))
-                .count();
-            assert_eq!(starts, 1);
+            let calls = fixture.calls_since(mark);
+            assert_eq!(calls.len(), 6, "{calls:?}");
+            assert!(is_advertising_start(&calls[..3]), "{calls:?}");
+            assert!(is_advertising_start(&calls[3..]), "{calls:?}");
             assert!(fixture.seen.take().is_empty());
+            assert!(fixture.fake.is_advertising());
         }
+    }
+
+    /// The advertising data of [`demo_advertising`] for [`server`].
+    fn demo_advertising_data() -> Vec<u8> {
+        vec![0x02, 0x01, 0x06, 0x03, 0x03, 0x0f, 0x18]
+    }
+
+    #[test]
+    fn a_silent_reattempt_resends_the_fields_the_framework_set() {
+        let fixture = fixture();
+        // A client's link fails to establish before NimBLE reports it; ESP-IDF
+        // frees it and restarts advertising by itself, without any event.
+        fixture.fake.set_mtu(3, ATT_DEFAULT_MTU);
+        let mark = fixture.mark();
+        fixture.fake.silent_reattempt(3);
+        assert_eq!(
+            fixture.calls_since(mark),
+            [
+                NativeCall::AdvertisingStop,
+                NativeCall::AdvertisingData(demo_advertising_data()),
+                NativeCall::AdvertisingStart { address_type: 0 },
+            ],
+            "the advertising data is the validated payload, not an empty one"
+        );
+        assert!(fixture.fake.is_advertising());
+        assert!(fixture.seen.take().is_empty());
+        // The framework is unaffected and still serves the next client.
+        fixture.deliver(connect(3));
+        let id = fixture.id();
+        assert_eq!(fixture.seen.take(), [Seen::Connected(id)]);
+    }
+
+    #[test]
+    fn a_silently_failed_reattempt_is_recovered_by_start_advertising() {
+        let fixture = fixture();
+        fixture.fake.fail_next(Operation::AdvertisingStart, 6);
+        fixture.fake.silent_reattempt(3);
+        assert!(
+            !fixture.fake.is_advertising(),
+            "NimBLE only logs the failure"
+        );
+        assert!(fixture.seen.take().is_empty());
+        // The request is sent even though the framework last started
+        // advertising successfully.
+        let mark = fixture.mark();
+        fixture.running.start_advertising().unwrap();
+        assert!(is_advertising_start(&fixture.calls_since(mark)));
+        assert!(fixture.fake.is_advertising());
+    }
+
+    #[test]
+    fn a_client_freed_without_an_event_does_not_block_the_next_one() {
+        let fixture = fixture();
+        let (level, level_handle) = fixture.level.clone();
+        fixture.deliver(connect(1));
+        let first = fixture.id();
+        fixture.deliver(subscribe(1, level_handle, true));
+        fixture.seen.take();
+        // ESP-IDF's re-attempt frees a link that failed to establish with
+        // HCI 0x3e even after reporting it connected, without a
+        // disconnection event (after ending its subscriptions).
+        fixture.deliver(GapEvent::Subscribe {
+            connection: 1,
+            attribute: level_handle,
+            reason: SubscribeReason::Terminated,
+            notify: false,
+            indicate: false,
+        });
+        fixture.fake.silent_reattempt(1);
+        fixture.deliver(connect(2));
+        let second = fixture.id();
+        assert_ne!(first, second);
+        assert_eq!(
+            fixture.seen.take(),
+            [
+                Seen::Subscription(first, level, false),
+                Seen::Disconnected(first, HOST_ENOTCONN),
+                Seen::Connected(second),
+            ]
+        );
+        assert_eq!(fixture.runtime().native_handle(first), None);
+    }
+
+    #[test]
+    fn events_before_the_late_connection_report_follow_it() {
+        let fixture = fixture();
+        let (level, level_handle) = fixture.level.clone();
+        let (custom, custom_handle) = fixture.custom.clone();
+        // ESP-IDF serves ATT before it reports the peripheral connection.
+        fixture.fake.set_mtu(1, 247);
+        fixture.deliver(mtu(1, 247));
+        fixture.deliver(subscribe(1, level_handle, true));
+        fixture.deliver(subscribe(1, custom_handle, true));
+        fixture.deliver(subscribe(1, custom_handle, false));
+        assert!(fixture.seen.take().is_empty());
+        assert!(fixture.running.connection().is_none());
+        fixture.deliver(connect(1));
+        let id = fixture.id();
+        assert_eq!(
+            fixture.seen.take(),
+            [
+                Seen::Connected(id),
+                Seen::Mtu(id, 247),
+                Seen::Subscription(id, level.clone(), true),
+            ]
+        );
+        let info = fixture.running.connection().unwrap();
+        assert_eq!(info.mtu(), 247);
+        assert_eq!(info.subscriptions(), std::slice::from_ref(&level));
+        // Later changes are reported as usual.
+        fixture.deliver(subscribe(1, custom_handle, true));
+        assert_eq!(fixture.seen.take(), [Seen::Subscription(id, custom, true)]);
+    }
+
+    #[test]
+    fn early_subscriptions_never_reach_another_link() {
+        let fixture = fixture();
+        let (_, level_handle) = fixture.level.clone();
+        let early = |handle: u16| fixture.deliver(subscribe(handle, level_handle, true));
+        let fresh = |handle: u16| {
+            fixture.deliver(connect(handle));
+            let info = fixture.running.connection().unwrap();
+            assert!(info.subscriptions().is_empty(), "{handle}");
+            fixture.deliver(disconnect(handle));
+            fixture.seen.take();
+        };
+        // Dropped with a failed connection, a disconnection, a host reset,
+        // and NimBLE's own report that the subscriptions ended.
+        early(1);
+        fixture.deliver(GapEvent::Connect {
+            connection: 1,
+            status: HOST_EAGAIN,
+        });
+        fresh(1);
+        early(2);
+        fixture.deliver(disconnect(2));
+        fresh(2);
+        early(3);
+        fixture.fake.inject(NativeEvent::HostReset { reason: 19 });
+        fixture.fake.inject(NativeEvent::HostSynced);
+        fresh(3);
+        early(4);
+        fixture.deliver(GapEvent::Subscribe {
+            connection: 4,
+            attribute: level_handle,
+            reason: SubscribeReason::Terminated,
+            notify: false,
+            indicate: false,
+        });
+        fixture.fake.silent_reattempt(4);
+        fresh(4);
+        // And with a rejected second client.
+        fixture.deliver(connect(9));
+        early(5);
+        fixture.deliver(connect(5));
+        fixture.deliver(disconnect(5));
+        fixture.deliver(disconnect(9));
+        fresh(5);
+        // At most a few links are remembered; the oldest is dropped.
+        for handle in 10..10 + PENDING_LINKS as u16 + 1 {
+            early(handle);
+        }
+        fresh(10);
+        fixture.deliver(connect(11));
+        assert_eq!(
+            fixture.running.connection().unwrap().subscriptions().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn host_synced_is_reported_only_after_a_reported_reset() {
+        let fixture = fixture();
+        // A sync without a reset (possible on a second core) is not
+        // reported, and advertising is only re-sent.
+        fixture.fake.inject(NativeEvent::HostSynced);
+        assert!(fixture.seen.take().is_empty());
+        fixture.fake.inject(NativeEvent::HostReset { reason: 19 });
+        fixture.fake.inject(NativeEvent::HostSynced);
+        fixture.fake.inject(NativeEvent::HostSynced);
+        assert_eq!(fixture.seen.take(), [Seen::HostReset(19), Seen::HostSynced]);
+
+        // A reset while the host starts is not reported, nor is the sync that
+        // completes startup.
+        let fake = FakeBackend::new();
+        let seen = Recorder::default();
+        let mut configured = take(fake.clone(), slot()).unwrap();
+        configured.set_handler(seen.handler());
+        let (server, _, _) = server();
+        let gate = fake.hold(Operation::HostStart);
+        let starting = thread::spawn(move || configured.start(server));
+        gate.wait_entered();
+        fake.inject(NativeEvent::HostReset { reason: 19 });
+        fake.inject(NativeEvent::HostSynced);
+        gate.release();
+        let running = starting.join().unwrap().unwrap();
+        fake.inject(NativeEvent::HostSynced);
+        assert!(seen.take().is_empty());
+        drop(running);
     }
 
     #[test]

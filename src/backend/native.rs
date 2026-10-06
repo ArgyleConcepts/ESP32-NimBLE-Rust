@@ -12,6 +12,7 @@
 
 use super::dispatch::EventDispatcher;
 use super::gap::GapEvent;
+use crate::ble::advertising::AdvertisingFields;
 use crate::error::{BackendDetail, BackendError, Error, ErrorKind};
 use crate::gatt::registration::GattPlan;
 use std::ffi::CStr;
@@ -69,7 +70,7 @@ impl Operation {
             Self::GattCount => "ble_gatts_count_cfg",
             Self::GattAdd => "ble_gatts_add_svcs",
             Self::DeviceName => "ble_svc_gap_device_name_set",
-            Self::AdvertisingData => "ble_gap_adv_set_data",
+            Self::AdvertisingData => "ble_gap_adv_set_fields",
             Self::ScanResponseData => "ble_gap_adv_rsp_set_data",
             Self::AdvertisingStart => "ble_gap_adv_start",
         }
@@ -255,6 +256,11 @@ pub(crate) trait Backend: Clone + Send + Sync + 'static {
     /// until the host is deinitialized, because NimBLE keeps pointers to
     /// them, including after a failed registration.
     type Registration: Send + Sync;
+    /// Native advertising fields built from [`AdvertisingFields`]. NimBLE
+    /// keeps pointers into them after they are set (for ESP-IDF's
+    /// connection re-attempt), so they must stay alive, unmoved, until the
+    /// host is deinitialized.
+    type AdvertisingFields: Send + Sync;
 
     /// Initialize the NimBLE port and controller.
     fn host_init(&self) -> NativeResult<()>;
@@ -298,14 +304,19 @@ pub(crate) trait Backend: Clone + Send + Sync + 'static {
     fn notify(&self, connection: u16, attribute: u16, mbuf: Self::Mbuf) -> NativeResult<()>;
     /// Terminate a connection as a remote-user termination. The result
     /// arrives later as a [`GapEvent::Disconnect`]; nothing is delivered
-    /// from inside this call.
+    /// from inside this call. A link the host no longer knows fails with
+    /// `BLE_HS_ENOTCONN`, and one the controller no longer knows with the
+    /// HCI Unknown Connection Identifier status.
     fn terminate(&self, connection: u16) -> NativeResult<()>;
     /// Set the GAP Device Name characteristic's value. Call after host
     /// initialization; NimBLE copies the name.
     fn set_device_name(&self, name: &CStr) -> NativeResult<()>;
-    /// Set the legacy advertising data, at most 31 bytes; NimBLE copies it to
-    /// the controller.
-    fn set_advertising_data(&self, data: &[u8]) -> NativeResult<()>;
+    /// Build native advertising fields without any native host call.
+    fn prepare_advertising_fields(&self, fields: &AdvertisingFields) -> Self::AdvertisingFields;
+    /// Encode `fields` as the legacy advertising data and send it to the
+    /// controller (`ble_gap_adv_set_fields`). NimBLE also keeps a copy that
+    /// refers into `fields` for its connection re-attempt.
+    fn set_advertising_fields(&self, fields: &Self::AdvertisingFields) -> NativeResult<()>;
     /// Set the legacy scan response data, at most 31 bytes; NimBLE copies it
     /// to the controller.
     fn set_scan_response_data(&self, data: &[u8]) -> NativeResult<()>;

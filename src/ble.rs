@@ -124,7 +124,11 @@
 //! `BLE_HS_ENOTSUP` when `CONFIG_BT_NIMBLE_EXT_ADV` is enabled; startup then
 //! fails at [`StartStage::Advertising`]. Without
 //! [`Ble::advertise`], the host runs without advertising, and no client can
-//! connect.
+//! connect. The firmware must allow at least two NimBLE connections
+//! (`CONFIG_BT_NIMBLE_MAX_CONNECTIONS`, 3 by default); ESP builds fail to
+//! compile otherwise, because restarting advertising after a failed
+//! connection needs a free connection slot while NimBLE still holds the
+//! failed link.
 //!
 //! Advertising stops when a client connects. Unless
 //! [`AdvertisingBuilder::remain_available`] turned it off, it restarts by
@@ -134,7 +138,17 @@
 //! payloads are sent again each time, because a reset also resets the
 //! controller). A restart that fails is reported as
 //! [`ConnectionEvent::AdvertisingFailed`] and tried again at the next of
-//! those points; [`Ble::start_advertising`] starts it on request.
+//! those points; [`Ble::start_advertising`] starts it on request. Restarts
+//! and requests are always sent to NimBLE, which treats advertising that is
+//! already running as success.
+//!
+//! ESP-IDF's connection re-attempt (`CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT`,
+//! enabled by default on the ESP32-C3 and ESP32-S3) also restarts
+//! advertising by itself, without any event, when a client's link fails to
+//! establish. It re-sends the advertising data from the fields the framework
+//! last set, so it advertises the same payload. If that restart fails,
+//! NimBLE only logs it and the framework cannot tell; calling
+//! [`Ble::start_advertising`] while no client is connected recovers it.
 //!
 //! # The connected client
 //!
@@ -143,6 +157,13 @@
 //! state and work tied to an earlier connection never apply to a later one.
 //! The connection's ATT MTU and the endpoints it subscribed to are tracked
 //! from NimBLE's events and cleared when it disconnects or the host resets.
+//! ESP-IDF reports a client's connection only after reading its version and
+//! features, while ATT already serves it: the MTU is read from NimBLE when
+//! the connection is reported, and subscriptions made before then are
+//! remembered for that link and reported right after
+//! [`ConnectionEvent::Connected`]. If NimBLE frees the connected client's
+//! link without reporting it (ESP-IDF's re-attempt can), the framework ends
+//! that connection when the next client connects.
 //! [`Ble::connection`] returns a snapshot, and a [`ConnectionHandler`]
 //! registered with [`Ble::connection_handler`] receives each change as a
 //! [`ConnectionEvent`] on the host task.
@@ -154,7 +175,8 @@
 //! (legacy advertising stops at the first connection, so this needs another
 //! route into the controller), the framework asks NimBLE to terminate the
 //! new link and reports [`ConnectionEvent::ConnectionRejected`]; the
-//! connected client is unaffected.
+//! connected client is unaffected. A link whose connection attempt NimBLE
+//! reports as failed is terminated too, since ESP-IDF can leave it open.
 //!
 //! [`Access::Open`] means the framework neither requests nor requires
 //! pairing, bonding, or encryption. A client that starts pairing is answered
@@ -972,7 +994,10 @@ impl Ble<Running> {
     /// disconnected while advertising does not
     /// [remain available](AdvertisingBuilder::remain_available).
     ///
-    /// Succeeds without a change while advertising is already active. Fails
+    /// The request is sent to NimBLE even if advertising seems active, and
+    /// succeeds if it already is, so it also recovers advertising that NimBLE
+    /// stopped without an event (see the
+    /// [module documentation](crate::ble#advertising)). Fails
     /// with an [`ErrorKind::Lifecycle`] error when no advertising was
     /// configured, while a client is connected (one client is supported),
     /// while the host is resynchronizing after a reset, or while it shuts
