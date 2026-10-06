@@ -178,10 +178,14 @@ struct FakeState {
     /// Handle slots and layout of the last registration, filled in when the
     /// host starts, as NimBLE does.
     registered: Option<(Arc<[AtomicU16]>, Layout)>,
+    /// Leave value handles unassigned at host start, as when NimBLE's
+    /// attribute allocation fails with assertions disabled.
+    skip_handle_assignment: bool,
 }
 
-/// Per service, each characteristic's notify flag and descriptor count.
-type Layout = Vec<Vec<(bool, usize)>>;
+/// Per service, each characteristic's notify flag, descriptor count, and
+/// handle-slot index.
+type Layout = Vec<Vec<(bool, usize, usize)>>;
 
 /// A characteristic as the fake registered it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,6 +194,7 @@ pub(crate) struct FakeCharacteristic {
     pub(crate) access: crate::gatt::Access,
     pub(crate) slot: CharacteristicSlot,
     pub(crate) descriptors: Vec<(Uuid, crate::gatt::DescriptorAccess, DescriptorSlot)>,
+    pub(crate) handle_index: usize,
 }
 
 /// A service as the fake registered it.
@@ -270,6 +275,11 @@ impl FakeBackend {
             .holds
             .insert(operation, Hold { gate: gate.clone() });
         gate
+    }
+
+    /// Make the next host start leave every value handle unassigned.
+    pub(crate) fn skip_handle_assignment(&self) {
+        self.lock().skip_handle_assignment = true;
     }
 
     /// Treat `thread` as the native host task.
@@ -477,18 +487,18 @@ impl Backend for FakeBackend {
             Operation::HostStart,
             self.enter(Operation::HostStart, NativeCall::HostStart),
         )?;
-        if let Some((handles, layout)) = self.lock().registered.take() {
+        let registered = self.lock().registered.take();
+        if let Some((handles, layout)) = registered {
+            if self.lock().skip_handle_assignment {
+                return Ok(());
+            }
             // `next` is the next free handle; the stack's services end at 0x10.
             let mut next = 0x0011_u16;
-            let mut slots = handles.iter();
             for service in layout {
                 next += 1; // service declaration
-                for (notify, descriptors) in service {
+                for (notify, descriptors, slot) in service {
                     let value = next + 1; // after the characteristic declaration
-                    slots
-                        .next()
-                        .expect("one slot per characteristic")
-                        .store(value, Ordering::Relaxed);
+                    handles[slot].store(value, Ordering::Relaxed);
                     next = value + 1 + u16::from(notify) + descriptors as u16;
                 }
             }
@@ -670,6 +680,7 @@ impl Backend for FakeBackend {
                         uuid: characteristic.uuid,
                         access: characteristic.access,
                         slot: characteristic.slot,
+                        handle_index: characteristic.handle_index,
                         descriptors: characteristic
                             .descriptors
                             .iter()
@@ -710,6 +721,7 @@ impl Backend for FakeBackend {
                         (
                             characteristic.access.notify,
                             characteristic.descriptors.len(),
+                            characteristic.handle_index,
                         )
                     })
                     .collect()

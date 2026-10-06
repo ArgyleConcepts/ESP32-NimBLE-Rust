@@ -148,7 +148,8 @@
 //!   request's storage.
 //! - Handlers are synchronous and run on the NimBLE host task. Keep them
 //!   short and non-blocking: the host processes no other BLE events while a
-//!   handler runs.
+//!   handler runs. (NimBLE's own notification helpers would call read
+//!   handlers on whichever thread sends; this crate does not use them.)
 //! - The framework holds no locks of its own while calling a handler, so a
 //!   handler may take application locks; avoiding deadlocks between those
 //!   locks and other application threads is the application's
@@ -277,7 +278,7 @@ pub struct NotifyEndpoint<V> {
 }
 
 impl<V> NotifyEndpoint<V> {
-    // Read by the notification runtime in a later ticket and by tests.
+    // Read by notification sending (a later ticket) and by tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn id(&self) -> &EndpointId {
         &self.id
@@ -331,8 +332,8 @@ fn write_thunk<C: Writable>(characteristic: &C, data: &[u8]) -> Result<(), AttEr
 /// an undeclarable capability fails to compile. Repeating a declaration has
 /// no further effect.
 pub struct CharacteristicDef<C: Characteristic> {
-    // Called through `RegisteredCharacteristic` by registration in a later
-    // ticket and by tests.
+    // Called through `RegisteredCharacteristic` by the registration access
+    // path, which host builds without NimBLE never run.
     #[cfg_attr(not(test), allow(dead_code))]
     characteristic: C,
     uuid: Uuid,
@@ -440,7 +441,7 @@ impl<C: Characteristic> fmt::Debug for CharacteristicDef<C> {
 }
 
 /// A characteristic definition with its type erased, as stored in a frozen
-/// server and dispatched by the registration code (a later ticket).
+/// server and dispatched by [`registration`].
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait RegisteredCharacteristic: Send + Sync {
     fn uuid(&self) -> Uuid;
@@ -520,7 +521,7 @@ impl Service {
         self
     }
 
-    // Read by registration in a later ticket and by tests.
+    // Read by `registration`; host builds without NimBLE only plan.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn uuid(&self) -> Uuid {
         self.uuid
@@ -667,7 +668,7 @@ impl GattServer {
         Ok(Self { services })
     }
 
-    // Read by registration in a later ticket and by tests.
+    // Read by `registration`; host builds without NimBLE only plan.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn services(&self) -> &[Service] {
         &self.services
@@ -1363,7 +1364,7 @@ mod tests {
                 .descriptor(setting(0x2901, &value).readable()),
         );
         let server = GattServer::new([service]).unwrap();
-        // Registration (a later ticket) passes NimBLE a thin pointer, such as
+        // Registration passes NimBLE a thin pointer, such as
         // the address of a boxed entry's slot, so both the trait objects and
         // the slots that hold them must stay put once the server is built.
         let addresses = |server: &GattServer| {

@@ -82,6 +82,9 @@ pub(crate) struct PlannedCharacteristic {
     pub(crate) access: Access,
     pub(crate) slot: CharacteristicSlot,
     pub(crate) descriptors: Vec<PlannedDescriptor>,
+    /// The index of this characteristic's value-handle slot; slots are in
+    /// registration order.
+    pub(crate) handle_index: usize,
 }
 
 /// One primary service to register.
@@ -115,8 +118,10 @@ impl GattPlan {
                     .characteristics()
                     .iter()
                     .map(|characteristic| {
+                        let handle_index = endpoints.len();
                         endpoints.push(characteristic.endpoint().cloned());
                         PlannedCharacteristic {
+                            handle_index,
                             uuid: characteristic.uuid().att_form(),
                             access: characteristic.access(),
                             slot: CharacteristicSlot(characteristic),
@@ -229,21 +234,52 @@ impl Target<'_> {
     }
 }
 
-/// Serve one native attribute access. `buffer` is the access context's
-/// buffer, which NimBLE owns: the response for reads, the request for
-/// writes. It is never freed or kept here.
+/// A borrowed view of an access context's buffer, which NimBLE owns: the
+/// response for reads, the request for writes. It offers only length, append,
+/// and copy, so the buffer cannot be freed, transferred, or replaced through
+/// it.
+pub(crate) struct AccessBuffer<'a, B: Backend> {
+    backend: &'a B,
+    mbuf: &'a mut B::Mbuf,
+}
+
+impl<'a, B: Backend> AccessBuffer<'a, B> {
+    pub(crate) fn new(backend: &'a B, mbuf: &'a mut B::Mbuf) -> Self {
+        Self { backend, mbuf }
+    }
+
+    fn len(&self) -> usize {
+        self.backend.mbuf_len(self.mbuf)
+    }
+
+    fn append(&mut self, data: &[u8]) -> Result<(), AttError> {
+        // A failed append may leave part of the value in NimBLE's buffer;
+        // NimBLE discards the response when an error is returned.
+        self.backend
+            .mbuf_append(self.mbuf, data)
+            .map_err(|_| AttError::INSUFFICIENT_RESOURCES)
+    }
+
+    fn copy(&self, destination: &mut [u8]) -> Result<(), AttError> {
+        self.backend
+            .mbuf_copy(self.mbuf, 0, destination)
+            .map_err(|_| AttError::UNLIKELY)
+    }
+}
+
+/// Serve one native attribute access through `buffer`, which is never freed
+/// or kept here.
 ///
 /// An operation for the other kind of attribute, an unknown operation, or a
 /// missing buffer is answered with [`AttError::UNLIKELY`]. Undeclared
 /// operations are refused by the handler's declared access, independent of
 /// the native permission flags.
 pub(crate) fn serve_access<B: Backend>(
-    backend: &B,
     target: Target<'_>,
     op: AccessOp,
-    buffer: Option<&mut B::Mbuf>,
+    buffer: Option<AccessBuffer<'_, B>>,
 ) -> Result<(), AttError> {
-    let buffer = buffer.ok_or(AttError::UNLIKELY)?;
+    let mut buffer = buffer.ok_or(AttError::UNLIKELY)?;
     let reading = match (target, op) {
         (Target::Characteristic(_), AccessOp::ReadCharacteristic)
         | (Target::Descriptor(_), AccessOp::ReadDescriptor) => true,
@@ -254,27 +290,101 @@ pub(crate) fn serve_access<B: Backend>(
     if reading {
         let mut value = Vec::new();
         target.read(&mut value)?;
-        // A failed append may leave part of the value in NimBLE's buffer;
-        // NimBLE discards the response when an error is returned.
-        backend
-            .mbuf_append(buffer, &value)
-            .map_err(|_| AttError::INSUFFICIENT_RESOURCES)
+        buffer.append(&value)
     } else {
         // Permission comes first, so an undeclared write is refused as such
         // whatever its length.
         if !target.writable() {
             return Err(AttError::WRITE_NOT_PERMITTED);
         }
-        let length = backend.mbuf_len(buffer);
+        let length = buffer.len();
         if length > target.max_len() {
             return Err(AttError::INVALID_ATTRIBUTE_VALUE_LENGTH);
         }
         let mut data = vec![0; length];
-        backend
-            .mbuf_copy(buffer, 0, &mut data)
-            .map_err(|_| AttError::UNLIKELY)?;
+        buffer.copy(&mut data)?;
         target.write(&data)
     }
+}
+
+/// Which kind of attribute a native access callback serves.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AttributeKind {
+    Characteristic,
+    Descriptor,
+}
+
+/// The body of a native access callback after the context was found: recover
+/// the handler from the callback argument and serve the operation, returning
+/// the status for NimBLE. A null argument is answered with
+/// [`AttError::UNLIKELY`].
+///
+/// # Safety
+///
+/// `argument` must be null or the callback argument of a `kind` slot from
+/// [`GattPlan`] whose server is still alive.
+pub(crate) unsafe fn dispatch_access<B: Backend>(
+    kind: AttributeKind,
+    argument: *mut c_void,
+    op: u32,
+    codes: &AccessCodes,
+    buffer: Option<AccessBuffer<'_, B>>,
+) -> i32 {
+    // SAFETY: the caller guarantees a null or live slot argument of `kind`.
+    let target = unsafe {
+        match kind {
+            AttributeKind::Characteristic => {
+                CharacteristicSlot::from_arg(argument).map(Target::Characteristic)
+            }
+            AttributeKind::Descriptor => DescriptorSlot::from_arg(argument).map(Target::Descriptor),
+        }
+    };
+    access_status(match target {
+        Some(target) => serve_access(target, AccessOp::from_code(op, codes), buffer),
+        None => Err(AttError::UNLIKELY),
+    })
+}
+
+/// The SDK's characteristic property and attribute permission bits, supplied
+/// by the backend.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FlagCodes {
+    pub(crate) characteristic_read: u32,
+    pub(crate) characteristic_write: u32,
+    pub(crate) characteristic_write_without_response: u32,
+    pub(crate) characteristic_notify: u32,
+    pub(crate) attribute_read: u32,
+    pub(crate) attribute_write: u32,
+}
+
+/// Native characteristic flags for declared capabilities.
+pub(crate) fn characteristic_flags(access: Access, codes: &FlagCodes) -> u32 {
+    let mut flags = 0;
+    if access.read {
+        flags |= codes.characteristic_read;
+    }
+    if access.write {
+        flags |= codes.characteristic_write;
+    }
+    if access.write_without_response {
+        flags |= codes.characteristic_write_without_response;
+    }
+    if access.notify {
+        flags |= codes.characteristic_notify;
+    }
+    flags
+}
+
+/// Native attribute permissions for a descriptor's declared access.
+pub(crate) fn descriptor_flags(access: DescriptorAccess, codes: &FlagCodes) -> u32 {
+    let mut flags = 0;
+    if access.read {
+        flags |= codes.attribute_read;
+    }
+    if access.write {
+        flags |= codes.attribute_write;
+    }
+    flags
 }
 
 /// The status an access callback returns to NimBLE: zero or an ATT error.
@@ -424,7 +534,7 @@ mod tests {
     ) -> (Result<(), AttError>, Vec<u8>) {
         let mut buffer = fake.mbuf_from_flat(&[]).unwrap();
         let id = buffer.id();
-        let result = serve_access(fake, target, op, Some(&mut buffer));
+        let result = serve_access(target, op, Some(AccessBuffer::new(fake, &mut buffer)));
         let data = fake.mbuf_data(id).unwrap();
         fake.mbuf_free(buffer).unwrap();
         (result, data)
@@ -437,7 +547,7 @@ mod tests {
         data: &[u8],
     ) -> Result<(), AttError> {
         let mut buffer = fake.mbuf_from_flat(data).unwrap();
-        let result = serve_access(fake, target, op, Some(&mut buffer));
+        let result = serve_access(target, op, Some(AccessBuffer::new(fake, &mut buffer)));
         fake.mbuf_free(buffer).unwrap();
         result
     }
@@ -644,7 +754,7 @@ mod tests {
         }
         // No buffer in the context.
         assert_eq!(
-            serve_access(&fake, level, AccessOp::ReadCharacteristic, None),
+            serve_access::<FakeBackend>(level, AccessOp::ReadCharacteristic, None),
             Err(AttError::UNLIKELY)
         );
         // Operations that were not declared stay refused even if NimBLE
@@ -814,10 +924,9 @@ mod tests {
         assert_eq!(fake.mbuf_segments(chain.id()), Some(vec![2, 0, 1, 3]));
         assert_eq!(
             serve_access(
-                &fake,
                 target,
                 AccessOp::WriteCharacteristic,
-                Some(&mut chain)
+                Some(AccessBuffer::new(&fake, &mut chain))
             ),
             Ok(())
         );
@@ -836,10 +945,9 @@ mod tests {
         let mut chain = fake.mbuf_from_segments(&[&[1, 2, 3], &[4, 5, 6], &[7]]);
         assert_eq!(
             serve_access(
-                &fake,
                 target,
                 AccessOp::WriteCharacteristic,
-                Some(&mut chain)
+                Some(AccessBuffer::new(&fake, &mut chain))
             ),
             Err(AttError::INVALID_ATTRIBUTE_VALUE_LENGTH)
         );
@@ -851,10 +959,9 @@ mod tests {
         let mut chain = fake.mbuf_from_segments(&[&[9], &[9, 9]]);
         assert_eq!(
             serve_access(
-                &fake,
                 target,
                 AccessOp::WriteCharacteristic,
-                Some(&mut chain)
+                Some(AccessBuffer::new(&fake, &mut chain))
             ),
             Err(AttError::UNLIKELY)
         );
@@ -865,10 +972,9 @@ mod tests {
         let mut response = fake.mbuf_from_segments(&[&[0xaa]]);
         assert_eq!(
             serve_access(
-                &fake,
                 target,
                 AccessOp::ReadCharacteristic,
-                Some(&mut response)
+                Some(AccessBuffer::new(&fake, &mut response))
             ),
             Ok(())
         );
@@ -926,5 +1032,170 @@ mod tests {
         );
         fake.host_start().unwrap();
         assert_eq!(fake.value_handles(&registration), [0x13]);
+    }
+
+    const CODES: AccessCodes = AccessCodes {
+        read_characteristic: 20,
+        write_characteristic: 21,
+        read_descriptor: 22,
+        write_descriptor: 23,
+    };
+
+    #[test]
+    fn the_trampoline_body_validates_its_argument_operation_and_buffer() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (server, _) = server(&log);
+        let plan = GattPlan::new(&server);
+        let fake = FakeBackend::new();
+        let mode = plan.services[1].characteristics[0].slot.as_arg();
+        let setting = plan.services[0].characteristics[0].descriptors[1]
+            .slot
+            .as_arg();
+        let unlikely = i32::from(AttError::UNLIKELY.code());
+
+        let dispatch = |kind, argument, op, data: Option<&[u8]>| {
+            let mut buffer = data.map(|data| fake.mbuf_from_flat(data).unwrap());
+            // SAFETY: arguments are null or slots of the live `server` of the
+            // matching kind.
+            let status = unsafe {
+                dispatch_access(
+                    kind,
+                    argument,
+                    op,
+                    &CODES,
+                    buffer
+                        .as_mut()
+                        .map(|buffer| AccessBuffer::new(&fake, buffer)),
+                )
+            };
+            let contents = buffer
+                .as_ref()
+                .and_then(|buffer| fake.mbuf_data(buffer.id()));
+            if let Some(buffer) = buffer {
+                fake.mbuf_free(buffer).unwrap();
+            }
+            (status, contents)
+        };
+
+        // A null argument, an unknown operation, or a missing buffer.
+        assert_eq!(
+            dispatch(
+                AttributeKind::Characteristic,
+                std::ptr::null_mut(),
+                20,
+                Some(&[])
+            )
+            .0,
+            unlikely
+        );
+        assert_eq!(
+            dispatch(
+                AttributeKind::Descriptor,
+                std::ptr::null_mut(),
+                22,
+                Some(&[])
+            )
+            .0,
+            unlikely
+        );
+        assert_eq!(
+            dispatch(AttributeKind::Characteristic, mode, 99, Some(&[])).0,
+            unlikely
+        );
+        assert_eq!(
+            dispatch(AttributeKind::Characteristic, mode, 20, None).0,
+            unlikely
+        );
+        // Valid requests reach their handlers and return NimBLE statuses.
+        assert_eq!(
+            dispatch(AttributeKind::Characteristic, mode, 21, Some(&[5])).0,
+            0
+        );
+        assert_eq!(
+            dispatch(AttributeKind::Characteristic, mode, 20, Some(&[])),
+            (0, Some(vec![5]))
+        );
+        assert_eq!(
+            dispatch(AttributeKind::Descriptor, setting, 23, Some(&[6])).0,
+            0
+        );
+        assert_eq!(
+            dispatch(AttributeKind::Descriptor, setting, 22, Some(&[])),
+            (0, Some(vec![6]))
+        );
+        // A descriptor operation code on a characteristic is refused.
+        assert_eq!(
+            dispatch(AttributeKind::Characteristic, mode, 22, Some(&[])).0,
+            unlikely
+        );
+        assert_eq!(
+            dispatch(AttributeKind::Characteristic, mode, 21, Some(&[1, 2])).0,
+            i32::from(AttError::INVALID_ATTRIBUTE_VALUE_LENGTH.code())
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "write mode 5",
+                "read mode",
+                "write level-setting 6",
+                "read level-setting"
+            ]
+        );
+        assert_eq!(fake.assert_balanced(), Ok(()));
+    }
+
+    #[test]
+    fn native_flags_follow_declared_access() {
+        let codes = FlagCodes {
+            characteristic_read: 0x01,
+            characteristic_write: 0x02,
+            characteristic_write_without_response: 0x04,
+            characteristic_notify: 0x08,
+            attribute_read: 0x10,
+            attribute_write: 0x20,
+        };
+        let access = |read, write, write_without_response, notify| crate::gatt::Access {
+            read,
+            write,
+            write_without_response,
+            notify,
+        };
+        assert_eq!(
+            characteristic_flags(access(false, false, false, false), &codes),
+            0
+        );
+        assert_eq!(
+            characteristic_flags(access(true, false, false, false), &codes),
+            0x01
+        );
+        assert_eq!(
+            characteristic_flags(access(false, true, true, false), &codes),
+            0x06
+        );
+        assert_eq!(
+            characteristic_flags(access(true, true, true, true), &codes),
+            0x0f
+        );
+        assert_eq!(
+            characteristic_flags(access(false, false, false, true), &codes),
+            0x08
+        );
+        let descriptor = |read, write| DescriptorAccess { read, write };
+        assert_eq!(descriptor_flags(descriptor(true, false), &codes), 0x10);
+        assert_eq!(descriptor_flags(descriptor(false, true), &codes), 0x20);
+        assert_eq!(descriptor_flags(descriptor(true, true), &codes), 0x30);
+    }
+
+    #[test]
+    fn handle_slots_follow_registration_order() {
+        let log = Arc::default();
+        let (server, _) = server(&log);
+        let plan = GattPlan::new(&server);
+        let indexes: Vec<_> = plan
+            .characteristics()
+            .map(|characteristic| characteristic.handle_index)
+            .collect();
+        assert_eq!(indexes, [0, 1, 2]);
+        assert_eq!(plan.endpoints().len(), indexes.len());
     }
 }

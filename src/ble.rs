@@ -420,9 +420,19 @@ impl<B: Backend> Configured<B> {
             }
         }
 
-        // NimBLE assigned the value handles when the host started.
+        // NimBLE assigned the value handles when the host started. A zero
+        // means its attribute allocation failed without stopping the host
+        // (ESP-IDF assertions disabled); the database is unusable.
         let registration = started.registration.as_ref().expect("registered");
         let handles = started.backend.value_handles(registration);
+        if handles.contains(&0) {
+            let error = Error::new(
+                ErrorKind::Lifecycle,
+                Some("GATT registration"),
+                "NimBLE did not assign every attribute handle when the host started",
+            );
+            return Err(started.fail(StartStage::Registration, error, None));
+        }
         started.value_handles = plan.endpoints().iter().cloned().zip(handles).collect();
         Ok(started)
     }
@@ -1149,6 +1159,36 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.cleanup(), Cleanup::Poisoned);
         assert_eq!(fake.calls(), [HostInit, GattCount, GattAdd, HostDeinit]);
+    }
+
+    #[test]
+    fn unassigned_value_handles_fail_registration_after_sync() {
+        use NativeCall::*;
+        let (error, slot) = failing_start(
+            StartStage::Registration,
+            |fake| fake.skip_handle_assignment(),
+            vec![NativeEvent::HostSynced],
+            &[
+                HostInit,
+                GattCount,
+                GattAdd,
+                InstallCallbacks,
+                HostStart,
+                InferAddress,
+                HostStop,
+                HostDeinit,
+                RemoveCallbacks,
+                RegistrationFreed,
+            ],
+        );
+        assert_eq!(error.cleanup(), Cleanup::Released);
+        assert!(
+            error
+                .to_string()
+                .contains("did not assign every attribute handle"),
+            "{error}"
+        );
+        assert!(take(FakeBackend::new(), slot).is_ok());
     }
 
     #[test]
