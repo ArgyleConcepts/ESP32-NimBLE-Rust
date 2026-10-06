@@ -12,9 +12,9 @@ ESP32-C3 and ESP32-S3 fixtures and inspects the results; it does not flash or
 execute firmware, verify hardware, or test BLE behavior. argyle-nimble's
 public API covers UUIDs, value codecs, error types, GATT server definitions,
 and the exclusive `Ble` host owner with its startup sequence, which registers
-the GATT server with NimBLE. Advertising, connection handling, and
-notification sending are not implemented, and nothing has been run on
-hardware.
+the GATT server with NimBLE, then starts legacy advertising and tracks one
+connected client. Notification sending is not implemented, and nothing has
+been run on hardware.
 
 ## Supported configuration
 
@@ -31,6 +31,13 @@ hardware.
 Picolibc, ESP-IDF's 6.x default, is rejected during CMake configuration and
 again by the build script. No Picolibc support is claimed. Other chips, other
 ESP-IDF versions, and `no_std` builds are outside the validated scope.
+
+Advertising uses NimBLE's legacy advertising API, so keep
+`CONFIG_BT_NIMBLE_EXT_ADV` disabled (its default). With extended advertising
+enabled, the ESP-IDF 6.1 sources compile those calls to return
+`BLE_HS_ENOTSUP`, so startup would fail when advertising starts; that
+configuration is neither built nor tested here. The GAP Device Name is limited by
+`CONFIG_BT_NIMBLE_GAP_DEVICE_NAME_MAX_LEN` (31 bytes by default).
 
 ## Consumer setup
 

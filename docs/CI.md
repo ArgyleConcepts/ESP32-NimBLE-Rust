@@ -203,6 +203,15 @@ moves through the same fake. GATT registration tests check the plan built
 from a server, value-handle mapping, callback-argument routing, malformed and
 undeclared requests, length checks before copying, buffer failures, and the
 buffer ledger on every path; the native table translation itself is only
+compiled for the targets. Advertising tests check payload placement and
+encoding, the 31-byte packet boundaries, name shortening and character
+boundaries, and every rejected configuration. Connection runtime tests
+inject GAP and host events through the fake to drive whole sequences:
+advertising only after synchronization, connect/subscribe/MTU/disconnect/
+reconnect, numeric-handle reuse, second clients, duplicate, stale, and
+out-of-order events, failed connections and restarts, host reset and
+resynchronization, re-entrant handlers, overlapping advertising starts, and
+shutdown ordering. The ESP advertising calls and their constants are only
 compiled for the targets. The tests show framework logic on the host only;
 they are not SDK, target, or hardware evidence. The firmware fixtures compile
 the real ESP backend for C3 and S3. `tests/compile_contracts.rs` uses

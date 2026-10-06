@@ -12,10 +12,12 @@ use super::gap::{GapCodes, GapEvent, GapEventView};
 use super::native::{
     check, native_length, Backend, NativeError, NativeEvent, NativeResult, Operation,
 };
+use crate::ble::advertising::{ad, LEGACY_PAYLOAD_CAPACITY};
+use crate::ble::connection::{ATT_CHANNEL, ATT_DEFAULT_MTU, HCI_STATUS_BASE};
 use crate::error::ATT_STATUS_BASE;
 use crate::AttError;
-use std::ffi::{c_int, c_void};
-use std::ptr::NonNull;
+use std::ffi::{c_int, c_void, CStr};
+use std::ptr::{null, null_mut, NonNull};
 use std::sync::Arc;
 
 /// SDK GAP codes from the consumer's generated bindings.
@@ -64,6 +66,49 @@ assert_att_codes!(
 );
 
 const _: () = assert!(ATT_STATUS_BASE as u32 == bindings::BLE_HS_ERR_ATT_BASE as u32);
+
+// The advertising payloads are encoded in platform-neutral code from the
+// Bluetooth Assigned Numbers and Core Specification; check those values
+// against the consumer's NimBLE. A mismatch fails compilation.
+const _: () = {
+    assert!(ad::FLAGS as u32 == bindings::BLE_HS_ADV_TYPE_FLAGS as u32);
+    assert!(ad::INCOMPLETE_UUIDS16 as u32 == bindings::BLE_HS_ADV_TYPE_INCOMP_UUIDS16 as u32);
+    assert!(ad::COMPLETE_UUIDS16 as u32 == bindings::BLE_HS_ADV_TYPE_COMP_UUIDS16 as u32);
+    assert!(ad::INCOMPLETE_UUIDS128 as u32 == bindings::BLE_HS_ADV_TYPE_INCOMP_UUIDS128 as u32);
+    assert!(ad::COMPLETE_UUIDS128 as u32 == bindings::BLE_HS_ADV_TYPE_COMP_UUIDS128 as u32);
+    assert!(ad::SHORTENED_NAME as u32 == bindings::BLE_HS_ADV_TYPE_INCOMP_NAME as u32);
+    assert!(ad::COMPLETE_NAME as u32 == bindings::BLE_HS_ADV_TYPE_COMP_NAME as u32);
+    assert!(ad::GENERAL_DISCOVERABLE as u32 == bindings::BLE_HS_ADV_F_DISC_GEN as u32);
+    assert!(ad::BREDR_UNSUPPORTED as u32 == bindings::BLE_HS_ADV_F_BREDR_UNSUP as u32);
+    assert!(LEGACY_PAYLOAD_CAPACITY as u32 == bindings::BLE_HCI_MAX_ADV_DATA_LEN as u32);
+    assert!(LEGACY_PAYLOAD_CAPACITY as u32 == bindings::BLE_HCI_MAX_SCAN_RSP_DATA_LEN as u32);
+    assert!(ATT_DEFAULT_MTU as u32 == bindings::BLE_ATT_MTU_DFLT as u32);
+    assert!(ATT_CHANNEL as u32 == bindings::BLE_L2CAP_CID_ATT as u32);
+    assert!(HCI_STATUS_BASE as u32 == bindings::BLE_HS_ERR_HCI_BASE as u32);
+    // `ble_gap_adv_start` takes the duration as an `int32_t`.
+    assert!(bindings::ARGYLE_NIMBLE_HS_FOREVER as i64 == i32::MAX as i64);
+};
+
+/// NimBLE's "already in that state" status, which advertising start and stop
+/// report when there is nothing to change.
+const ALREADY: c_int = bindings::BLE_HS_EALREADY as c_int;
+
+/// Copy a payload into a full-size buffer, so the SDK always receives a
+/// valid pointer, even for an empty payload.
+fn payload(
+    operation: Operation,
+    data: &[u8],
+) -> NativeResult<([u8; LEGACY_PAYLOAD_CAPACITY], c_int)> {
+    if data.len() > LEGACY_PAYLOAD_CAPACITY {
+        return Err(NativeError::InvalidLength {
+            operation,
+            length: data.len(),
+        });
+    }
+    let mut buffer = [0; LEGACY_PAYLOAD_CAPACITY];
+    buffer[..data.len()].copy_from_slice(data);
+    Ok((buffer, data.len() as c_int))
+}
 
 /// The dispatcher receiving host callbacks. NimBLE's sync and reset callbacks
 /// carry no user argument, so the single installed dispatcher is kept here.
@@ -121,9 +166,9 @@ extern "C" fn on_gap_event(event: *mut bindings::ble_gap_event, _argument: *mut 
     0
 }
 
-/// The GAP callback to pass with advertising requests (added with the
-/// advertising ticket).
-pub(crate) const GAP_EVENT_CALLBACK: bindings::ble_gap_event_fn = Some(on_gap_event);
+/// The GAP callback passed with advertising requests; connections accepted
+/// by that advertising inherit it. Its argument is unused (null).
+const GAP_EVENT_CALLBACK: bindings::ble_gap_event_fn = Some(on_gap_event);
 
 std::thread_local! {
     /// Set on the NimBLE host task, where every native callback runs.
@@ -145,6 +190,7 @@ pub(crate) struct EspMbuf(pub(super) NonNull<bindings::os_mbuf>);
 
 /// The ESP-IDF NimBLE host. There is one native host per firmware; the
 /// [`Ble`](crate::Ble) owner controls its lifecycle.
+#[derive(Clone)]
 pub(crate) struct EspBackend;
 
 impl Backend for EspBackend {
@@ -293,11 +339,73 @@ impl Backend for EspBackend {
         })
     }
 
+    fn set_device_name(&self, name: &CStr) -> NativeResult<()> {
+        // SAFETY: `name` is NUL-terminated and readable for the call; NimBLE
+        // copies it (or rejects it as too long).
+        check(Operation::DeviceName, unsafe {
+            bindings::ble_svc_gap_device_name_set(name.as_ptr())
+        })
+    }
+
+    fn set_advertising_data(&self, data: &[u8]) -> NativeResult<()> {
+        let (buffer, length) = payload(Operation::AdvertisingData, data)?;
+        // SAFETY: `buffer` is readable for `length` (at most 31) bytes for
+        // the call; NimBLE copies them into its HCI command.
+        check(Operation::AdvertisingData, unsafe {
+            bindings::ble_gap_adv_set_data(buffer.as_ptr(), length)
+        })
+    }
+
+    fn set_scan_response_data(&self, data: &[u8]) -> NativeResult<()> {
+        let (buffer, length) = payload(Operation::ScanResponseData, data)?;
+        // SAFETY: as above; the pointer is valid even for an empty payload,
+        // which NimBLE passes to `memcpy`.
+        check(Operation::ScanResponseData, unsafe {
+            bindings::ble_gap_adv_rsp_set_data(buffer.as_ptr(), length)
+        })
+    }
+
+    fn advertising_start(&self, address_type: u8) -> NativeResult<()> {
+        // SAFETY: the parameters are plain data; zero is a valid value and
+        // selects NimBLE's default intervals, all channels, and no filter.
+        let mut parameters: bindings::ble_gap_adv_params = unsafe { std::mem::zeroed() };
+        parameters.conn_mode = bindings::BLE_GAP_CONN_MODE_UND as u8;
+        parameters.disc_mode = bindings::BLE_GAP_DISC_MODE_GEN as u8;
+        // SAFETY: undirected advertising takes no peer address; NimBLE copies
+        // `parameters` during the call; the callback is a `'static` function
+        // whose (null) argument is unused.
+        let code = unsafe {
+            bindings::ble_gap_adv_start(
+                address_type,
+                null(),
+                bindings::ARGYLE_NIMBLE_HS_FOREVER as i32,
+                &parameters,
+                GAP_EVENT_CALLBACK,
+                null_mut(),
+            )
+        };
+        // `ble_gap_adv_validate` reports an advertising procedure that is
+        // already running as EALREADY.
+        if code == ALREADY {
+            return Ok(());
+        }
+        check(Operation::AdvertisingStart, code)
+    }
+
     fn advertising_stop(&self) -> NativeResult<()> {
         // SAFETY: plain SDK call with no arguments.
-        check(Operation::AdvertisingStop, unsafe {
-            bindings::ble_gap_adv_stop()
-        })
+        let code = unsafe { bindings::ble_gap_adv_stop() };
+        // NimBLE stops the controller either way and reports EALREADY when
+        // no advertising procedure was active.
+        if code == ALREADY {
+            return Ok(());
+        }
+        check(Operation::AdvertisingStop, code)
+    }
+
+    fn is_synced(&self) -> bool {
+        // SAFETY: plain SDK call with no arguments; it reads the sync state.
+        unsafe { bindings::ble_hs_synced() != 0 }
     }
 
     fn infer_address_type(&self) -> NativeResult<u8> {

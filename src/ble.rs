@@ -1,4 +1,5 @@
-//! Exclusive ownership of the BLE host and its startup.
+//! Exclusive ownership of the BLE host: startup, advertising, and the
+//! connected client.
 //!
 //! NimBLE is process-global, and native code keeps references to callback
 //! state. [`Ble`] is the single owner of that host, and its type parameter
@@ -6,20 +7,23 @@
 //!
 //! 1. [`Ble::take`] acquires the process-wide owner as `Ble<Configuring>`.
 //!    While one owner exists, further calls fail; the owner cannot be cloned.
-//! 2. Configuration methods, such as [`Ble::sync_timeout`], exist only on
-//!    `Ble<Configuring>`.
+//! 2. Configuration methods, [`Ble::sync_timeout`], [`Ble::advertise`], and
+//!    [`Ble::connection_handler`], exist only on `Ble<Configuring>`.
 //! 3. [`Ble::start`] consumes the configuring owner, takes the frozen
 //!    [`GattServer`] and an explicit [`Access`] choice, starts the host, and
-//!    returns `Ble<Running>` only once the host is ready.
-//! 4. Dropping a running owner, or calling [`Ble::shutdown`], stops and
+//!    returns `Ble<Running>` only once the host is ready and advertising, if
+//!    configured, has started.
+//! 4. `Ble<Running>` reports the connected client ([`Ble::connection`]) and
+//!    can start advertising again ([`Ble::start_advertising`]).
+//! 5. Dropping a running owner, or calling [`Ble::shutdown`], stops and
 //!    deinitializes the host and releases ownership.
 //!
-//! Starting twice and configuring a running owner are compile errors, not
-//! runtime checks.
+//! Starting twice, configuring a running owner, and querying a configuring
+//! one are compile errors, not runtime checks.
 //!
 //! ```no_run
 //! use argyle_nimble::gatt::{Characteristic, CharacteristicDef, GattServer, Readable, Service};
-//! use argyle_nimble::{Access, AttError, Ble, Uuid};
+//! use argyle_nimble::{Access, Advertising, AttError, Ble, ConnectionEvent, Uuid};
 //! use std::time::Duration;
 //!
 //! struct Level;
@@ -38,10 +42,27 @@
 //! }
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let server = GattServer::new([Service::primary(Uuid::Uuid16(0x180f))
-//!     .characteristic(CharacteristicDef::new(Level).readable())])?;
-//! let ble = Ble::take()?.sync_timeout(Duration::from_secs(3));
+//! let (level, level_updates) = CharacteristicDef::new(Level).readable().notifiable();
+//! let server = GattServer::new([Service::primary(Uuid::Uuid16(0x180f)).characteristic(level)])?;
+//! let advertising = Advertising::builder()
+//!     .name("argyle-demo")
+//!     .service(Uuid::Uuid16(0x180f))
+//!     .build()?;
+//! let level_key = level_updates.key();
+//! let ble = Ble::take()?
+//!     .sync_timeout(Duration::from_secs(3))
+//!     .advertise(advertising)
+//!     .connection_handler(move |event| match event {
+//!         ConnectionEvent::SubscriptionChanged { endpoint, notify, .. } if endpoint == level_key => {
+//!             // Start or stop producing level updates.
+//!             let _ = notify;
+//!         }
+//!         _ => {}
+//!     });
 //! let running = ble.start(server, Access::Open)?;
+//! if let Some(client) = running.connection() {
+//!     let _ = (client.mtu(), client.is_subscribed(&level_updates));
+//! }
 //! // ... later work uses `running`; dropping it shuts the host down.
 //! let _server = running.shutdown()?;
 //! # Ok(())
@@ -53,19 +74,24 @@
 //! [`Ble::start`] runs these stages in order; each failure is reported as a
 //! [`StartError`] naming its [`StartStage`]:
 //!
-//! 1. [`StartStage::HostInit`]: `nimble_port_init`, which also initializes
+//! 1. Before any native call, the advertising configuration, if any, is
+//!    checked against the server; a mismatch fails at
+//!    [`StartStage::Advertising`] (see [`Advertising`]).
+//! 2. [`StartStage::HostInit`]: `nimble_port_init`, which also initializes
 //!    the Bluetooth controller, then the standard GAP and GATT services.
-//! 2. [`StartStage::Registration`]: build NimBLE's GATT tables from the
+//! 3. [`StartStage::DeviceName`]: with an advertising name, set it as the
+//!    GAP Device Name (`ble_svc_gap_device_name_set`).
+//! 4. [`StartStage::Registration`]: build NimBLE's GATT tables from the
 //!    server and hand them to NimBLE (`ble_gatts_count_cfg`,
 //!    `ble_gatts_add_svcs`). This only sizes and records the services.
-//! 3. [`StartStage::InstallCallbacks`]: the host sync and reset callbacks.
-//! 4. [`StartStage::HostStart`]: the NimBLE host task. When it starts, NimBLE
+//! 5. [`StartStage::InstallCallbacks`]: the host sync and reset callbacks.
+//! 6. [`StartStage::HostStart`]: the NimBLE host task. When it starts, NimBLE
 //!    allocates the attributes and assigns their handles. In ESP-IDF 6.1 an
 //!    allocation failure there (for example a server too large for the
 //!    configured NimBLE memory) fails an assertion on the host task instead
 //!    of returning an error: with assertions enabled the firmware aborts, and
 //!    otherwise the host never synchronizes and startup times out.
-//! 5. [`StartStage::Synchronization`]: wait until the host reports that it
+//! 7. [`StartStage::Synchronization`]: wait until the host reports that it
 //!    is synchronized with the controller. Host resets during the wait are
 //!    recorded, and NimBLE retries synchronization by itself. If the host
 //!    has not synchronized within the sync timeout ([`DEFAULT_SYNC_TIMEOUT`]
@@ -74,8 +100,12 @@
 //!    reason, and the host is shut down. Timeouts below
 //!    [`MIN_SYNC_TIMEOUT`] are raised to it, and a timeout too large to
 //!    represent as a deadline waits without a limit.
-//! 6. [`StartStage::AddressInference`]: choose the own-address type to
-//!    advertise with, without privacy.
+//! 8. [`StartStage::AddressInference`]: choose the own-address type to
+//!    advertise with, without privacy. Then every characteristic must have
+//!    been assigned a handle, or startup fails at
+//!    [`StartStage::Registration`].
+//! 9. [`StartStage::Advertising`]: with an advertising configuration, send
+//!    its payloads and start advertising.
 //!
 //! The GATT server is moved into heap storage owned by the running owner
 //! before any native call, so its address stays fixed however the owner
@@ -84,12 +114,61 @@
 //! registration; they are freed before the server. Requests are handled as
 //! described in [`gatt`](crate::gatt#request-handling).
 //!
+//! # Advertising
+//!
+//! The payloads, their placement, and their validation are described on
+//! [`Advertising`]. Advertising is legacy, connectable, undirected, and
+//! generally discoverable (`ADV_IND`), with NimBLE's default intervals, all
+//! channels, no filter, and no time limit. It uses NimBLE's legacy
+//! advertising API, which ESP-IDF 6.1's NimBLE compiles to return
+//! `BLE_HS_ENOTSUP` when `CONFIG_BT_NIMBLE_EXT_ADV` is enabled; startup then
+//! fails at [`StartStage::Advertising`]. Without
+//! [`Ble::advertise`], the host runs without advertising, and no client can
+//! connect.
+//!
+//! Advertising stops when a client connects. Unless
+//! [`AdvertisingBuilder::remain_available`] turned it off, it restarts by
+//! itself, while no client is connected, after the client disconnects,
+//! after a connection attempt fails, after NimBLE ends advertising without a
+//! connection, and after the host resynchronizes following a reset (the
+//! payloads are sent again each time, because a reset also resets the
+//! controller). A restart that fails is reported as
+//! [`ConnectionEvent::AdvertisingFailed`] and tried again at the next of
+//! those points; [`Ble::start_advertising`] starts it on request.
+//!
+//! # The connected client
+//!
+//! One client is supported. Each connection gets a [`ConnectionId`] that is
+//! never reused, even when NimBLE reuses its numeric connection handle, so
+//! state and work tied to an earlier connection never apply to a later one.
+//! The connection's ATT MTU and the endpoints it subscribed to are tracked
+//! from NimBLE's events and cleared when it disconnects or the host resets.
+//! [`Ble::connection`] returns a snapshot, and a [`ConnectionHandler`]
+//! registered with [`Ble::connection_handler`] receives each change as a
+//! [`ConnectionEvent`] on the host task.
+//!
+//! Events that do not belong to the connected client change nothing: a
+//! repeated connection report, events for a link that already ended or never
+//! connected, subscriptions to attributes without a notify endpoint, and MTU
+//! changes on channels other than ATT's. If a second client connects anyway
+//! (legacy advertising stops at the first connection, so this needs another
+//! route into the controller), the framework asks NimBLE to terminate the
+//! new link and reports [`ConnectionEvent::ConnectionRejected`]; the
+//! connected client is unaffected.
+//!
+//! [`Access::Open`] means the framework neither requests nor requires
+//! pairing, bonding, or encryption. A client that starts pairing is answered
+//! by NimBLE according to its security-manager configuration, which this
+//! crate does not change, and bond storage is neither managed nor deleted.
+//!
 //! # Cleanup and ownership of shared resources
 //!
 //! On a failed start, on drop, and in [`Ble::shutdown`], the framework undoes
-//! only the stages it completed, in reverse: stop the host task,
-//! deinitialize the host (which also drops NimBLE's GATT registration), then
-//! remove the callbacks and free the GATT tables and the storage.
+//! only the stages it completed, in reverse: stop advertising if it is
+//! active (and never start it again), stop the host task (which also
+//! terminates the client's connection), deinitialize the host (which also
+//! drops NimBLE's GATT registration), then remove the callbacks and free the
+//! GATT tables, the connection handler, and the storage.
 //! If `nimble_port_init` fails, nothing is deinitialized, so resources the
 //! application owns are left alone. With the on-chip controller enabled
 //! (`CONFIG_BT_CONTROLLER_ENABLED`, the configuration Phase 1 targets), a
@@ -109,13 +188,16 @@
 //! program so native code can never reach freed memory, and every later
 //! [`Ble::take`] fails until the device restarts. The error reports which
 //! step failed. A host task that has not started its host by the time a
-//! sync wait ends cannot be stopped, which also poisons.
+//! sync wait ends cannot be stopped, which also poisons. A failure to stop
+//! advertising does not poison: stopping the host ends advertising anyway.
 //!
-//! Stopping the host waits for the host task to finish its queued work, and
-//! NimBLE also runs some callbacks (such as advertising completion) on the
-//! thread that stops it. Do not drop or shut down a running owner while
-//! holding a lock that a BLE callback may take, or the shutdown will wait for
-//! itself or for the host task.
+//! Stopping the host waits for the host task to finish its queued work,
+//! including delivering the client's disconnection to the connection
+//! handler, and NimBLE also runs some callbacks (such as advertising
+//! completion) on the thread that stops it. Do not drop or shut down a
+//! running owner while holding a lock that a BLE callback or the connection
+//! handler may take, or the shutdown will wait for itself or for the host
+//! task.
 //!
 //! After shutdown, the old host task deletes itself asynchronously through
 //! ESP-IDF's single host-task handle. Take and start the host again from a
@@ -123,8 +205,11 @@
 //! at `configMAX_PRIORITIES - 4`, normally 21), so the old task finishes
 //! before a new one exists.
 //!
-//! Recovery from host faults while running, and quiescing connections and
-//! notifications before shutdown, are not implemented yet.
+//! A host reset while running ends the connection and advertising; NimBLE
+//! resynchronizes by itself, and the framework reports
+//! [`ConnectionEvent::HostReset`] and [`ConnectionEvent::HostSynced`] and
+//! restarts advertising as described above. Sending notifications is not
+//! implemented yet.
 //!
 //! # Builds without NimBLE
 //!
@@ -132,11 +217,23 @@
 //! always fails with an [`ErrorKind::Lifecycle`]
 //! error, since there is no NimBLE host to own.
 
+pub(crate) mod advertising;
+pub(crate) mod connection;
+
+pub use advertising::{
+    Advertising, AdvertisingBuilder, AdvertisingError, LocalName, LEGACY_PAYLOAD_CAPACITY,
+    MAX_DEVICE_NAME_LEN,
+};
+pub use connection::{
+    ConnectionEvent, ConnectionHandler, ConnectionId, ConnectionInfo, DisconnectReason,
+};
+
 use crate::backend::dispatch::{EventDispatcher, EventSink};
 use crate::backend::native::{Backend, NativeEvent};
 use crate::gatt::registration::GattPlan;
-use crate::gatt::{EndpointId, GattServer};
+use crate::gatt::GattServer;
 use crate::{Error, ErrorKind};
+use connection::Runtime;
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -160,6 +257,11 @@ enum SlotState {
 /// The process-wide ownership record for one native host.
 pub(crate) struct OwnerSlot {
     state: Mutex<SlotState>,
+    /// The last connection generation handed out. It outlives each owner, so
+    /// connection identities are never reused while the program runs. A
+    /// `u64` cannot wrap in practice; it is behind a lock because the
+    /// ESP32-C3 and ESP32-S3 have no 64-bit atomics.
+    generation: Mutex<u64>,
 }
 
 // Host builds have no platform owner; tests use these with the fake backend.
@@ -168,7 +270,18 @@ impl OwnerSlot {
     pub(crate) const fn new() -> Self {
         Self {
             state: Mutex::new(SlotState::Free),
+            generation: Mutex::new(0),
         }
+    }
+
+    /// A connection generation never handed out before by this slot.
+    pub(crate) fn next_generation(&self) -> u64 {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *generation += 1;
+        *generation
     }
 
     fn lock(&self) -> MutexGuard<'_, SlotState> {
@@ -229,9 +342,10 @@ struct HostState {
     parks: usize,
 }
 
-/// Host sync and reset notifications from the native callbacks.
+/// Host sync and reset notifications from the native callbacks, which the
+/// startup wait observes.
 #[derive(Default)]
-struct HostEvents {
+pub(crate) struct HostEvents {
     state: Mutex<HostState>,
     changed: Condvar,
 }
@@ -308,7 +422,7 @@ impl EventSink for HostEvents {
                 state.synced = false;
                 state.last_reset = Some(reason);
             }
-            // Connection events are handled by later features.
+            // The connection runtime handles GAP events.
             NativeEvent::Gap(_) => return,
         }
         drop(state);
@@ -318,10 +432,12 @@ impl EventSink for HostEvents {
 
 /// Application definitions and callback state, boxed before native code is
 /// involved so their addresses stay fixed while the owner moves.
-struct Core {
+struct Core<B: Backend> {
     server: GattServer,
     dispatcher: Arc<EventDispatcher>,
-    events: Arc<HostEvents>,
+    /// The dispatcher's sink: connection state, advertising, and the
+    /// application's connection handler.
+    runtime: Arc<Runtime<B>>,
 }
 
 /// The startup stages completed so far, which cleanup undoes in reverse.
@@ -338,6 +454,8 @@ pub(crate) struct Configured<B: Backend> {
     ownership: Ownership,
     sync_timeout: Duration,
     events: Arc<HostEvents>,
+    advertising: Option<Advertising>,
+    handler: Option<Box<dyn ConnectionHandler>>,
 }
 
 /// Acquire `slot` for an owner that drives `backend`.
@@ -351,6 +469,8 @@ pub(crate) fn take<B: Backend>(
         ownership: slot.acquire()?,
         sync_timeout: DEFAULT_SYNC_TIMEOUT,
         events: Arc::default(),
+        advertising: None,
+        handler: None,
     })
 }
 
@@ -359,11 +479,36 @@ impl<B: Backend> Configured<B> {
         self.sync_timeout = timeout.max(MIN_SYNC_TIMEOUT);
     }
 
+    pub(crate) fn set_advertising(&mut self, advertising: Advertising) {
+        self.advertising = Some(advertising);
+    }
+
+    pub(crate) fn set_handler(&mut self, handler: Box<dyn ConnectionHandler>) {
+        self.handler = Some(handler);
+    }
+
     pub(crate) fn start(self, server: GattServer) -> Result<Started<B>, StartError> {
-        let events = self.events;
+        // Checked against the server before any native call.
+        let (plan, plan_error) = match self
+            .advertising
+            .as_ref()
+            .map(|advertising| advertising.plan(&server))
+        {
+            None => (None, None),
+            Some(Ok(plan)) => (Some(plan), None),
+            Some(Err(error)) => (None, Some(error)),
+        };
+        let slot = self.ownership.slot;
+        let runtime = Arc::new(Runtime::new(
+            self.backend.clone(),
+            slot,
+            self.events,
+            self.handler,
+            plan,
+        ));
         let dispatcher = Arc::new(EventDispatcher::new());
         dispatcher
-            .attach(events.clone())
+            .attach(runtime.clone())
             .expect("a new dispatcher has no sink");
         let mut started = Started {
             backend: self.backend,
@@ -371,18 +516,32 @@ impl<B: Backend> Configured<B> {
             core: Some(Box::new(Core {
                 server,
                 dispatcher,
-                events,
+                runtime,
             })),
             registration: None,
-            value_handles: Vec::new(),
             progress: Progress::default(),
-            address_type: 0,
         };
+        if let Some(error) = plan_error {
+            return Err(started.fail(StartStage::Advertising, error.into(), None));
+        }
 
         if let Err(error) = started.backend.host_init() {
             return Err(started.fail(StartStage::HostInit, error.into(), None));
         }
         started.progress.initialized = true;
+
+        // NimBLE copies the name into the GAP service, which `host_init`
+        // initialized.
+        let name = started
+            .core()
+            .runtime
+            .advertising_plan()
+            .and_then(|plan| plan.device_name.clone());
+        if let Some(name) = name {
+            if let Err(error) = started.backend.set_device_name(&name) {
+                return Err(started.fail(StartStage::DeviceName, error.into(), None));
+            }
+        }
 
         // The tables are owned before NimBLE sees them, so even a partial
         // registration leaves NimBLE pointing at live storage.
@@ -404,7 +563,7 @@ impl<B: Backend> Configured<B> {
         }
         started.progress.started = true;
 
-        if let Err(last_reset) = started.core().events.wait_synced(self.sync_timeout) {
+        if let Err(last_reset) = started.core().runtime.host().wait_synced(self.sync_timeout) {
             let error = Error::new(
                 ErrorKind::Timeout,
                 Some("host synchronization"),
@@ -413,12 +572,12 @@ impl<B: Backend> Configured<B> {
             return Err(started.fail(StartStage::Synchronization, error, last_reset));
         }
 
-        match started.backend.infer_address_type() {
-            Ok(address_type) => started.address_type = address_type,
+        let address_type = match started.backend.infer_address_type() {
+            Ok(address_type) => address_type,
             Err(error) => {
                 return Err(started.fail(StartStage::AddressInference, error.into(), None));
             }
-        }
+        };
 
         // NimBLE assigned the value handles when the host started. A zero
         // means its attribute allocation failed without stopping the host
@@ -433,7 +592,12 @@ impl<B: Backend> Configured<B> {
             );
             return Err(started.fail(StartStage::Registration, error, None));
         }
-        started.value_handles = plan.endpoints().iter().cloned().zip(handles).collect();
+        let value_handles = plan.endpoints().iter().cloned().zip(handles).collect();
+        started.core().runtime.prepare(address_type, value_handles);
+
+        if let Err(error) = started.core().runtime.begin() {
+            return Err(started.fail(StartStage::Advertising, error, None));
+        }
         Ok(started)
     }
 }
@@ -443,6 +607,8 @@ impl<B: Backend> fmt::Debug for Configured<B> {
         formatter
             .debug_struct("Configured")
             .field("sync_timeout", &self.sync_timeout)
+            .field("advertising", &self.advertising)
+            .field("handler", &self.handler.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -451,24 +617,24 @@ impl<B: Backend> fmt::Debug for Configured<B> {
 pub(crate) struct Started<B: Backend> {
     backend: B,
     ownership: Option<Ownership>,
-    core: Option<Box<Core>>,
+    core: Option<Box<Core<B>>>,
     /// NimBLE's GATT tables. They point into `core` and NimBLE points into
     /// them, so they are freed after deinitialization and before `core`.
     registration: Option<B::Registration>,
-    /// Characteristic value handles in registration order, with each
-    /// characteristic's notify endpoint.
-    // Used by notifications in a later ticket.
-    #[cfg_attr(not(test), allow(dead_code))]
-    value_handles: Vec<(Option<EndpointId>, u16)>,
     progress: Progress,
-    // Used by advertising in a later ticket.
-    #[cfg_attr(not(test), allow(dead_code))]
-    address_type: u8,
 }
 
 impl<B: Backend> Started<B> {
-    fn core(&self) -> &Core {
+    fn core(&self) -> &Core<B> {
         self.core.as_deref().expect("storage exists until shutdown")
+    }
+
+    pub(crate) fn connection(&self) -> Option<ConnectionInfo> {
+        self.core().runtime.connection()
+    }
+
+    pub(crate) fn start_advertising(&self) -> Result<(), Error> {
+        self.core().runtime.start_advertising()
     }
 
     fn fail(mut self, stage: StartStage, cause: Error, last_host_reset: Option<i32>) -> StartError {
@@ -518,7 +684,7 @@ impl<B: Backend> Started<B> {
         }
     }
 
-    fn undo(&mut self, core: &Core) -> Result<(), Error> {
+    fn undo(&mut self, core: &Core<B>) -> Result<(), Error> {
         // On the host task, which runs every native callback, stopping the
         // host would wait for itself.
         if self.backend.is_host_task() || core.dispatcher.is_delivering_on_current_thread() {
@@ -529,6 +695,9 @@ impl<B: Backend> Started<B> {
             ));
         }
         if self.progress.started {
+            // No advertising starts after this, and active advertising
+            // stops; stopping the host then terminates any connection.
+            core.runtime.stop();
             self.backend.host_stop()?;
             self.progress.started = false;
         }
@@ -578,6 +747,8 @@ pub enum Access {
 pub enum StartStage {
     /// Initializing the NimBLE port and controller.
     HostInit,
+    /// Setting the GAP Device Name from the advertising configuration.
+    DeviceName,
     /// Registering the GATT server's services with NimBLE.
     Registration,
     /// Installing the host sync and reset callbacks.
@@ -588,17 +759,23 @@ pub enum StartStage {
     Synchronization,
     /// Choosing the own-address type.
     AddressInference,
+    /// Checking the advertising configuration against the GATT server
+    /// (before any native call), or starting advertising (after every
+    /// other stage).
+    Advertising,
 }
 
 impl fmt::Display for StartStage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::HostInit => "host initialization",
+            Self::DeviceName => "device name",
             Self::Registration => "GATT registration",
             Self::InstallCallbacks => "callback installation",
             Self::HostStart => "host start",
             Self::Synchronization => "host synchronization",
             Self::AddressInference => "address inference",
+            Self::Advertising => "advertising",
         })
     }
 }
@@ -749,6 +926,23 @@ impl Ble<Configuring> {
         self
     }
 
+    /// Advertise with `advertising` once the host is ready, and set its name
+    /// as the GAP Device Name. A later call replaces the configuration.
+    /// Without one the host starts but does not advertise, so no client can
+    /// connect. See the [module documentation](crate::ble#advertising).
+    pub fn advertise(mut self, advertising: Advertising) -> Self {
+        self.state.inner.set_advertising(advertising);
+        self
+    }
+
+    /// Deliver connection and host lifecycle events to `handler` while the
+    /// host runs. A later call replaces the handler. See
+    /// [`ConnectionHandler`] for the threading contract.
+    pub fn connection_handler(mut self, handler: impl ConnectionHandler) -> Self {
+        self.state.inner.set_handler(Box::new(handler));
+        self
+    }
+
     /// Start the host with `server` and the chosen access policy, returning
     /// the running owner once the host is ready. See the
     /// [module documentation](crate::ble) for the stages and cleanup.
@@ -763,6 +957,31 @@ impl Ble<Configuring> {
 }
 
 impl Ble<Running> {
+    /// The connected client, or `None` while no client is connected.
+    ///
+    /// This is a snapshot: the client may connect, disconnect, or change its
+    /// subscriptions or MTU right after it is taken. Compare its
+    /// [`ConnectionId`] with later events to tell connections apart. It is
+    /// safe to call from a [`ConnectionHandler`].
+    pub fn connection(&self) -> Option<ConnectionInfo> {
+        self.state.inner.connection()
+    }
+
+    /// Start advertising with the configuration given to
+    /// [`advertise`](Ble::advertise), for example after a client
+    /// disconnected while advertising does not
+    /// [remain available](AdvertisingBuilder::remain_available).
+    ///
+    /// Succeeds without a change while advertising is already active. Fails
+    /// with an [`ErrorKind::Lifecycle`] error when no advertising was
+    /// configured, while a client is connected (one client is supported),
+    /// while the host is resynchronizing after a reset, or while it shuts
+    /// down; and with an [`ErrorKind::Backend`] error when NimBLE refuses.
+    /// It may be called from a [`ConnectionHandler`].
+    pub fn start_advertising(&self) -> Result<(), Error> {
+        self.state.inner.start_advertising()
+    }
+
     /// Shut the host down and release ownership, returning the GATT server
     /// for a later start. Dropping the owner does the same without a report.
     ///
@@ -1233,7 +1452,7 @@ mod tests {
         // stack's services: service 0x11, then declaration/value (and a CCCD
         // for notify) per characteristic.
         assert_eq!(
-            running.value_handles,
+            running.core().runtime.value_handles(),
             [
                 (Some(first_endpoint.id().clone()), 0x13),
                 (None, 0x16),
@@ -1242,7 +1461,9 @@ mod tests {
         );
         let handle_of = |endpoint: &crate::gatt::NotifyEndpoint<u8>| {
             running
-                .value_handles
+                .core()
+                .runtime
+                .value_handles()
                 .iter()
                 .find(|(id, _)| id.as_ref() == Some(endpoint.id()))
                 .map(|(_, handle)| *handle)
@@ -1500,7 +1721,7 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(moved.0, before);
-        assert_eq!(moved.1.address_type, 0);
+        assert!(moved.1.connection().is_none());
     }
 
     #[test]

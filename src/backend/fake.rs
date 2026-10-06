@@ -118,6 +118,14 @@ pub(crate) enum NativeCall {
     GattAdd,
     /// The registration's tables were freed.
     RegistrationFreed,
+    SetDeviceName {
+        name: String,
+    },
+    AdvertisingData(Vec<u8>),
+    ScanResponseData(Vec<u8>),
+    AdvertisingStart {
+        address_type: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -181,6 +189,9 @@ struct FakeState {
     /// Leave value handles unassigned at host start, as when NimBLE's
     /// attribute allocation fails with assertions disabled.
     skip_handle_assignment: bool,
+    /// NimBLE's sync state: set by injected sync and reset callbacks, as
+    /// NimBLE sets it before delivering them, or by the test.
+    synced: bool,
 }
 
 /// Per service, each characteristic's notify flag, descriptor count, and
@@ -287,6 +298,12 @@ impl FakeBackend {
         self.lock().host_thread = Some(thread);
     }
 
+    /// Set the sync state without a callback, as NimBLE does at the start of
+    /// a host reset before it reports the reset's GAP events.
+    pub(crate) fn set_synced(&self, synced: bool) {
+        self.lock().synced = synced;
+    }
+
     pub(crate) fn set_mtu(&self, connection: u16, mtu: u16) {
         self.lock().mtu.insert(connection, mtu);
     }
@@ -366,9 +383,20 @@ impl FakeBackend {
     }
 
     /// Deliver a native callback through the installed dispatcher, as the
-    /// NimBLE host task would.
+    /// NimBLE host task would. Sync and reset callbacks first update the
+    /// sync state, as NimBLE does before calling them.
     pub(crate) fn inject(&self, event: NativeEvent) -> Option<Delivery> {
+        match event {
+            NativeEvent::HostSynced => self.set_synced(true),
+            NativeEvent::HostReset { .. } => self.set_synced(false),
+            NativeEvent::Gap(_) => {}
+        }
         self.callbacks.deliver(event)
+    }
+
+    /// Deliver a GAP event, as the NimBLE host task would.
+    pub(crate) fn inject_gap(&self, event: GapEvent) -> Option<Delivery> {
+        self.inject(NativeEvent::Gap(event))
     }
 
     /// Record a call, consume a scripted result, then stop at a hold if one
@@ -655,11 +683,55 @@ impl Backend for FakeBackend {
         )
     }
 
+    fn set_device_name(&self, name: &std::ffi::CStr) -> NativeResult<()> {
+        let call = NativeCall::SetDeviceName {
+            name: name.to_string_lossy().into_owned(),
+        };
+        check(
+            Operation::DeviceName,
+            self.enter(Operation::DeviceName, call),
+        )
+    }
+
+    fn set_advertising_data(&self, data: &[u8]) -> NativeResult<()> {
+        check(
+            Operation::AdvertisingData,
+            self.enter(
+                Operation::AdvertisingData,
+                NativeCall::AdvertisingData(data.to_vec()),
+            ),
+        )
+    }
+
+    fn set_scan_response_data(&self, data: &[u8]) -> NativeResult<()> {
+        check(
+            Operation::ScanResponseData,
+            self.enter(
+                Operation::ScanResponseData,
+                NativeCall::ScanResponseData(data.to_vec()),
+            ),
+        )
+    }
+
+    fn advertising_start(&self, address_type: u8) -> NativeResult<()> {
+        check(
+            Operation::AdvertisingStart,
+            self.enter(
+                Operation::AdvertisingStart,
+                NativeCall::AdvertisingStart { address_type },
+            ),
+        )
+    }
+
     fn advertising_stop(&self) -> NativeResult<()> {
         check(
             Operation::AdvertisingStop,
             self.enter(Operation::AdvertisingStop, NativeCall::AdvertisingStop),
         )
+    }
+
+    fn is_synced(&self) -> bool {
+        self.lock().synced
     }
 
     fn mtu(&self, connection: u16) -> Option<u16> {

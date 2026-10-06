@@ -6,9 +6,11 @@
 use super::dispatch::EventDispatcher;
 use super::native::{Backend, NativeResult};
 use crate::gatt::registration::GattPlan;
+use std::ffi::CStr;
 use std::sync::Arc;
 
 /// An uninhabited backend.
+#[derive(Clone)]
 pub(crate) enum Unavailable {}
 
 impl Backend for Unavailable {
@@ -54,7 +56,22 @@ impl Backend for Unavailable {
     fn terminate(&self, _: u16) -> NativeResult<()> {
         match *self {}
     }
+    fn set_device_name(&self, _: &CStr) -> NativeResult<()> {
+        match *self {}
+    }
+    fn set_advertising_data(&self, _: &[u8]) -> NativeResult<()> {
+        match *self {}
+    }
+    fn set_scan_response_data(&self, _: &[u8]) -> NativeResult<()> {
+        match *self {}
+    }
+    fn advertising_start(&self, _: u8) -> NativeResult<()> {
+        match *self {}
+    }
     fn advertising_stop(&self) -> NativeResult<()> {
+        match *self {}
+    }
+    fn is_synced(&self) -> bool {
         match *self {}
     }
     fn mtu(&self, _: u16) -> Option<u16> {
