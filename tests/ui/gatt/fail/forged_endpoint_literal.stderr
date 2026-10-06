@@ -1,0 +1,15 @@
+error[E0451]: fields `id` and `value` of struct `NotifyEndpoint` are private
+ --> tests/ui/gatt/fail/forged_endpoint_literal.rs:9:36
+  |
+9 |     let _ = NotifyEndpoint::<u8> { id: todo!(), value: PhantomData };
+  |                                    ^^           ^^^^^ private field
+  |                                    |
+  |                                    private field
+
+error: type `gatt::EndpointId` is private
+ --> tests/ui/gatt/fail/forged_endpoint_literal.rs:9:40
+  |
+9 |     let _ = NotifyEndpoint::<u8> { id: todo!(), value: PhantomData };
+  |                                        ^^^^^^^ private type
+  |
+  = note: this error originates in the macro `todo` (in Nightly builds, run with -Z macro-backtrace for more info)

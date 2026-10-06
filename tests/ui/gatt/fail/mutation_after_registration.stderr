@@ -1,0 +1,10 @@
+error[E0382]: use of moved value: `service`
+  --> tests/ui/gatt/fail/mutation_after_registration.rs:26:13
+   |
+23 |     let service = Service::primary(Uuid::Uuid16(0x180f))
+   |         ------- move occurs because `service` has type `Service`, which does not implement the `Copy` trait
+24 |         .characteristic(CharacteristicDef::new(Level).readable());
+25 |     let _server = GattServer::new([service]).unwrap();
+   |                                    ------- value moved here
+26 |     let _ = service.characteristic(CharacteristicDef::new(Level).readable());
+   |             ^^^^^^^ value used here after move

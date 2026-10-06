@@ -338,12 +338,16 @@ class Validation:
                 result.add((fields.get("name", ""), fields.get("version", ""), fields.get("checksum", "")))
             return result
 
+        # Cargo drops repository packages the fixture does not use, such as
+        # argyle-nimble's dev-dependencies. Every package the fixture does
+        # resolve must match the repository lock exactly, apart from the
+        # fixture itself, so no dependency is added or changes version.
         repository = packages(ROOT / "Cargo.lock")
         fixture = packages(self.manifest.with_name("Cargo.lock"))
         added = {package[0] for package in fixture - repository}
         self.runner.check(
             "fixture-lock-matches-repository",
-            repository <= fixture and added == {FIXTURE_PACKAGE},
+            added == {FIXTURE_PACKAGE},
             f"fixture lock adds only the fixture package; added {sorted(added)}",
         )
 

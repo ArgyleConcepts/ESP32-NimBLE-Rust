@@ -5,7 +5,7 @@ A public MIT-licensed Rust framework for ESP-IDF's NimBLE stack.
 ## Current status
 
 This is an early library crate. Its public API covers the values that cross
-the BLE boundary:
+the BLE boundary and the declaration of a GATT server:
 
 - `Uuid`: 16-, 32-, and 128-bit Bluetooth UUIDs with checked parsing and
   explicit canonical (text) and wire (least significant byte first) orders.
@@ -13,10 +13,14 @@ the BLE boundary:
   UTF-8 encodings, a `BigEndian` wrapper, and `Encode`/`Decode` traits for
   application codecs over Rust-owned bytes only.
 - `AttError` for ATT results returned to a client, kept separate from
-  `Error` for framework lifecycle, backend, and encoding failures.
+  `Error` for framework lifecycle, backend, encoding, and definition failures.
+- `gatt`: services and characteristics declared with application structs and
+  traits. Read, write, and notify capabilities require their handlers at
+  compile time, and `GattServer` freezes the validated definition with
+  typed notification endpoints.
 
-It has **no BLE controller, GATT server, implemented BLE behavior, or published
-package**. See the rustdoc on each type for contracts and examples. Its private,
+It has **no BLE controller, NimBLE registration of these definitions,
+implemented BLE behavior, or published package**. See the rustdoc on each type for contracts and examples. Its private,
 versioned ESP-IDF build-context contract can validate the configured SDK,
 consumer compiler arguments, and Bluetooth/NimBLE configuration for ESP32-C3
 and ESP32-S3. Private binding-generation code and narrow C shims define the
@@ -82,6 +86,9 @@ milestones.
 - `src/lib.rs`: library entry point and crate documentation.
 - `src/uuid.rs`, `src/codec.rs`, and `src/error.rs`: public UUID, value codec,
   and error types with their contracts and tests.
+- `src/gatt.rs`: public GATT authoring API; `tests/gatt_authoring.rs` checks its
+  compile-time contracts with the `tests/ui/gatt` pass and compile-fail
+  fixtures.
 - `build_support/context.rs` and `cmake/`: private build-context validation and
   CMake export contract.
 - `build_support/bindings.rs`: private context-driven bindgen generator.

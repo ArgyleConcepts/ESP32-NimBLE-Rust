@@ -9,8 +9,11 @@
 //!   application codecs, over Rust-owned bytes only.
 //! - [`AttError`] for ATT results returned to a client, and [`Error`] for
 //!   framework failures; the two are deliberately separate.
+//! - [`gatt`]: declarative services and characteristics whose capabilities
+//!   are checked at compile time, frozen into a [`gatt::GattServer`]
+//!   definition.
 //!
-//! There is no BLE controller, GATT server, or runtime behavior yet. Private
+//! There is no BLE controller, NimBLE registration, or runtime behavior yet. Private
 //! tooling validates consumer build context and generates bindings from the
 //! selected ESP-IDF configuration; generated declarations and C shims remain
 //! private. A reusable CMake module builds an application's Rust static
@@ -25,6 +28,7 @@
 mod backend;
 pub mod codec;
 mod error;
+pub mod gatt;
 mod uuid;
 
 pub use error::{AttError, BackendError, Error, ErrorKind, InvalidAttErrorCode};

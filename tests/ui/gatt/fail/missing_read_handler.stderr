@@ -1,0 +1,14 @@
+error[E0277]: the trait bound `Level: Readable` is not satisfied
+  --> tests/ui/gatt/fail/missing_read_handler.rs:16:43
+   |
+16 |     let _ = CharacteristicDef::new(Level).readable();
+   |                                           ^^^^^^^^ the trait `Readable` is not implemented for `Level`
+   |
+note: required by a bound in `CharacteristicDef::<C>::readable`
+  --> src/gatt.rs
+   |
+   |     pub fn readable(mut self) -> Self
+   |            -------- required by a bound in this associated function
+   |     where
+   |         C: Readable,
+   |            ^^^^^^^^ required by this bound in `CharacteristicDef::<C>::readable`

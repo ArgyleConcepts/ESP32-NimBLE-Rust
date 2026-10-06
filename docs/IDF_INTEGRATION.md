@@ -10,8 +10,9 @@ and it does not install toolchains.
 This is compile/link integration. Azure validation builds and links generic
 ESP32-C3 and ESP32-S3 fixtures and inspects the results; it does not flash or
 execute firmware, verify hardware, or test BLE behavior. argyle-nimble's
-public API covers UUIDs, value codecs, and error types; it has no BLE
-controller, GATT server, or runtime behavior yet.
+public API covers UUIDs, value codecs, error types, and GATT server
+definitions; it has no BLE controller, NimBLE registration, or runtime
+behavior yet.
 
 ## Supported configuration
 

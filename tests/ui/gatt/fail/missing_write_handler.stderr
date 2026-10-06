@@ -1,0 +1,14 @@
+error[E0277]: the trait bound `Level: Writable` is not satisfied
+  --> tests/ui/gatt/fail/missing_write_handler.rs:16:43
+   |
+16 |     let _ = CharacteristicDef::new(Level).writable_without_response();
+   |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Writable` is not implemented for `Level`
+   |
+note: required by a bound in `CharacteristicDef::<C>::writable_without_response`
+  --> src/gatt.rs
+   |
+   |     pub fn writable_without_response(mut self) -> Self
+   |            ------------------------- required by a bound in this associated function
+   |     where
+   |         C: Writable,
+   |            ^^^^^^^^ required by this bound in `CharacteristicDef::<C>::writable_without_response`

@@ -1,0 +1,5 @@
+error[E0616]: field `services` of struct `GattServer` is private
+ --> tests/ui/gatt/fail/server_contents_private.rs:8:25
+  |
+8 |     let _ = &mut server.services;
+  |                         ^^^^^^^^ private field

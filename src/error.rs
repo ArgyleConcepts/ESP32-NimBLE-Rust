@@ -14,6 +14,7 @@
 //! `From` implementations on [`AttError`].
 
 use crate::codec::{DecodeError, EncodeError};
+use crate::Uuid;
 use std::fmt;
 
 /// An ATT error code returned to the client in an Error Response.
@@ -237,6 +238,9 @@ pub enum ErrorKind {
     /// An outgoing value could not be encoded. The error's
     /// [`source`](std::error::Error::source) is the [`EncodeError`].
     Encode,
+    /// A GATT definition is structurally invalid, such as a characteristic
+    /// with no read, write, or notify capability.
+    Definition,
 }
 
 impl fmt::Display for ErrorKind {
@@ -245,6 +249,7 @@ impl fmt::Display for ErrorKind {
             Self::Lifecycle => "lifecycle error",
             Self::Backend => "native backend error",
             Self::Encode => "encoding error",
+            Self::Definition => "invalid GATT definition",
         })
     }
 }
@@ -268,6 +273,11 @@ enum Cause {
     },
     Backend(BackendError),
     Encode(EncodeError),
+    Definition {
+        service: Option<Uuid>,
+        characteristic: Option<Uuid>,
+        problem: &'static str,
+    },
 }
 
 impl Error {
@@ -298,9 +308,42 @@ impl Error {
     }
 }
 
+impl Error {
+    /// An invalid GATT definition, located by service and characteristic
+    /// UUID where known.
+    pub(crate) fn definition(
+        service: Option<Uuid>,
+        characteristic: Option<Uuid>,
+        problem: &'static str,
+    ) -> Self {
+        Self {
+            kind: ErrorKind::Definition,
+            cause: Cause::Definition {
+                service,
+                characteristic,
+                problem,
+            },
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.cause {
+            Cause::Definition {
+                service,
+                characteristic,
+                problem,
+            } => {
+                write!(formatter, "{}: ", self.kind)?;
+                if let Some(service) = service {
+                    write!(formatter, "service {service}: ")?;
+                }
+                if let Some(characteristic) = characteristic {
+                    write!(formatter, "characteristic {characteristic}: ")?;
+                }
+                formatter.write_str(problem)
+            }
             Cause::Message {
                 operation: Some(operation),
                 message,
@@ -318,7 +361,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.cause {
-            Cause::Message { .. } => None,
+            Cause::Message { .. } | Cause::Definition { .. } => None,
             Cause::Backend(error) => Some(error),
             Cause::Encode(error) => Some(error),
         }

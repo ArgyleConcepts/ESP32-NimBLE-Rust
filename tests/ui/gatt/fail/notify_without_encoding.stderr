@@ -1,0 +1,24 @@
+error[E0277]: the trait bound `Duration: argyle_nimble::codec::Encode` is not satisfied
+  --> tests/ui/gatt/fail/notify_without_encoding.rs:16:44
+   |
+16 |     let _ = CharacteristicDef::new(Uptime).notifiable();
+   |                                            ^^^^^^^^^^ the trait `argyle_nimble::codec::Encode` is not implemented for `Duration`
+   |
+   = help: the following other types implement trait `argyle_nimble::codec::Encode`:
+             &T
+             BigEndian<f32>
+             BigEndian<f64>
+             BigEndian<i128>
+             BigEndian<i16>
+             BigEndian<i32>
+             BigEndian<i64>
+             BigEndian<i8>
+           and $N others
+note: required by a bound in `CharacteristicDef::<C>::notifiable`
+  --> src/gatt.rs
+   |
+   |     pub fn notifiable(mut self) -> (Self, NotifyEndpoint<C::Value>)
+   |            ---------- required by a bound in this associated function
+   |     where
+   |         C::Value: Encode,
+   |                   ^^^^^^ required by this bound in `CharacteristicDef::<C>::notifiable`

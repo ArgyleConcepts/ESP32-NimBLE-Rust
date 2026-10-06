@@ -187,6 +187,15 @@ pub trait Decode<'a>: Sized {
     fn decode(reader: &mut ValueReader<'a>) -> Result<Self, DecodeError>;
 }
 
+/// A type that decodes without borrowing from the received bytes, such as
+/// `u16`, `String`, or `Vec<u8>` but not `&str`. Implemented automatically.
+///
+/// Values handed to application code after the received bytes are released,
+/// such as written characteristic values, require this bound.
+pub trait DecodeOwned: for<'a> Decode<'a> {}
+
+impl<T: for<'a> Decode<'a>> DecodeOwned for T {}
+
 /// A bounded writer that appends encoded bytes to a caller's `Vec<u8>`.
 ///
 /// The capacity limits the bytes this writer may add, not the vector's
