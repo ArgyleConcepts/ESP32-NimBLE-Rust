@@ -14,7 +14,7 @@ use super::native::{
 };
 use crate::ble::advertising::{ad, LEGACY_PAYLOAD_CAPACITY};
 use crate::ble::connection::{
-    ATT_CHANNEL, ATT_DEFAULT_MTU, HCI_STATUS_BASE, HOST_EAGAIN, HOST_ENOTCONN,
+    ATT_CHANNEL, ATT_DEFAULT_MTU, HCI_STATUS_BASE, HOST_EAGAIN, HOST_ENOTCONN, HOST_ENOTSYNCED,
 };
 use crate::error::ATT_STATUS_BASE;
 use crate::AttError;
@@ -89,6 +89,7 @@ const _: () = {
     assert!(HCI_STATUS_BASE as u32 == bindings::BLE_HS_ERR_HCI_BASE as u32);
     assert!(HOST_EAGAIN as u32 == bindings::BLE_HS_EAGAIN as u32);
     assert!(HOST_ENOTCONN as u32 == bindings::BLE_HS_ENOTCONN as u32);
+    assert!(HOST_ENOTSYNCED as u32 == bindings::BLE_HS_ENOTSYNCED as u32);
     // `ble_gap_adv_start` takes the duration as an `int32_t`.
     assert!(bindings::ARGYLE_NIMBLE_HS_FOREVER as i64 == i32::MAX as i64);
 };

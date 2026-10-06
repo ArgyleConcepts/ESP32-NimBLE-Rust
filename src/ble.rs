@@ -105,7 +105,11 @@
 //!    been assigned a handle, or startup fails at
 //!    [`StartStage::Registration`].
 //! 9. [`StartStage::Advertising`]: with an advertising configuration, send
-//!    its payloads and start advertising.
+//!    its payloads and start advertising. If the host resets after the sync
+//!    wait, NimBLE refuses the commands until it resynchronizes; startup then
+//!    waits for the resynchronization within the sync timeout and tries
+//!    again, and fails with an [`ErrorKind::Timeout`] error if it does not
+//!    come.
 //!
 //! The GATT server is moved into heap storage owned by the running owner
 //! before any native call, so its address stays fixed however the owner
@@ -140,10 +144,14 @@
 //! Supporting the re-attempt is future work.
 //!
 //! Advertising stops when a client connects: the controller stops it when it
-//! accepts the client, and the framework stops it again when NimBLE reports
-//! the connection, since a start between the two (ESP-IDF reports a
-//! connection only after reading the client's version and features) would
-//! otherwise leave it running. Unless
+//! accepts the client. ESP-IDF reports the connection only after reading the
+//! client's version and features, so a start between the two (by the
+//! application or a restart) would leave it running; the framework then
+//! stops it when NimBLE reports the connection. Stopping clears NimBLE's
+//! advertising state, so a second client the controller accepted from that
+//! advertising just before the stop is refused by NimBLE and left to the
+//! controller; that residual race needs a start inside this window, so the
+//! stop is issued only after one. Unless
 //! [`AdvertisingBuilder::remain_available`] turned it off, it restarts by
 //! itself, while no client is connected, after the client disconnects,
 //! after a connection attempt fails, after NimBLE ends advertising without a
@@ -362,6 +370,8 @@ impl Drop for Ownership {
 #[derive(Default)]
 struct HostState {
     synced: bool,
+    /// How many times the host has synchronized.
+    syncs: u64,
     last_reset: Option<i32>,
     /// How many times a waiter has blocked, so tests can deliver events
     /// while startup is waiting.
@@ -418,6 +428,47 @@ impl HostEvents {
     }
 }
 
+impl HostEvents {
+    /// How many times the host has synchronized so far.
+    pub(crate) fn syncs(&self) -> u64 {
+        self.lock().syncs
+    }
+
+    /// Wait until the host has synchronized more than `syncs` times in
+    /// total, or until `timeout` (`None` for no limit) passes; return
+    /// whether it did.
+    pub(crate) fn wait_for_sync_after(&self, syncs: u64, timeout: Option<Duration>) -> bool {
+        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+        let mut state = self.lock();
+        loop {
+            if state.syncs > syncs {
+                return true;
+            }
+            #[cfg(test)]
+            {
+                state.parks += 1;
+                self.changed.notify_all();
+            }
+            state = match deadline {
+                None => self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return false;
+                    }
+                    self.changed
+                        .wait_timeout(state, remaining)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .0
+                }
+            };
+        }
+    }
+}
+
 #[cfg(test)]
 impl HostEvents {
     /// Block until a waiter has blocked at least `parks` times; a waiter
@@ -444,7 +495,10 @@ impl EventSink for HostEvents {
     fn on_event(&self, event: NativeEvent) {
         let mut state = self.lock();
         match event {
-            NativeEvent::HostSynced => state.synced = true,
+            NativeEvent::HostSynced => {
+                state.synced = true;
+                state.syncs += 1;
+            }
             NativeEvent::HostReset { reason } => {
                 state.synced = false;
                 state.last_reset = Some(reason);
@@ -622,7 +676,7 @@ impl<B: Backend> Configured<B> {
         let value_handles = plan.endpoints().iter().cloned().zip(handles).collect();
         started.core().runtime.prepare(address_type, value_handles);
 
-        if let Err(error) = started.core().runtime.begin() {
+        if let Err(error) = started.core().runtime.begin(self.sync_timeout) {
             return Err(started.fail(StartStage::Advertising, error, None));
         }
         Ok(started)

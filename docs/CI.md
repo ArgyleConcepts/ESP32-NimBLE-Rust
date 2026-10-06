@@ -214,7 +214,8 @@ out-of-order events, failed connections and restarts, host reset and
 resynchronization, re-entrant handlers, overlapping advertising starts, and
 shutdown ordering. The fake also models ESP-IDF's late connection report
 (advertising ends at link creation, before the report), links left open or
-already freed after a failed connection, and repeated terminations. The ESP advertising calls and their constants are only
+already freed after a failed connection, repeated terminations, and
+NimBLE refusing commands while the host is not synchronized. The ESP advertising calls and their constants are only
 compiled for the targets. The tests show framework logic on the host only;
 they are not SDK, target, or hardware evidence. The firmware fixtures compile
 the real ESP backend for C3 and S3. `tests/compile_contracts.rs` uses

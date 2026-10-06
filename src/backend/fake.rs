@@ -71,6 +71,11 @@ impl Gate {
         self.wait_for("the worker's arrival", |state| state.0);
     }
 
+    /// Whether a worker has arrived at the gate.
+    pub(crate) fn entered(&self) -> bool {
+        self.lock().0
+    }
+
     pub(crate) fn release(&self) {
         self.lock().1 = true;
         self.changed.notify_all();
@@ -488,6 +493,19 @@ impl FakeBackend {
         self.inject(NativeEvent::Gap(event))
     }
 
+    /// Like an HCI command from a task other than NimBLE's: a scripted
+    /// result, or `BLE_HS_ENOTSYNCED` (22) while the host is not
+    /// synchronized (`ble_hs_hci_cmd_send_buf`), checked when the call
+    /// proceeds past any hold.
+    fn enter_hci(&self, operation: Operation, call: NativeCall) -> i32 {
+        let code = self.enter(operation, call);
+        if code == 0 && !self.lock().synced {
+            22
+        } else {
+            code
+        }
+    }
+
     /// Record a call, consume a scripted result, then stop at a hold if one
     /// is armed for this operation. The state lock is released while held.
     fn enter(&self, operation: Operation, call: NativeCall) -> i32 {
@@ -771,7 +789,7 @@ impl Backend for FakeBackend {
     /// Unknown Connection Identifier (0x202), and a repeated request succeeds
     /// as the ESP backend maps `BLE_HS_EALREADY`; a scripted result wins.
     fn terminate(&self, connection: u16) -> NativeResult<()> {
-        let code = self.enter(Operation::Terminate, NativeCall::Terminate { connection });
+        let code = self.enter_hci(Operation::Terminate, NativeCall::Terminate { connection });
         let mut state = self.lock();
         let code = match state.links.get_mut(&connection) {
             _ if code != 0 => code,
@@ -799,7 +817,7 @@ impl Backend for FakeBackend {
     fn set_advertising_data(&self, data: &[u8]) -> NativeResult<()> {
         check(
             Operation::AdvertisingData,
-            self.enter(
+            self.enter_hci(
                 Operation::AdvertisingData,
                 NativeCall::AdvertisingData(data.to_vec()),
             ),
@@ -809,7 +827,7 @@ impl Backend for FakeBackend {
     fn set_scan_response_data(&self, data: &[u8]) -> NativeResult<()> {
         check(
             Operation::ScanResponseData,
-            self.enter(
+            self.enter_hci(
                 Operation::ScanResponseData,
                 NativeCall::ScanResponseData(data.to_vec()),
             ),
@@ -819,7 +837,7 @@ impl Backend for FakeBackend {
     /// Starting while advertising succeeds, as the ESP backend maps
     /// `BLE_HS_EALREADY`.
     fn advertising_start(&self, address_type: u8) -> NativeResult<()> {
-        let code = self.enter(
+        let code = self.enter_hci(
             Operation::AdvertisingStart,
             NativeCall::AdvertisingStart { address_type },
         );
@@ -830,7 +848,7 @@ impl Backend for FakeBackend {
     }
 
     fn advertising_stop(&self) -> NativeResult<()> {
-        let code = self.enter(Operation::AdvertisingStop, NativeCall::AdvertisingStop);
+        let code = self.enter_hci(Operation::AdvertisingStop, NativeCall::AdvertisingStop);
         // NimBLE stops the controller before it can fail.
         self.lock().advertising = false;
         check(Operation::AdvertisingStop, code)
@@ -949,6 +967,7 @@ mod tests {
     #[test]
     fn calls_are_logged_in_order_and_scripted_codes_are_consumed_fifo() {
         let fake = FakeBackend::new();
+        fake.set_synced(true);
         fake.fail_next(Operation::HostInit, 0x103);
         fake.fail_next(Operation::HostInit, 5);
         assert_eq!(
@@ -1355,8 +1374,25 @@ mod tests {
     }
 
     #[test]
+    fn hci_commands_are_refused_while_the_host_is_not_synchronized() {
+        let fake = FakeBackend::new();
+        let refused =
+            |result: NativeResult<()>| matches!(result, Err(NativeError::Status { code: 22, .. }));
+        assert!(refused(fake.set_advertising_data(&[])));
+        assert!(refused(fake.set_scan_response_data(&[])));
+        assert!(refused(fake.advertising_start(0)));
+        assert!(refused(fake.advertising_stop()));
+        assert!(refused(fake.terminate(1)));
+        assert!(!fake.is_advertising());
+        fake.set_synced(true);
+        assert_eq!(fake.advertising_start(0), Ok(()));
+        assert!(fake.is_advertising());
+    }
+
+    #[test]
     fn a_hold_stops_only_the_next_call_of_its_operation() {
         let fake = FakeBackend::new();
+        fake.set_synced(true);
         let held = fake.hold(Operation::HostStop);
         let stopping = {
             let fake = fake.clone();

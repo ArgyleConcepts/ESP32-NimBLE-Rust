@@ -229,4 +229,12 @@ fn private_c_shim_rejects_nimbles_connection_reattempt() {
         "{}",
         output_message(&enabled)
     );
+    let hidden = check("-DARGYLE_NIMBLE_TEST_HIDE_REATTEMPT_SETTING");
+    assert!(!hidden.status.success(), "{}", output_message(&hidden));
+    assert!(
+        String::from_utf8_lossy(&hidden.stderr)
+            .contains("argyle-nimble cannot see NimBLE's BLE_ENABLE_CONN_REATTEMPT setting"),
+        "{}",
+        output_message(&hidden)
+    );
 }
