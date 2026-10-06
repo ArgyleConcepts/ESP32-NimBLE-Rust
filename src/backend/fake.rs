@@ -156,6 +156,8 @@ impl FakeMbuf {
 struct MbufRecord {
     data: Vec<u8>,
     state: MbufState,
+    /// Segment lengths of the chain, in order; they sum to `data.len()`.
+    segments: Vec<usize>,
 }
 
 struct Hold {
@@ -173,7 +175,13 @@ struct FakeState {
     notifications: Vec<(u16, u16, Vec<u8>)>,
     mtu: HashMap<u16, u16>,
     host_thread: Option<std::thread::ThreadId>,
+    /// Handle slots and layout of the last registration, filled in when the
+    /// host starts, as NimBLE does.
+    registered: Option<(Arc<[AtomicU16]>, Layout)>,
 }
+
+/// Per service, each characteristic's notify flag and descriptor count.
+type Layout = Vec<Vec<(bool, usize)>>;
 
 /// A characteristic as the fake registered it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -196,7 +204,7 @@ pub(crate) struct FakeService {
 /// [`NativeCall::RegistrationFreed`].
 pub(crate) struct FakeRegistration {
     pub(crate) services: Vec<FakeService>,
-    handles: Box<[AtomicU16]>,
+    handles: Arc<[AtomicU16]>,
     state: Arc<Mutex<FakeState>>,
 }
 
@@ -286,6 +294,31 @@ impl FakeBackend {
     }
 
     /// Current bytes of a buffer, including after it was released.
+    /// A live chained buffer holding `segments` in order, as NimBLE delivers
+    /// a long write; NimBLE created it, so no native call is recorded. The
+    /// test frees it, as NimBLE frees access buffers.
+    pub(crate) fn mbuf_from_segments(&self, segments: &[&[u8]]) -> FakeMbuf {
+        let mut state = self.lock();
+        state.next_mbuf += 1;
+        let id = state.next_mbuf;
+        state.mbufs.insert(
+            id,
+            MbufRecord {
+                data: segments.concat(),
+                state: MbufState::Live,
+                segments: segments.iter().map(|segment| segment.len()).collect(),
+            },
+        );
+        FakeMbuf { id }
+    }
+
+    pub(crate) fn mbuf_segments(&self, id: u32) -> Option<Vec<usize>> {
+        self.lock()
+            .mbufs
+            .get(&id)
+            .map(|record| record.segments.clone())
+    }
+
     pub(crate) fn mbuf_data(&self, id: u32) -> Option<Vec<u8>> {
         self.lock().mbufs.get(&id).map(|record| record.data.clone())
     }
@@ -434,11 +467,33 @@ impl Backend for FakeBackend {
         self.callbacks.remove(|| {}).map_err(|_| reentrant)
     }
 
+    /// Like NimBLE's host start, which runs `ble_gatts_start`: assigns the
+    /// registered attributes' handles, starting after the stack's own
+    /// services. Each service has a declaration, then per characteristic a
+    /// declaration, the value, the CCCD when notify-capable, and its
+    /// descriptors.
     fn host_start(&self) -> NativeResult<()> {
         check(
             Operation::HostStart,
             self.enter(Operation::HostStart, NativeCall::HostStart),
-        )
+        )?;
+        if let Some((handles, layout)) = self.lock().registered.take() {
+            // `next` is the next free handle; the stack's services end at 0x10.
+            let mut next = 0x0011_u16;
+            let mut slots = handles.iter();
+            for service in layout {
+                next += 1; // service declaration
+                for (notify, descriptors) in service {
+                    let value = next + 1; // after the characteristic declaration
+                    slots
+                        .next()
+                        .expect("one slot per characteristic")
+                        .store(value, Ordering::Relaxed);
+                    next = value + 1 + u16::from(notify) + descriptors as u16;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn host_stop(&self) -> NativeResult<()> {
@@ -473,6 +528,7 @@ impl Backend for FakeBackend {
             MbufRecord {
                 data: data.to_vec(),
                 state: MbufState::Live,
+                segments: vec![data.len()],
             },
         );
         Ok(FakeMbuf { id })
@@ -501,7 +557,8 @@ impl Backend for FakeBackend {
             data.len() / 2
         };
         self.with_live(mbuf.id, Operation::MbufAppend, |record| {
-            record.data.extend_from_slice(&data[..copied])
+            record.data.extend_from_slice(&data[..copied]);
+            record.segments.push(copied);
         })
         .ok_or(NativeError::Status {
             operation: Operation::MbufAppend,
@@ -630,10 +687,9 @@ impl Backend for FakeBackend {
         }
     }
 
-    /// Assigns handles as NimBLE lays out attributes, starting after the
-    /// stack's own services: each service declaration, then per
-    /// characteristic its declaration, value, the CCCD when notify-capable,
-    /// and its descriptors. (NimBLE assigns them when the host starts.)
+    /// Like `ble_gatts_count_cfg` and `ble_gatts_add_svcs`: records the
+    /// tables for the host start, which assigns handles. Both calls are
+    /// all-or-nothing.
     fn register_gatt(&self, registration: &FakeRegistration) -> NativeResult<()> {
         check(
             Operation::GattCount,
@@ -643,23 +699,23 @@ impl Backend for FakeBackend {
             Operation::GattAdd,
             self.enter(Operation::GattAdd, NativeCall::GattAdd),
         )?;
-        // `next` is the next free handle; the stack's services end at 0x10.
-        let mut next = 0x0011_u16;
-        let mut slots = registration.handles.iter();
-        for service in &registration.services {
-            next += 1; // service declaration
-            for characteristic in &service.characteristics {
-                let value = next + 1; // after the characteristic declaration
-                slots
-                    .next()
-                    .expect("one slot per characteristic")
-                    .store(value, Ordering::Relaxed);
-                next = value
-                    + 1
-                    + u16::from(characteristic.access.notify)
-                    + characteristic.descriptors.len() as u16;
-            }
-        }
+        let layout = registration
+            .services
+            .iter()
+            .map(|service| {
+                service
+                    .characteristics
+                    .iter()
+                    .map(|characteristic| {
+                        (
+                            characteristic.access.notify,
+                            characteristic.descriptors.len(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        self.lock().registered = Some((registration.handles.clone(), layout));
         Ok(())
     }
 

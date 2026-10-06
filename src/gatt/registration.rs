@@ -91,8 +91,8 @@ pub(crate) struct PlannedService {
     pub(crate) characteristics: Vec<PlannedCharacteristic>,
 }
 
-/// The services of a server in registration order. UUIDs are in their
-/// shortest form. Characteristic value handles, once assigned, are reported
+/// The services of a server in registration order. UUIDs are in their ATT
+/// form (16- or 128-bit). Characteristic value handles, once assigned, are reported
 /// in the same order as [`characteristics`](Self::characteristics).
 #[derive(Debug)]
 pub(crate) struct GattPlan {
@@ -110,21 +110,21 @@ impl GattPlan {
             .services()
             .iter()
             .map(|service| PlannedService {
-                uuid: service.uuid().shortest(),
+                uuid: service.uuid().att_form(),
                 characteristics: service
                     .characteristics()
                     .iter()
                     .map(|characteristic| {
                         endpoints.push(characteristic.endpoint().cloned());
                         PlannedCharacteristic {
-                            uuid: characteristic.uuid().shortest(),
+                            uuid: characteristic.uuid().att_form(),
                             access: characteristic.access(),
                             slot: CharacteristicSlot(characteristic),
                             descriptors: characteristic
                                 .descriptors()
                                 .iter()
                                 .map(|descriptor| PlannedDescriptor {
-                                    uuid: descriptor.uuid().shortest(),
+                                    uuid: descriptor.uuid().att_form(),
                                     access: descriptor.access(),
                                     slot: DescriptorSlot(descriptor),
                                 })
@@ -211,6 +211,16 @@ impl Target<'_> {
         }
     }
 
+    fn writable(self) -> bool {
+        match self {
+            Self::Characteristic(target) => {
+                let access = target.access();
+                access.write || access.write_without_response
+            }
+            Self::Descriptor(target) => target.access().write,
+        }
+    }
+
     fn write(self, data: &[u8]) -> Result<(), AttError> {
         match self {
             Self::Characteristic(target) => target.write(data),
@@ -250,6 +260,11 @@ pub(crate) fn serve_access<B: Backend>(
             .mbuf_append(buffer, &value)
             .map_err(|_| AttError::INSUFFICIENT_RESOURCES)
     } else {
+        // Permission comes first, so an undeclared write is refused as such
+        // whatever its length.
+        if !target.writable() {
+            return Err(AttError::WRITE_NOT_PERMITTED);
+        }
         let length = backend.mbuf_len(buffer);
         if length > target.max_len() {
             return Err(AttError::INVALID_ATTRIBUTE_VALUE_LENGTH);
@@ -428,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn the_plan_mirrors_the_hierarchy_with_shortest_uuids() {
+    fn the_plan_mirrors_the_hierarchy_with_att_form_uuids() {
         let log = Arc::default();
         let (server, endpoint) = server(&log);
         let plan = GattPlan::new(&server);
@@ -748,5 +763,168 @@ mod tests {
         ] {
             assert_eq!(AccessOp::from_code(code, &codes), op);
         }
+    }
+
+    /// Raw bytes, up to 6.
+    struct Bytes(Arc<Mutex<Vec<u8>>>);
+
+    impl Characteristic for Bytes {
+        type Value = Vec<u8>;
+        const MAX_LEN: usize = 6;
+        fn uuid(&self) -> Uuid {
+            Uuid::Uuid32(0xabcd_0001)
+        }
+    }
+
+    impl Readable for Bytes {
+        fn read(&self) -> Result<Vec<u8>, AttError> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+    }
+
+    impl Writable for Bytes {
+        fn write(&self, value: Vec<u8>) -> Result<(), AttError> {
+            *self.0.lock().unwrap() = value;
+            Ok(())
+        }
+    }
+
+    fn copies(fake: &FakeBackend) -> Vec<NativeCall> {
+        fake.calls()
+            .into_iter()
+            .filter(|call| matches!(call, NativeCall::MbufCopy { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn chained_buffers_are_read_and_written_across_segment_boundaries() {
+        let stored = Arc::new(Mutex::new(Vec::new()));
+        let definition = CharacteristicDef::new(Bytes(stored.clone()))
+            .readable()
+            .writable();
+        let server =
+            GattServer::new([Service::primary(Uuid::Uuid16(0x181c)).characteristic(definition)])
+                .unwrap();
+        let target = Target::Characteristic(server.services()[0].characteristics()[0].as_ref());
+        let fake = FakeBackend::new();
+
+        // A write spread over segments, including an empty one, is copied
+        // whole in one call and delivered intact.
+        let mut chain = fake.mbuf_from_segments(&[&[1, 2], &[], &[3], &[4, 5, 6]]);
+        assert_eq!(fake.mbuf_segments(chain.id()), Some(vec![2, 0, 1, 3]));
+        assert_eq!(
+            serve_access(
+                &fake,
+                target,
+                AccessOp::WriteCharacteristic,
+                Some(&mut chain)
+            ),
+            Ok(())
+        );
+        assert_eq!(*stored.lock().unwrap(), [1, 2, 3, 4, 5, 6]);
+        assert!(matches!(
+            copies(&fake)[..],
+            [NativeCall::MbufCopy {
+                offset: 0,
+                length: 6,
+                ..
+            }]
+        ));
+        fake.mbuf_free(chain).unwrap();
+
+        // One byte past MAX_LEN across segments is refused before copying.
+        let mut chain = fake.mbuf_from_segments(&[&[1, 2, 3], &[4, 5, 6], &[7]]);
+        assert_eq!(
+            serve_access(
+                &fake,
+                target,
+                AccessOp::WriteCharacteristic,
+                Some(&mut chain)
+            ),
+            Err(AttError::INVALID_ATTRIBUTE_VALUE_LENGTH)
+        );
+        assert_eq!(copies(&fake).len(), 1);
+        fake.mbuf_free(chain).unwrap();
+
+        // A copy failing within the chain reaches no handler.
+        fake.fail_next(Operation::MbufCopy, -1);
+        let mut chain = fake.mbuf_from_segments(&[&[9], &[9, 9]]);
+        assert_eq!(
+            serve_access(
+                &fake,
+                target,
+                AccessOp::WriteCharacteristic,
+                Some(&mut chain)
+            ),
+            Err(AttError::UNLIKELY)
+        );
+        assert_eq!(*stored.lock().unwrap(), [1, 2, 3, 4, 5, 6]);
+        fake.mbuf_free(chain).unwrap();
+
+        // A read appends after what the response buffer already holds.
+        let mut response = fake.mbuf_from_segments(&[&[0xaa]]);
+        assert_eq!(
+            serve_access(
+                &fake,
+                target,
+                AccessOp::ReadCharacteristic,
+                Some(&mut response)
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            fake.mbuf_data(response.id()),
+            Some(vec![0xaa, 1, 2, 3, 4, 5, 6])
+        );
+        fake.mbuf_free(response).unwrap();
+
+        assert_eq!(fake.assert_balanced(), Ok(()));
+        assert!(fake.violations().is_empty());
+    }
+
+    #[test]
+    fn an_undeclared_write_is_refused_before_its_length_is_checked() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (server, _) = server(&log);
+        let fake = FakeBackend::new();
+        let level = Target::Characteristic(server.services()[0].characteristics()[0].as_ref());
+        let description =
+            Target::Descriptor(server.services()[0].characteristics()[0].descriptors()[0].as_ref());
+        let oversized = vec![0; 600];
+        for (target, op) in [
+            (level, AccessOp::WriteCharacteristic),
+            (description, AccessOp::WriteDescriptor),
+        ] {
+            assert_eq!(
+                write_access(&fake, target, op, &oversized),
+                Err(AttError::WRITE_NOT_PERMITTED)
+            );
+        }
+        assert!(copies(&fake).is_empty(), "nothing was copied");
+        assert_eq!(fake.assert_balanced(), Ok(()));
+    }
+
+    #[test]
+    fn handles_are_assigned_when_the_host_starts_and_32_bit_uuids_register_as_128_bit() {
+        let stored = Arc::default();
+        let server = GattServer::new([Service::primary(Uuid::Uuid16(0x181c))
+            .characteristic(CharacteristicDef::new(Bytes(stored)).readable())])
+        .unwrap();
+        let plan = GattPlan::new(&server);
+        assert_eq!(
+            plan.services[0].characteristics[0].uuid,
+            Uuid::Uuid128(Uuid::Uuid32(0xabcd_0001).to_u128()),
+            "ATT carries only 16- and 128-bit UUIDs"
+        );
+        let fake = FakeBackend::new();
+        let registration = fake.prepare_gatt(&plan);
+        fake.register_gatt(&registration).unwrap();
+        assert_eq!(
+            fake.value_handles(&registration),
+            [0],
+            "not before the host starts"
+        );
+        fake.host_start().unwrap();
+        assert_eq!(fake.value_handles(&registration), [0x13]);
     }
 }

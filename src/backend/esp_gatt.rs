@@ -38,22 +38,19 @@ const ACCESS_CODES: AccessCodes = AccessCodes {
 /// A boxed NimBLE UUID; NimBLE keeps a pointer to its `ble_uuid_t` header.
 enum NativeUuid {
     U16(Box<bindings::ble_uuid16_t>),
-    U32(Box<bindings::ble_uuid32_t>),
     U128(Box<bindings::ble_uuid128_t>),
 }
 
 impl NativeUuid {
+    /// Register 16-bit UUIDs as such and everything else as 128-bit, the
+    /// widths ATT carries (see `Uuid::att_form`).
     fn new(uuid: Uuid) -> Self {
-        match uuid {
-            // SAFETY: the shims build a UUID value from plain arguments.
+        match uuid.att_form() {
+            // SAFETY: the shim builds a UUID value from a plain argument.
             Uuid::Uuid16(value) => {
                 Self::U16(Box::new(unsafe { bindings::argyle_nimble_uuid16(value) }))
             }
-            // SAFETY: as above.
-            Uuid::Uuid32(value) => {
-                Self::U32(Box::new(unsafe { bindings::argyle_nimble_uuid32(value) }))
-            }
-            Uuid::Uuid128(_) => {
+            uuid => {
                 let bytes = uuid.to_wire_bytes();
                 // SAFETY: `ble_uuid128_t` is plain data; zero is a valid value.
                 let mut native: Box<bindings::ble_uuid128_t> = Box::new(unsafe { zeroed() });
@@ -72,7 +69,6 @@ impl NativeUuid {
     fn header(&self) -> *const bindings::ble_uuid_t {
         match self {
             Self::U16(uuid) => &uuid.u,
-            Self::U32(uuid) => &uuid.u,
             Self::U128(uuid) => &uuid.u,
         }
     }

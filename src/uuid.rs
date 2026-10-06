@@ -186,20 +186,20 @@ impl Uuid {
         }
     }
 
-    /// The same UUID in its shortest width: a value over the Bluetooth Base
-    /// UUID becomes 16- or 32-bit. NimBLE compares UUID widths before values,
-    /// so attributes are registered in this form to match clients' requests.
+    /// The same UUID in the form ATT carries it: 16-bit when the value is a
+    /// 16-bit UUID over the Bluetooth Base UUID, otherwise 128-bit. ATT PDUs
+    /// carry only these two widths and NimBLE compares widths before values,
+    /// so attributes registered in this form match clients' requests.
     #[cfg_attr(not(any(test, argyle_nimble_esp)), allow(dead_code))]
-    pub(crate) const fn shortest(&self) -> Self {
+    pub(crate) const fn att_form(&self) -> Self {
         let value = self.to_u128();
-        if value & ((1 << 96) - 1) != BLUETOOTH_BASE_UUID & ((1 << 96) - 1) {
-            return *self;
-        }
         let short = (value >> 96) as u32;
-        if short <= u16::MAX as u32 {
+        if value & ((1 << 96) - 1) == BLUETOOTH_BASE_UUID & ((1 << 96) - 1)
+            && short <= u16::MAX as u32
+        {
             Self::Uuid16(short as u16)
         } else {
-            Self::Uuid32(short)
+            Self::Uuid128(value)
         }
     }
 
@@ -476,18 +476,21 @@ mod tests {
     }
 
     #[test]
-    fn the_shortest_form_keeps_identity_and_reduces_base_uuid_values() {
+    fn the_att_form_keeps_identity_with_only_16_and_128_bit_widths() {
         let cases = [
             (Uuid::Uuid16(0x180f), Uuid::Uuid16(0x180f)),
             (Uuid::Uuid32(0x0000_2a19), Uuid::Uuid16(0x2a19)),
-            (Uuid::Uuid32(0x0001_0002), Uuid::Uuid32(0x0001_0002)),
+            (
+                Uuid::Uuid32(0x0001_0002),
+                Uuid::Uuid128(Uuid::Uuid32(0x0001_0002).to_u128()),
+            ),
             (
                 Uuid::Uuid128(Uuid::Uuid16(0x2a19).to_u128()),
                 Uuid::Uuid16(0x2a19),
             ),
             (
                 Uuid::Uuid128(Uuid::Uuid32(0xabcd_0001).to_u128()),
-                Uuid::Uuid32(0xabcd_0001),
+                Uuid::Uuid128(Uuid::Uuid32(0xabcd_0001).to_u128()),
             ),
             (Uuid::Uuid128(NUS), Uuid::Uuid128(NUS)),
             (
@@ -495,9 +498,10 @@ mod tests {
                 Uuid::Uuid128(BLUETOOTH_BASE_UUID ^ 1),
             ),
         ];
-        for (uuid, shortest) in cases {
-            assert_eq!(uuid.shortest(), shortest, "{uuid}");
-            assert_eq!(uuid.shortest().to_u128(), uuid.to_u128());
+        for (uuid, att) in cases {
+            assert_eq!(uuid.att_form(), att, "{uuid}");
+            assert_eq!(uuid.att_form().to_u128(), uuid.to_u128());
+            assert!(!matches!(uuid.att_form(), Uuid::Uuid32(_)));
         }
     }
 

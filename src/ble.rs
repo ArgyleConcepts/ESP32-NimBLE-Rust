@@ -56,10 +56,15 @@
 //! 1. [`StartStage::HostInit`]: `nimble_port_init`, which also initializes
 //!    the Bluetooth controller, then the standard GAP and GATT services.
 //! 2. [`StartStage::Registration`]: build NimBLE's GATT tables from the
-//!    server and register them (`ble_gatts_count_cfg`, `ble_gatts_add_svcs`).
+//!    server and hand them to NimBLE (`ble_gatts_count_cfg`,
+//!    `ble_gatts_add_svcs`). This only sizes and records the services.
 //! 3. [`StartStage::InstallCallbacks`]: the host sync and reset callbacks.
-//! 4. [`StartStage::HostStart`]: the NimBLE host task, which assigns the
-//!    attribute handles.
+//! 4. [`StartStage::HostStart`]: the NimBLE host task. When it starts, NimBLE
+//!    allocates the attributes and assigns their handles. In ESP-IDF 6.1 an
+//!    allocation failure there (for example a server too large for the
+//!    configured NimBLE memory) fails an assertion on the host task instead
+//!    of returning an error: with assertions enabled the firmware aborts, and
+//!    otherwise the host never synchronizes and startup times out.
 //! 5. [`StartStage::Synchronization`]: wait until the host reports that it
 //!    is synchronized with the controller. Host resets during the wait are
 //!    recorded, and NimBLE retries synchronization by itself. If the host
@@ -1122,7 +1127,8 @@ mod tests {
         assert!(error.to_string().contains("ble_gatts_count_cfg"), "{error}");
         assert!(take(FakeBackend::new(), slot).is_ok());
 
-        // Adding failed part-way: NimBLE may hold pointers until deinit.
+        // Adding failed (it is all-or-nothing); the tables still outlive
+        // deinitialization.
         let (error, _) = failing_start(
             StartStage::Registration,
             |fake| fake.fail_next(Operation::GattAdd, 6),
@@ -1183,9 +1189,9 @@ mod tests {
             vec![NativeEvent::HostSynced],
         )
         .unwrap();
-        // The fake lays attributes out as NimBLE does, after the stack's
-        // services: service 0x11, then declaration/value (and a CCCD for
-        // notify) per characteristic.
+        // The fake assigns handles at host start, as NimBLE does, after the
+        // stack's services: service 0x11, then declaration/value (and a CCCD
+        // for notify) per characteristic.
         assert_eq!(
             running.value_handles,
             [
