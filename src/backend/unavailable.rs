@@ -61,4 +61,7 @@ impl Backend for Unavailable {
     fn infer_address_type(&self) -> NativeResult<u8> {
         match *self {}
     }
+    fn is_host_task(&self) -> bool {
+        match *self {}
+    }
 }

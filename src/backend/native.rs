@@ -280,6 +280,10 @@ pub(crate) trait Backend: Send + Sync {
     /// The own-address type to advertise with, without privacy. Valid only
     /// after the host has synchronized.
     fn infer_address_type(&self) -> NativeResult<u8>;
+    /// Whether the caller is running on the native host task. Operations that
+    /// wait for the host task, such as stopping it, would wait for themselves
+    /// there; this covers every native callback, not only dispatched events.
+    fn is_host_task(&self) -> bool;
 }
 
 #[cfg(test)]

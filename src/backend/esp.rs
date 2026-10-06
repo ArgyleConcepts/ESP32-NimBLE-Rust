@@ -125,7 +125,13 @@ extern "C" fn on_gap_event(event: *mut bindings::ble_gap_event, _argument: *mut 
 /// advertising ticket).
 pub(crate) const GAP_EVENT_CALLBACK: bindings::ble_gap_event_fn = Some(on_gap_event);
 
+std::thread_local! {
+    /// Set on the NimBLE host task, where every native callback runs.
+    static ON_HOST_TASK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 extern "C" fn host_task(_argument: *mut c_void) {
+    ON_HOST_TASK.with(|flag| flag.set(true));
     // SAFETY: called on the task NimBLE created for the host; `nimble_port_run`
     // returns after `nimble_port_stop`, and the task must then delete itself.
     unsafe {
@@ -137,8 +143,8 @@ extern "C" fn host_task(_argument: *mut c_void) {
 /// An owned native buffer chain.
 pub(crate) struct EspMbuf(NonNull<bindings::os_mbuf>);
 
-/// The ESP-IDF NimBLE host. There is one native host per firmware; callers
-/// own its lifecycle (see the controller in later tickets).
+/// The ESP-IDF NimBLE host. There is one native host per firmware; the
+/// [`Ble`](crate::Ble) owner controls its lifecycle.
 pub(crate) struct EspBackend;
 
 impl Backend for EspBackend {
@@ -289,6 +295,10 @@ impl Backend for EspBackend {
             bindings::ble_hs_id_infer_auto(0, &mut address_type)
         })?;
         Ok(address_type)
+    }
+
+    fn is_host_task(&self) -> bool {
+        ON_HOST_TASK.with(std::cell::Cell::get)
     }
 
     fn mtu(&self, connection: u16) -> Option<u16> {

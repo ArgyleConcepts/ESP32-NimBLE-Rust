@@ -63,8 +63,9 @@
 //!    has not synchronized within the sync timeout ([`DEFAULT_SYNC_TIMEOUT`]
 //!    unless configured), startup fails with an
 //!    [`ErrorKind::Timeout`] error, the last reset
-//!    reason, and the host is shut down. A timeout too large to represent as
-//!    a deadline waits without a limit.
+//!    reason, and the host is shut down. Timeouts below
+//!    [`MIN_SYNC_TIMEOUT`] are raised to it, and a timeout too large to
+//!    represent as a deadline waits without a limit.
 //! 5. [`StartStage::AddressInference`]: choose the own-address type to
 //!    advertise with, without privacy.
 //!
@@ -78,20 +79,30 @@
 //! On a failed start, on drop, and in [`Ble::shutdown`], the framework undoes
 //! only the stages it completed, in reverse: stop the host task,
 //! deinitialize the host, then remove the callbacks and free the storage.
-//! If `nimble_port_init` fails (for example because the application already
-//! initialized NimBLE), nothing is deinitialized, so resources the
-//! application owns are left alone.
+//! If `nimble_port_init` fails, nothing is deinitialized, so resources the
+//! application owns are left alone. With the on-chip controller enabled
+//! (`CONFIG_BT_CONTROLLER_ENABLED`, the configuration Phase 1 targets), a
+//! NimBLE stack the application already initialized makes it fail that way;
+//! without the controller, ESP-IDF has no such guard, so the application
+//! must not initialize NimBLE itself. After a released failure,
+//! [`StartError::into_server`] returns the GATT server for another attempt.
 //!
 //! The framework never initializes, erases, or repairs NVS. If the
 //! application's configuration uses NVS (for example PHY calibration data
 //! or persisted host state), the application initializes it first and keeps
 //! ownership of it.
 //!
-//! If a cleanup step fails, or cleanup would run inside a BLE callback on
-//! the host task (where stopping the host would wait for itself), the host
+//! If a cleanup step fails, or cleanup would run on the host task (in any
+//! BLE callback, where stopping the host would wait for itself), the host
 //! is **poisoned**: the framework keeps its storage alive for the rest of the
 //! program so native code can never reach freed memory, and every later
-//! [`Ble::take`] fails until the device restarts.
+//! [`Ble::take`] fails until the device restarts. The error reports which
+//! step failed. A host task that has not started its host by the time a
+//! sync wait ends cannot be stopped, which also poisons.
+//!
+//! Stopping the host waits for the host task to finish its queued work.
+//! Do not drop or shut down a running owner while holding a lock that a BLE
+//! callback may take, or the two will wait for each other.
 //!
 //! Recovery from host faults while running, and quiescing connections and
 //! notifications before shutdown, are not implemented yet.
@@ -113,6 +124,11 @@ use std::time::{Duration, Instant};
 /// How long [`Ble::start`] waits for host synchronization unless
 /// [`Ble::sync_timeout`] sets another limit.
 pub const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The shortest sync timeout [`Ble::sync_timeout`] accepts; shorter values
+/// are raised to it. A host task that has not even started its host when
+/// the wait ends cannot be stopped cleanly, which poisons the host.
+pub const MIN_SYNC_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SlotState {
@@ -289,7 +305,7 @@ pub(crate) fn take<B: Backend>(
 
 impl<B: Backend> Configured<B> {
     pub(crate) fn set_sync_timeout(&mut self, timeout: Duration) {
-        self.sync_timeout = timeout;
+        self.sync_timeout = timeout.max(MIN_SYNC_TIMEOUT);
     }
 
     pub(crate) fn start(self, server: GattServer) -> Result<Started<B>, StartError> {
@@ -371,44 +387,70 @@ impl<B: Backend> Started<B> {
     }
 
     fn fail(mut self, stage: StartStage, cause: Error, last_host_reset: Option<i32>) -> StartError {
-        let cleanup = self.shutdown();
+        let (cleanup, server, cleanup_error) = match self.shutdown() {
+            Ok(server) => (Cleanup::Released, server, None),
+            Err(error) => (Cleanup::Poisoned, None, Some(error)),
+        };
         StartError {
-            stage,
-            cause,
-            cleanup,
-            last_host_reset,
+            inner: Box::new(StartFailure {
+                stage,
+                cause,
+                cleanup,
+                cleanup_error,
+                last_host_reset,
+                server,
+            }),
         }
     }
 
-    /// Undo the completed stages in reverse and release ownership, or
-    /// poison the host and keep the storage alive if that cannot be done.
-    /// Later calls do nothing.
-    pub(crate) fn shutdown(&mut self) -> Cleanup {
+    /// Undo the completed stages in reverse and release ownership, returning
+    /// the GATT server, which native code no longer references. If a step
+    /// fails, or this runs on the host task, the host is poisoned instead:
+    /// the storage stays alive and the error explains why. Later calls do
+    /// nothing and return `Ok(None)`.
+    pub(crate) fn shutdown(&mut self) -> Result<Option<GattServer>, Error> {
         let Some(ownership) = self.ownership.take() else {
-            return Cleanup::Released;
+            return Ok(None);
         };
         let core = self.core.take().expect("storage exists until shutdown");
-        // On the host task, stopping the host would wait for itself.
-        let mut clean = !core.dispatcher.is_delivering_on_current_thread();
-        if clean && self.progress.started {
-            clean = self.backend.host_stop().is_ok();
+        match self.undo(&core) {
+            Ok(()) => {
+                let Core { server, .. } = *core;
+                drop(ownership);
+                Ok(Some(server))
+            }
+            Err(cause) => {
+                // Native code may still reach the storage or the callbacks.
+                Box::leak(core);
+                ownership.poison();
+                Err(Error::poisoned(cause))
+            }
         }
-        if clean && self.progress.initialized {
-            clean = self.backend.host_deinit().is_ok();
+    }
+
+    fn undo(&mut self, core: &Core) -> Result<(), Error> {
+        // On the host task, which runs every native callback, stopping the
+        // host would wait for itself.
+        if self.backend.is_host_task() || core.dispatcher.is_delivering_on_current_thread() {
+            return Err(Error::new(
+                ErrorKind::Lifecycle,
+                Some("shutdown"),
+                "the host cannot be shut down from its own task or a BLE callback",
+            ));
         }
-        if clean && self.progress.callbacks {
-            clean = self.backend.remove_callbacks().is_ok();
+        if self.progress.started {
+            self.backend.host_stop()?;
+            self.progress.started = false;
         }
-        if clean {
-            drop(core);
-            drop(ownership);
-            Cleanup::Released
-        } else {
-            // Native code may still reach the storage or the callbacks.
-            Box::leak(core);
-            ownership.poison();
-            Cleanup::Poisoned
+        if self.progress.initialized {
+            self.backend.host_deinit()?;
+            self.progress.initialized = false;
         }
+        if self.progress.callbacks {
+            self.backend.remove_callbacks()?;
+            self.progress.callbacks = false;
+        }
+        Ok(())
     }
 }
 
@@ -424,7 +466,7 @@ impl<B: Backend> fmt::Debug for Started<B> {
 
 impl<B: Backend> Drop for Started<B> {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown();
     }
 }
 
@@ -484,32 +526,51 @@ pub enum Cleanup {
 /// of cleanup.
 #[derive(Debug)]
 pub struct StartError {
+    // Boxed to keep `Result<Ble<Running>, StartError>` small.
+    inner: Box<StartFailure>,
+}
+
+#[derive(Debug)]
+struct StartFailure {
     stage: StartStage,
     cause: Error,
     cleanup: Cleanup,
+    cleanup_error: Option<Error>,
     last_host_reset: Option<i32>,
+    server: Option<GattServer>,
 }
 
 impl StartError {
     /// The stage that failed.
     pub fn stage(&self) -> StartStage {
-        self.stage
+        self.inner.stage
     }
 
     /// The underlying failure, also available as the error source.
     pub fn error(&self) -> &Error {
-        &self.cause
+        &self.inner.cause
     }
 
     /// Whether ownership was released or the host is poisoned.
     pub fn cleanup(&self) -> Cleanup {
-        self.cleanup
+        self.inner.cleanup
+    }
+
+    /// Why cleanup failed, when the host is poisoned.
+    pub fn cleanup_error(&self) -> Option<&Error> {
+        self.inner.cleanup_error.as_ref()
+    }
+
+    /// Recover the GATT server for another attempt. It is returned when
+    /// cleanup released the host; a poisoned host keeps it alive instead.
+    pub fn into_server(self) -> Option<GattServer> {
+        self.inner.server
     }
 
     /// The reason of the last host reset seen while waiting for
     /// synchronization, if any: a NimBLE host status, for diagnosis.
     pub fn last_host_reset(&self) -> Option<i32> {
-        self.last_host_reset
+        self.inner.last_host_reset
     }
 }
 
@@ -518,12 +579,12 @@ impl fmt::Display for StartError {
         write!(
             formatter,
             "BLE startup failed at {}: {}",
-            self.stage, self.cause
+            self.inner.stage, self.inner.cause
         )?;
-        if let Some(reason) = self.last_host_reset {
+        if let Some(reason) = self.inner.last_host_reset {
             write!(formatter, " (last host reset reason {reason})")?;
         }
-        formatter.write_str(match self.cleanup {
+        formatter.write_str(match self.inner.cleanup {
             Cleanup::Released => "; the host was released",
             Cleanup::Poisoned => "; cleanup failed and the host is poisoned",
         })
@@ -532,7 +593,7 @@ impl fmt::Display for StartError {
 
 impl std::error::Error for StartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.cause)
+        Some(&self.inner.cause)
     }
 }
 
@@ -612,17 +673,12 @@ impl Ble<Running> {
     /// Shut the host down and release ownership, reporting whether cleanup
     /// succeeded. Dropping the owner does the same without a report.
     ///
-    /// Fails with an [`ErrorKind::Lifecycle`]
-    /// error if a cleanup step failed and the host is now poisoned.
+    /// Fails with an [`ErrorKind::Lifecycle`] error if the host is now
+    /// poisoned; its [`source`](std::error::Error::source) is the cleanup
+    /// failure. Call it from an application thread, never from a BLE
+    /// callback or the host task.
     pub fn shutdown(mut self) -> Result<(), Error> {
-        match self.state.inner.shutdown() {
-            Cleanup::Released => Ok(()),
-            Cleanup::Poisoned => Err(Error::new(
-                ErrorKind::Lifecycle,
-                Some("shutdown"),
-                "the host could not be shut down cleanly and is poisoned",
-            )),
-        }
+        self.state.inner.shutdown().map(drop)
     }
 }
 
@@ -653,7 +709,7 @@ mod tests {
     use std::sync::Barrier;
     use std::thread;
 
-    fn slot() -> &'static OwnerSlot {
+    fn new_slot() -> &'static OwnerSlot {
         Box::leak(Box::new(OwnerSlot::new()))
     }
 
@@ -729,7 +785,7 @@ mod tests {
 
     #[test]
     fn only_one_owner_exists_at_a_time() {
-        let slot = slot();
+        let slot = new_slot();
         let fake = FakeBackend::new();
         let first = take(fake.clone(), slot).unwrap();
         let second = take(fake.clone(), slot).unwrap_err();
@@ -743,7 +799,7 @@ mod tests {
     #[test]
     fn concurrent_acquisition_yields_exactly_one_owner() {
         for _ in 0..20 {
-            let slot = slot();
+            let slot = new_slot();
             let barrier = Arc::new(Barrier::new(8));
             let attempts: Vec<_> = (0..8)
                 .map(|_| {
@@ -767,7 +823,7 @@ mod tests {
 
     #[test]
     fn a_running_owner_exists_only_after_sync_and_address_inference() {
-        let slot = slot();
+        let slot = new_slot();
         let fake = FakeBackend::new();
         let (server, freed_after) = witness_server(&fake);
         let configured = take(fake.clone(), slot).unwrap();
@@ -792,7 +848,7 @@ mod tests {
     fn resets_before_sync_are_survived_and_recorded() {
         let fake = FakeBackend::new();
         let (server, _) = witness_server(&fake);
-        let configured = take(fake.clone(), slot()).unwrap();
+        let configured = take(fake.clone(), new_slot()).unwrap();
         let events = vec![
             NativeEvent::HostReset { reason: 19 },
             NativeEvent::HostSynced,
@@ -808,7 +864,7 @@ mod tests {
         events: Vec<NativeEvent>,
         expected: &[NativeCall],
     ) -> (StartError, &'static OwnerSlot) {
-        let slot = slot();
+        let slot = new_slot();
         let fake = FakeBackend::new();
         setup(&fake);
         let (server, freed_after) = witness_server(&fake);
@@ -822,11 +878,12 @@ mod tests {
         assert_eq!(error.stage(), stage);
         assert_eq!(fake.calls(), expected, "{stage}");
         if error.cleanup() == Cleanup::Released {
-            assert_eq!(
-                freed_after.lock().unwrap().as_deref(),
-                Some(expected),
-                "freed only after every undo step"
+            assert!(error.cleanup_error().is_none());
+            assert!(
+                freed_after.lock().unwrap().is_none(),
+                "the server is handed back after every undo step, not freed"
             );
+            assert!(error.inner.server.is_some());
         }
         (error, slot)
     }
@@ -919,12 +976,22 @@ mod tests {
         let fake = FakeBackend::new();
         fake.fail_next(Operation::HostStop, 2);
         let (server, freed_after) = witness_server(&fake);
-        let slot = slot();
+        let slot = new_slot();
         let mut configured = take(fake.clone(), slot).unwrap();
         configured.set_sync_timeout(Duration::from_millis(10));
         let error = start_with(&fake, configured, server, vec![]).unwrap_err();
         assert_eq!(error.cleanup(), Cleanup::Poisoned);
         assert!(error.to_string().ends_with("the host is poisoned"));
+        let cleanup_error = error.cleanup_error().expect("the cleanup failure is kept");
+        assert_eq!(cleanup_error.kind(), ErrorKind::Lifecycle);
+        assert!(
+            cleanup_error.to_string().contains("nimble_port_stop"),
+            "{cleanup_error}"
+        );
+        assert!(
+            error.inner.server.is_none(),
+            "a poisoned host keeps the server alive"
+        );
         assert_eq!(
             fake.calls(),
             [HostInit, InstallCallbacks, HostStart, HostStop]
@@ -941,60 +1008,151 @@ mod tests {
             .contains("cannot be used again until restart"));
     }
 
+    fn started_owner(
+        fake: &FakeBackend,
+        slot: &'static OwnerSlot,
+    ) -> (Started<FakeBackend>, FreedAfter) {
+        let (server, freed_after) = witness_server(fake);
+        let configured = take(fake.clone(), slot).unwrap();
+        let running = start_with(fake, configured, server, vec![NativeEvent::HostSynced]).unwrap();
+        (running, freed_after)
+    }
+
     #[test]
     fn explicit_shutdown_reports_success_and_failure() {
         let fake = FakeBackend::new();
-        let (server, _) = witness_server(&fake);
-        let slot = slot();
-        let mut running = start_with(
-            &fake,
-            take(fake.clone(), slot).unwrap(),
-            server,
-            vec![NativeEvent::HostSynced],
-        )
-        .unwrap();
-        assert_eq!(running.shutdown(), Cleanup::Released);
-        assert_eq!(
-            running.shutdown(),
-            Cleanup::Released,
+        let slot = new_slot();
+        let (mut running, _) = started_owner(&fake, slot);
+        assert!(running.shutdown().unwrap().is_some());
+        assert!(
+            running.shutdown().unwrap().is_none(),
             "a second shutdown does nothing"
         );
         drop(running);
         assert_eq!(fake.calls().len(), STARTUP.len() + TEARDOWN.len());
 
         let fake = FakeBackend::new();
-        let (server, freed_after) = witness_server(&fake);
-        let mut running = start_with(
-            &fake,
-            take(fake.clone(), slot).unwrap(),
-            server,
-            vec![NativeEvent::HostSynced],
-        )
-        .unwrap();
+        let (mut running, freed_after) = started_owner(&fake, slot);
         fake.fail_next(Operation::HostDeinit, 3);
-        assert_eq!(running.shutdown(), Cleanup::Poisoned);
+        let error = running.shutdown().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Lifecycle);
+        assert!(error.to_string().contains("is poisoned"), "{error}");
+        let source = std::error::Error::source(&error).expect("the failed step");
+        assert!(
+            source.to_string().contains("nimble_port_deinit"),
+            "{source}"
+        );
         assert!(freed_after.lock().unwrap().is_none());
         assert!(take(fake, slot).is_err());
     }
 
     #[test]
-    fn shutdown_inside_a_callback_poisons_without_native_calls() {
+    fn a_released_failure_returns_the_server_for_a_restart() {
         let fake = FakeBackend::new();
+        let slot = new_slot();
+        fake.fail_next(Operation::InferAddress, 6);
         let (server, freed_after) = witness_server(&fake);
-        let slot = slot();
+        let error = start_with(
+            &fake,
+            take(fake.clone(), slot).unwrap(),
+            server,
+            vec![NativeEvent::HostSynced],
+        )
+        .unwrap_err();
+        let server = error.into_server().expect("released");
+        // The same callback slot and owner slot work again.
         let mut running = start_with(
             &fake,
             take(fake.clone(), slot).unwrap(),
             server,
             vec![NativeEvent::HostSynced],
         )
-        .unwrap();
+        .expect("restart");
+        assert!(running.shutdown().unwrap().is_some());
+        let mut expected = STARTUP.to_vec();
+        expected.extend(TEARDOWN);
+        assert_eq!(fake.calls()[expected.len()..], expected[..]);
+        assert!(take(fake, slot).is_ok());
+        assert!(freed_after.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn shutdown_inside_a_callback_poisons_without_native_calls() {
+        let fake = FakeBackend::new();
+        let slot = new_slot();
+        let (mut running, freed_after) = started_owner(&fake, slot);
         let dispatcher = running.core().dispatcher.clone();
         let delivery = dispatcher.begin().expect("the sink is attached");
-        assert_eq!(running.shutdown(), Cleanup::Poisoned);
+        let error = running.shutdown().unwrap_err();
+        assert!(std::error::Error::source(&error)
+            .unwrap()
+            .to_string()
+            .contains("BLE callback"));
         drop(delivery);
         assert_eq!(fake.calls(), STARTUP, "stopping would wait for itself");
         assert!(freed_after.lock().unwrap().is_none());
+
+        // Dropping the owner inside a callback poisons the same way.
+        let fake = FakeBackend::new();
+        let slot = new_slot();
+        let (running, freed_after) = started_owner(&fake, slot);
+        let dispatcher = running.core().dispatcher.clone();
+        let delivery = dispatcher.begin().expect("the sink is attached");
+        drop(running);
+        drop(delivery);
+        assert_eq!(fake.calls(), STARTUP);
+        assert!(freed_after.lock().unwrap().is_none());
+        assert!(take(fake, slot).is_err());
+    }
+
+    #[test]
+    fn shutdown_on_the_host_task_poisons_without_native_calls() {
+        let fake = FakeBackend::new();
+        let slot = new_slot();
+        let (running, freed_after) = started_owner(&fake, slot);
+        // Any native callback (such as a future GATT access) runs there,
+        // with or without the event dispatcher.
+        fake.set_host_thread(thread::current().id());
+        drop(running);
+        assert_eq!(fake.calls(), STARTUP);
+        assert!(freed_after.lock().unwrap().is_none());
+        assert!(take(fake, slot).is_err());
+    }
+
+    #[test]
+    fn events_during_teardown_reach_live_storage() {
+        let fake = FakeBackend::new();
+        let slot = new_slot();
+        let (running, freed_after) = started_owner(&fake, slot);
+        let gate = fake.hold(Operation::HostStop);
+        let stopping = thread::spawn(move || drop(running));
+        gate.wait_entered();
+        // A late callback while the host stops is still delivered safely.
+        assert_eq!(
+            fake.inject(NativeEvent::HostSynced),
+            Some(crate::backend::dispatch::Delivery::Delivered)
+        );
+        assert!(freed_after.lock().unwrap().is_none());
+        gate.release();
+        stopping.join().unwrap();
+        assert!(freed_after.lock().unwrap().is_some());
+        assert_eq!(
+            fake.inject(NativeEvent::HostSynced),
+            None,
+            "callbacks removed"
+        );
+        assert!(take(fake, slot).is_ok());
+    }
+
+    #[test]
+    fn very_short_sync_timeouts_are_raised_to_the_minimum() {
+        let mut configured = take(FakeBackend::new(), new_slot()).unwrap();
+        configured.set_sync_timeout(Duration::ZERO);
+        assert_eq!(configured.sync_timeout, MIN_SYNC_TIMEOUT);
+        configured.set_sync_timeout(Duration::from_secs(9));
+        assert_eq!(configured.sync_timeout, Duration::from_secs(9));
+        configured.set_sync_timeout(Duration::MAX);
+        assert_eq!(configured.sync_timeout, Duration::MAX);
     }
 
     #[test]
@@ -1003,7 +1161,7 @@ mod tests {
         let (server, _) = witness_server(&fake);
         let running = start_with(
             &fake,
-            take(fake.clone(), slot()).unwrap(),
+            take(fake.clone(), new_slot()).unwrap(),
             server,
             vec![NativeEvent::HostSynced],
         )

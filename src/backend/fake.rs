@@ -159,6 +159,7 @@ struct FakeState {
     holds: HashMap<Operation, Hold>,
     notifications: Vec<(u16, u16, Vec<u8>)>,
     mtu: HashMap<u16, u16>,
+    host_thread: Option<std::thread::ThreadId>,
 }
 
 /// Cheaply cloneable handle to one shared fake host.
@@ -207,6 +208,11 @@ impl FakeBackend {
             .holds
             .insert(operation, Hold { gate: gate.clone() });
         gate
+    }
+
+    /// Treat `thread` as the native host task.
+    pub(crate) fn set_host_thread(&self, thread: std::thread::ThreadId) {
+        self.lock().host_thread = Some(thread);
     }
 
     pub(crate) fn set_mtu(&self, connection: u16, mtu: u16) {
@@ -537,6 +543,10 @@ impl Backend for FakeBackend {
     fn mtu(&self, connection: u16) -> Option<u16> {
         self.enter(Operation::Mtu, NativeCall::Mtu { connection });
         self.lock().mtu.get(&connection).copied()
+    }
+
+    fn is_host_task(&self) -> bool {
+        self.lock().host_thread == Some(std::thread::current().id())
     }
 
     /// Reports a public address (type 0) unless a failure is scripted.

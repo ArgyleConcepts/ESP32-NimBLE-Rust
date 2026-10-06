@@ -27,8 +27,9 @@ the BLE boundary and the declaration of a GATT server:
   address inference, reporting a structured `StartError` per stage. Cleanup
   never frees storage native code can reach and never touches NVS.
 
-The startup path compiles for ESP32-C3 and ESP32-S3 and is tested on the host
-against a fake backend; it has **not been run on hardware**. It has **no NimBLE
+The firmware fixtures compile the startup path for ESP32-C3 and ESP32-S3, and
+host tests drive it against a fake backend; it has **not been run on
+hardware**. It has **no NimBLE
 registration of GATT definitions, advertising, connection handling, or
 published package**. See the rustdoc on each type for contracts and examples. Its private,
 versioned ESP-IDF build-context contract can validate the configured SDK,

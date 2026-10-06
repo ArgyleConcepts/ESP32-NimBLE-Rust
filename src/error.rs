@@ -280,6 +280,8 @@ enum Cause {
     Encode(EncodeError),
     // Boxed so the common error paths stay small.
     Definition(Box<DefinitionLocation>),
+    // The cleanup failure that poisoned the host.
+    Poisoned(Box<Error>),
 }
 
 #[derive(Debug)]
@@ -339,6 +341,16 @@ impl Error {
     }
 }
 
+impl Error {
+    /// The host is poisoned because cleanup failed with `cause`.
+    pub(crate) fn poisoned(cause: Error) -> Self {
+        Self {
+            kind: ErrorKind::Lifecycle,
+            cause: Cause::Poisoned(Box::new(cause)),
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.cause {
@@ -369,6 +381,11 @@ impl fmt::Display for Error {
                 operation: None,
                 message,
             } => write!(formatter, "{}: {message}", self.kind),
+            Cause::Poisoned(cause) => write!(
+                formatter,
+                "{}: the BLE host could not be shut down cleanly and is poisoned: {cause}",
+                self.kind
+            ),
             Cause::Backend(error) => write!(formatter, "{}: {error}", self.kind),
             Cause::Encode(error) => write!(formatter, "{}: {error}", self.kind),
         }
@@ -381,6 +398,7 @@ impl std::error::Error for Error {
             Cause::Message { .. } | Cause::Definition(_) => None,
             Cause::Backend(error) => Some(error),
             Cause::Encode(error) => Some(error),
+            Cause::Poisoned(cause) => Some(cause.as_ref()),
         }
     }
 }
