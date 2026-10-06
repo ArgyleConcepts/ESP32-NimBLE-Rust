@@ -319,12 +319,14 @@ pub(crate) trait Backend: Clone + Send + Sync + 'static {
     /// Start connectable, generally discoverable legacy advertising without
     /// a time limit, with NimBLE's default intervals. Its GAP events, and
     /// those of a connection it accepts, reach the installed dispatcher.
-    /// Starting while advertising is already active succeeds. Nothing is
-    /// delivered from inside this call.
-    fn advertising_start(&self, address_type: u8) -> NativeResult<()>;
-    /// Stop advertising. Stopping when advertising is not active succeeds.
-    /// Nothing is delivered from inside this call.
-    fn advertising_stop(&self) -> NativeResult<()>;
+    /// Returns whether a new advertising procedure started: starting while
+    /// one is already active succeeds without starting another (NimBLE's
+    /// `BLE_HS_EALREADY`). Nothing is delivered from inside this call.
+    fn advertising_start(&self, address_type: u8) -> NativeResult<bool>;
+    /// Stop advertising, returning whether an advertising procedure was
+    /// active; stopping when none is succeeds (`BLE_HS_EALREADY`). Nothing
+    /// is delivered from inside this call.
+    fn advertising_stop(&self) -> NativeResult<bool>;
     /// Whether the host is synchronized with the controller now. It turns
     /// false at the start of a host reset, before the reset's GAP events and
     /// reset callback are delivered.

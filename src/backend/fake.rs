@@ -71,11 +71,6 @@ impl Gate {
         self.wait_for("the worker's arrival", |state| state.0);
     }
 
-    /// Whether a worker has arrived at the gate.
-    pub(crate) fn entered(&self) -> bool {
-        self.lock().0
-    }
-
     pub(crate) fn release(&self) {
         self.lock().1 = true;
         self.changed.notify_all();
@@ -493,10 +488,11 @@ impl FakeBackend {
         self.inject(NativeEvent::Gap(event))
     }
 
-    /// Like an HCI command from a task other than NimBLE's: a scripted
-    /// result, or `BLE_HS_ENOTSYNCED` (22) while the host is not
-    /// synchronized (`ble_hs_hci_cmd_send_buf`), checked when the call
-    /// proceeds past any hold.
+    /// Like an HCI command from an application task: a scripted result, or
+    /// `BLE_HS_ENOTSYNCED` (22) while the host is not synchronized
+    /// (`ble_hs_hci_cmd_send_buf` refuses every task while the sync state is
+    /// bad and other tasks while it brings the controller up), checked when
+    /// the call proceeds past any hold.
     fn enter_hci(&self, operation: Operation, call: NativeCall) -> i32 {
         let code = self.enter(operation, call);
         if code == 0 && !self.lock().synced {
@@ -784,16 +780,21 @@ impl Backend for FakeBackend {
         check(Operation::Notify, code)
     }
 
-    /// Like `ble_gap_terminate`: an unknown link fails with
-    /// `BLE_HS_ENOTCONN` (7), a link the controller already dropped with HCI
-    /// Unknown Connection Identifier (0x202), and a repeated request succeeds
-    /// as the ESP backend maps `BLE_HS_EALREADY`; a scripted result wins.
+    /// Like `ble_gap_terminate`: a scripted result wins; otherwise an
+    /// unknown link fails with `BLE_HS_ENOTCONN` (7) before any HCI command,
+    /// a repeated request succeeds (the ESP backend maps `BLE_HS_EALREADY`),
+    /// the HCI command is refused with `BLE_HS_ENOTSYNCED` (22) while the
+    /// host is not synchronized, and a link the controller already dropped
+    /// fails with HCI Unknown Connection Identifier (0x202).
     fn terminate(&self, connection: u16) -> NativeResult<()> {
-        let code = self.enter_hci(Operation::Terminate, NativeCall::Terminate { connection });
+        let code = self.enter(Operation::Terminate, NativeCall::Terminate { connection });
         let mut state = self.lock();
+        let synced = state.synced;
         let code = match state.links.get_mut(&connection) {
             _ if code != 0 => code,
             None => 7,
+            Some(link) if link.terminating => 0,
+            Some(_) if !synced => 22,
             Some(link) if link.controller_gone => 0x202,
             Some(link) => {
                 link.terminating = true;
@@ -834,24 +835,36 @@ impl Backend for FakeBackend {
         )
     }
 
-    /// Starting while advertising succeeds, as the ESP backend maps
-    /// `BLE_HS_EALREADY`.
-    fn advertising_start(&self, address_type: u8) -> NativeResult<()> {
-        let code = self.enter_hci(
+    /// Like `ble_gap_adv_start`: while advertising, it succeeds without a
+    /// new procedure (`BLE_HS_EALREADY`); while the host is not synchronized
+    /// after a reset, it fails with `BLE_HS_ENOADDR` (21), as
+    /// `ble_hs_id_use_addr` finds the identity addresses `ble_hs_id_reset`
+    /// cleared before any HCI command.
+    fn advertising_start(&self, address_type: u8) -> NativeResult<bool> {
+        let code = self.enter(
             Operation::AdvertisingStart,
             NativeCall::AdvertisingStart { address_type },
         );
+        let mut state = self.lock();
+        let code = match code {
+            0 if state.advertising => return Ok(false),
+            0 if !state.synced => 21,
+            code => code,
+        };
         if code == 0 {
-            self.lock().advertising = true;
+            state.advertising = true;
         }
-        check(Operation::AdvertisingStart, code)
+        drop(state);
+        check(Operation::AdvertisingStart, code).map(|()| true)
     }
 
-    fn advertising_stop(&self) -> NativeResult<()> {
+    /// Like `ble_gap_adv_stop`: the HCI disable can fail (`BLE_HS_ENOTSYNCED`
+    /// while unsynchronized) before the advertising state is cleared;
+    /// otherwise it returns whether advertising was active.
+    fn advertising_stop(&self) -> NativeResult<bool> {
         let code = self.enter_hci(Operation::AdvertisingStop, NativeCall::AdvertisingStop);
-        // NimBLE stops the controller before it can fail.
-        self.lock().advertising = false;
-        check(Operation::AdvertisingStop, code)
+        check(Operation::AdvertisingStop, code)?;
+        Ok(std::mem::replace(&mut self.lock().advertising, false))
     }
 
     fn is_synced(&self) -> bool {
@@ -990,7 +1003,7 @@ mod tests {
         assert_eq!(fake.mtu(1), Some(185));
         assert_eq!(fake.mtu(2), None);
         assert_eq!(fake.terminate(1), Ok(()));
-        assert_eq!(fake.advertising_stop(), Ok(()));
+        assert_eq!(fake.advertising_stop(), Ok(false));
         assert_eq!(fake.host_stop(), Ok(()));
         assert_eq!(fake.host_deinit(), Ok(()));
         assert_eq!(
@@ -1374,19 +1387,33 @@ mod tests {
     }
 
     #[test]
-    fn hci_commands_are_refused_while_the_host_is_not_synchronized() {
+    fn native_calls_are_refused_while_the_host_is_not_synchronized() {
         let fake = FakeBackend::new();
-        let refused =
-            |result: NativeResult<()>| matches!(result, Err(NativeError::Status { code: 22, .. }));
-        assert!(refused(fake.set_advertising_data(&[])));
-        assert!(refused(fake.set_scan_response_data(&[])));
-        assert!(refused(fake.advertising_start(0)));
-        assert!(refused(fake.advertising_stop()));
-        assert!(refused(fake.terminate(1)));
+        let refused = |code: i32, result: NativeResult<()>| matches!(result, Err(NativeError::Status { code: actual, .. }) if actual == code);
+        // HCI commands are refused; starting advertising fails earlier, on
+        // the identity address a reset cleared; terminating an unknown link
+        // fails before any command.
+        assert!(refused(22, fake.set_advertising_data(&[])));
+        assert!(refused(22, fake.set_scan_response_data(&[])));
+        assert!(refused(21, fake.advertising_start(0).map(drop)));
+        assert!(refused(22, fake.advertising_stop().map(drop)));
+        assert!(refused(7, fake.terminate(1)));
+        fake.set_mtu(1, 23);
+        assert!(refused(22, fake.terminate(1)));
         assert!(!fake.is_advertising());
         fake.set_synced(true);
-        assert_eq!(fake.advertising_start(0), Ok(()));
+        assert_eq!(fake.advertising_start(0), Ok(true));
+        assert_eq!(fake.advertising_start(0), Ok(false), "already advertising");
         assert!(fake.is_advertising());
+        // A refused stop leaves advertising running.
+        fake.set_synced(false);
+        assert!(refused(22, fake.advertising_stop().map(drop)));
+        assert!(fake.is_advertising());
+        fake.set_synced(true);
+        assert_eq!(fake.advertising_stop(), Ok(true));
+        assert_eq!(fake.advertising_stop(), Ok(false));
+        assert_eq!(fake.terminate(1), Ok(()));
+        assert_eq!(fake.terminate(1), Ok(()), "already terminating");
     }
 
     #[test]
@@ -1400,7 +1427,7 @@ mod tests {
         };
         held.wait_entered();
         // Other operations proceed while HostStop is held.
-        assert_eq!(fake.advertising_stop(), Ok(()));
+        assert_eq!(fake.advertising_stop(), Ok(false));
         held.release();
         assert_eq!(stopping.join().unwrap(), Ok(()));
         // The hold was consumed; a second stop does not block.

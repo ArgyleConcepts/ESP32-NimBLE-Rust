@@ -14,7 +14,7 @@ use super::native::{
 };
 use crate::ble::advertising::{ad, LEGACY_PAYLOAD_CAPACITY};
 use crate::ble::connection::{
-    ATT_CHANNEL, ATT_DEFAULT_MTU, HCI_STATUS_BASE, HOST_EAGAIN, HOST_ENOTCONN, HOST_ENOTSYNCED,
+    ATT_CHANNEL, ATT_DEFAULT_MTU, HCI_STATUS_BASE, HOST_EAGAIN, HOST_ENOTCONN,
 };
 use crate::error::ATT_STATUS_BASE;
 use crate::AttError;
@@ -89,7 +89,6 @@ const _: () = {
     assert!(HCI_STATUS_BASE as u32 == bindings::BLE_HS_ERR_HCI_BASE as u32);
     assert!(HOST_EAGAIN as u32 == bindings::BLE_HS_EAGAIN as u32);
     assert!(HOST_ENOTCONN as u32 == bindings::BLE_HS_ENOTCONN as u32);
-    assert!(HOST_ENOTSYNCED as u32 == bindings::BLE_HS_ENOTSYNCED as u32);
     // `ble_gap_adv_start` takes the duration as an `int32_t`.
     assert!(bindings::ARGYLE_NIMBLE_HS_FOREVER as i64 == i32::MAX as i64);
 };
@@ -387,7 +386,7 @@ impl Backend for EspBackend {
         })
     }
 
-    fn advertising_start(&self, address_type: u8) -> NativeResult<()> {
+    fn advertising_start(&self, address_type: u8) -> NativeResult<bool> {
         // SAFETY: the parameters are plain data; zero is a valid value and
         // selects NimBLE's default intervals, all channels, and no filter.
         let mut parameters: bindings::ble_gap_adv_params = unsafe { std::mem::zeroed() };
@@ -409,20 +408,20 @@ impl Backend for EspBackend {
         // `ble_gap_adv_validate` reports an advertising procedure that is
         // already running as EALREADY.
         if code == ALREADY {
-            return Ok(());
+            return Ok(false);
         }
-        check(Operation::AdvertisingStart, code)
+        check(Operation::AdvertisingStart, code).map(|()| true)
     }
 
-    fn advertising_stop(&self) -> NativeResult<()> {
+    fn advertising_stop(&self) -> NativeResult<bool> {
         // SAFETY: plain SDK call with no arguments.
         let code = unsafe { bindings::ble_gap_adv_stop() };
-        // NimBLE stops the controller either way and reports EALREADY when
-        // no advertising procedure was active.
+        // `ble_gap_adv_stop_no_lock` disables advertising in the controller,
+        // then reports EALREADY when no advertising procedure was active.
         if code == ALREADY {
-            return Ok(());
+            return Ok(false);
         }
-        check(Operation::AdvertisingStop, code)
+        check(Operation::AdvertisingStop, code).map(|()| true)
     }
 
     fn is_synced(&self) -> bool {

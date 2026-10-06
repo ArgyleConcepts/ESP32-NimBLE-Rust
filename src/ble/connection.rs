@@ -52,10 +52,6 @@ pub(crate) const HOST_EAGAIN: i32 = 1;
 /// again for a new link. ESP builds check it against the SDK.
 pub(crate) const HOST_ENOTCONN: i32 = 7;
 
-/// NimBLE's `BLE_HS_ENOTSYNCED`: the host refuses commands from other tasks
-/// while it is not synchronized. ESP builds check it against the SDK.
-pub(crate) const HOST_ENOTSYNCED: i32 = 22;
-
 /// The HCI Unknown Connection Identifier status (Core Specification Vol 1,
 /// Part F, 1.3): the controller knows no such link.
 const HCI_UNKNOWN_CONNECTION: i32 = 0x02;
@@ -386,20 +382,38 @@ struct Outcome {
     terminate: Option<(u16, Unserved)>,
     /// Whether advertising may need to restart.
     restart: bool,
-    /// Whether a new client was accepted while the host is not stopping, so
-    /// advertising may need to stop.
+    /// Whether a client is connected after a connection report while the
+    /// host is not stopping, so advertising may need to stop.
     stop_advertising: bool,
 }
 
 /// What `operations` guards besides the order of advertising operations.
 #[derive(Default)]
 struct Operations {
-    /// Advertising starts sent since NimBLE last reported a connection (of
-    /// any outcome), the end of advertising, or a host reset. The controller
-    /// stops advertising when it accepts a client, so when a client is
-    /// reported, advertising can still be running only if a later start
-    /// re-enabled it: more than one start since the last report.
-    starts: u32,
+    /// Advertising procedures started whose end NimBLE has not reported.
+    ///
+    /// Only one procedure runs at a time. Each ends in exactly one of these
+    /// ways, each accounted once: the controller accepts a client, which
+    /// NimBLE reports later as exactly one connection, successful or failed
+    /// (with ESP-IDF's connection re-attempt disabled); NimBLE reports the
+    /// end of advertising; the framework stops it (a stop reports whether a
+    /// procedure was active); or the host resets, ending all of them. Starts
+    /// that find a procedure already running start nothing and are not
+    /// counted.
+    ///
+    /// So when a connection is reported and its procedure accounted for, a
+    /// remaining count means either a procedure that is still running or
+    /// procedures that ended with other clients the controller accepted but
+    /// NimBLE has not reported yet. With a client connected, the framework
+    /// then stops advertising; if nothing was running, the stop changes
+    /// nothing and the count stays for those later reports. With no
+    /// remaining count, nothing can be running, and no stop is sent: a stop
+    /// clears NimBLE's advertising state, and NimBLE then refuses a client
+    /// the controller accepted from that advertising
+    /// (`ble_gap_accept_slave_conn`), leaving a link only the controller
+    /// knows. That residual race needs a start while a connection is
+    /// unreported.
+    running: u32,
 }
 
 /// The running host's connection and advertising state, attached to the
@@ -509,12 +523,16 @@ impl<B: Backend> Runtime<B> {
     /// Start the configured advertising, if any, and enter the running
     /// phase. On failure the phase stays `Starting` until [`stop`](Self::stop).
     ///
-    /// The host may reset after startup saw it synchronized. NimBLE then
-    /// refuses commands from other tasks with `BLE_HS_ENOTSYNCED` until it
-    /// resynchronizes (`ble_hs_hci_cmd_send_buf` in `ble_hs_hci_cmd.c`), so
-    /// a start refused that way waits for the next synchronization, within
-    /// `timeout` in total, and is tried again, as the synchronization stage
-    /// tolerates resets.
+    /// The host may reset after startup saw it synchronized. Until it
+    /// resynchronizes, NimBLE refuses HCI commands (`BLE_HS_ENOTSYNCED`
+    /// from `ble_hs_hci_cmd_send_buf` in `ble_hs_hci_cmd.c`: from every task
+    /// while the sync state is bad, from other tasks while it is bringing
+    /// the controller up), and `ble_gap_adv_start` fails earlier with
+    /// `BLE_HS_ENOADDR` once `ble_hs_id_reset` has cleared the identity
+    /// addresses. So a start that fails while the host is not synchronized,
+    /// or after it resynchronized meanwhile, waits for the next
+    /// synchronization, within `timeout` in total, and is tried again, as
+    /// the synchronization stage tolerates resets.
     pub(crate) fn begin(&self, timeout: std::time::Duration) -> Result<(), Error> {
         let deadline = std::time::Instant::now().checked_add(timeout);
         loop {
@@ -530,7 +548,7 @@ impl<B: Backend> Runtime<B> {
                     lock(&self.state).phase = Phase::Running;
                     return Ok(());
                 }
-                Err(NativeError::Status { code, .. }) if code == HOST_ENOTSYNCED => {
+                Err(_) if !self.backend.is_synced() || self.host.syncs() != syncs => {
                     // Wait without `operations`: the host task takes it while
                     // it reports the reset.
                     drop(operations);
@@ -651,9 +669,12 @@ impl<B: Backend> Runtime<B> {
         self.backend
             .set_advertising_data(&plan.advertising_data)
             .and_then(|()| self.backend.set_scan_response_data(&plan.scan_response))
-            .and_then(|()| self.backend.advertising_start(address_type))?;
-        operations.starts += 1;
-        Ok(())
+            .and_then(|()| self.backend.advertising_start(address_type))
+            .map(|started| {
+                if started {
+                    operations.running += 1;
+                }
+            })
     }
 
     fn emit(&self, events: Vec<ConnectionEvent>) {
@@ -700,26 +721,27 @@ impl<B: Backend> Runtime<B> {
         };
         let outcome = {
             let mut state = lock(&self.state);
-            self.decide(&mut state, event, mtu)
+            let mut outcome = self.decide(&mut state, event, mtu);
+            if let GapEvent::Connect { .. } = event {
+                outcome.stop_advertising = state.active.is_some() && state.phase != Phase::Stopping;
+            }
+            outcome
         };
         let mut events = Vec::new();
         if let Some(mut operations) = operations {
-            let starts = std::mem::take(&mut operations.starts);
-            // ESP-IDF reports a connection only after reading the client's
-            // version and features, but NimBLE ended advertising when the
-            // controller accepted the client (`ble_gap_rx_conn_complete`
-            // resets the advertising state). Only a start in between, by the
-            // application or a restart, leaves it running, so only then is
-            // it stopped: stopping clears NimBLE's advertising state, and
-            // NimBLE then refuses a connection the controller accepted from
-            // that advertising (`ble_gap_accept_slave_conn`), leaving a link
-            // only the controller knows. That residual race needs a start
-            // while the client's connection is still unreported.
-            if outcome.stop_advertising && starts > 1 {
-                if let Err(error) = self.backend.advertising_stop() {
-                    events.push(ConnectionEvent::AdvertisingFailed {
+            // The reported connection, or the end of advertising, ended one
+            // procedure. ESP-IDF reports a connection only after reading the
+            // client's version and features, but the controller ended
+            // advertising when it accepted the client; a start in between
+            // (by the application or a restart) is still running.
+            operations.running = operations.running.saturating_sub(1);
+            if outcome.stop_advertising && operations.running > 0 {
+                match self.backend.advertising_stop() {
+                    Ok(true) => operations.running -= 1,
+                    Ok(false) => {}
+                    Err(error) => events.push(ConnectionEvent::AdvertisingFailed {
                         error: error.into(),
-                    });
+                    }),
                 }
             }
         }
@@ -810,7 +832,6 @@ impl<B: Backend> Runtime<B> {
                         }
                     }));
                 state.active = Some(active);
-                outcome.stop_advertising = state.phase != Phase::Stopping;
             }
             GapEvent::Connect { connection, status } => {
                 Self::forget_link(state, connection, &mut outcome.events);
@@ -930,7 +951,7 @@ impl<B: Backend> Runtime<B> {
 
     fn on_reset(&self, reason: i32) {
         // The reset also resets the controller, ending advertising.
-        lock(&self.operations).starts = 0;
+        lock(&self.operations).running = 0;
         let mut events = Vec::new();
         {
             let mut state = lock(&self.state);
@@ -2142,21 +2163,22 @@ mod tests {
         ));
         let (gate, starting) = start_before_connection_report(&fixture);
         // The report arrives while the start is still in progress: it waits
-        // for the start, so neither the client nor the stop happens first.
-        let stop = fixture.fake.hold(Operation::AdvertisingStop);
+        // for the start under `operations`, so the client is not recorded
+        // (which a start would then race) before the start finishes. The
+        // observations are collected first and the gate released before any
+        // assertion, so a failure fails instead of leaving threads blocked.
         let fake = fixture.fake.clone();
         let reporting = thread::spawn(move || fake.inject_gap(connect(2)));
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
-        while std::time::Instant::now() < deadline {
-            assert!(!stop.entered(), "the stop ran before the start finished");
-            assert!(fixture.running.connection().is_none());
+        let mut recorded_early = false;
+        while std::time::Instant::now() < deadline && !recorded_early {
+            recorded_early = fixture.running.connection().is_some();
             thread::yield_now();
         }
         gate.release();
         starting.join().unwrap().unwrap();
-        stop.wait_entered();
-        stop.release();
         reporting.join().unwrap();
+        assert!(!recorded_early, "the report passed a start in progress");
         let id = fixture.id();
         assert_eq!(fixture.seen.take(), [Seen::Connected(id)]);
         assert!(!fixture.fake.is_advertising(), "stopped for the client");
@@ -2171,21 +2193,94 @@ mod tests {
 
     #[test]
     fn a_report_after_a_single_start_does_not_stop_advertising() {
-        // The controller ended the only advertising start when it accepted
-        // the client; a stop would only clear NimBLE's state and could make
-        // it refuse another accepted connection.
+        // The controller ended the only advertising procedure when it
+        // accepted the client; a stop would only clear NimBLE's state and
+        // could make it refuse another accepted connection.
         let fixture = fixture();
         fixture.fake.create_link(1);
         let mark = fixture.mark();
         fixture.deliver(connect(1));
         assert!(!without_queries(&fixture.calls_since(mark)).contains(&NativeCall::AdvertisingStop));
-        // Nor after the end of advertising or a failed connection reset the
-        // count: one later start, then a report, needs no stop either.
+        // After the client disconnects, the restart is again the only one.
         fixture.deliver(disconnect(1));
         fixture.fake.create_link(2);
         let mark = fixture.mark();
         fixture.deliver(connect(2));
         assert!(!without_queries(&fixture.calls_since(mark)).contains(&NativeCall::AdvertisingStop));
+    }
+
+    /// Whether advertising was stopped after `mark`.
+    fn stopped_since(fixture: &Fixture, mark: usize) -> bool {
+        fixture
+            .calls_since(mark)
+            .contains(&NativeCall::AdvertisingStop)
+    }
+
+    #[test]
+    fn the_end_of_advertising_accounts_for_its_procedure() {
+        // Advertising ends (NimBLE reports it), the restart starts another
+        // procedure, and the controller accepts a client from it: nothing
+        // is running when the client is reported.
+        let fixture = fixture();
+        fixture.deliver(GapEvent::AdvertisingComplete { reason: 30 });
+        assert!(fixture.fake.is_advertising(), "restarted");
+        fixture.fake.create_link(1);
+        let mark = fixture.mark();
+        fixture.deliver(connect(1));
+        assert!(!stopped_since(&fixture, mark));
+    }
+
+    #[test]
+    fn a_failed_connection_accounts_for_its_procedure() {
+        // A client is accepted and its connection fails; the restart's
+        // procedure is the one the next client is accepted from.
+        let fixture = fixture();
+        fixture.fake.create_link(1);
+        fixture.deliver(GapEvent::Connect {
+            connection: 1,
+            status: HOST_EAGAIN,
+        });
+        assert!(fixture.fake.is_advertising(), "restarted");
+        fixture.fake.create_link(2);
+        let mark = fixture.mark();
+        fixture.deliver(connect(2));
+        assert!(!stopped_since(&fixture, mark));
+    }
+
+    #[test]
+    fn starts_that_start_nothing_are_not_counted() {
+        // A start refused by NimBLE, and one that finds advertising already
+        // running, start no procedure.
+        let fixture = fixture();
+        fixture.running.start_advertising().unwrap();
+        fixture.fake.create_link(1);
+        fixture.fake.fail_next(Operation::AdvertisingStart, 6);
+        assert!(fixture.running.start_advertising().is_err());
+        let mark = fixture.mark();
+        fixture.deliver(connect(1));
+        assert!(!stopped_since(&fixture, mark));
+    }
+
+    #[test]
+    fn a_report_for_another_link_does_not_hide_a_running_procedure() {
+        // The controller accepts A, the application starts advertising again,
+        // the controller accepts B, A's connection fails (and the restart
+        // starts advertising), then B is reported: advertising is running
+        // while B is connected, so it is stopped.
+        let fixture = fixture_with(Some(demo_advertising().build().unwrap()));
+        fixture.fake.create_link(1);
+        fixture.running.start_advertising().unwrap();
+        fixture.fake.create_link(2);
+        fixture.deliver(GapEvent::Connect {
+            connection: 1,
+            status: HOST_EAGAIN,
+        });
+        assert!(fixture.fake.is_advertising());
+        let mark = fixture.mark();
+        fixture.deliver(connect(2));
+        assert!(stopped_since(&fixture, mark));
+        assert!(!fixture.fake.is_advertising());
+        assert!(fixture.running.connection().is_some());
     }
 
     #[test]
@@ -2202,6 +2297,42 @@ mod tests {
         let mark = fixture.mark();
         fixture.deliver(connect(1));
         assert!(!without_queries(&fixture.calls_since(mark)).contains(&NativeCall::AdvertisingStop));
+    }
+
+    #[test]
+    fn a_stop_accounts_for_the_procedure_it_ended() {
+        // The window start was stopped for client 2; after it disconnects,
+        // the restart is the only procedure the next client is accepted from.
+        let fixture = fixture_with(Some(demo_advertising().build().unwrap()));
+        let (gate, starting) = start_before_connection_report(&fixture);
+        gate.release();
+        starting.join().unwrap().unwrap();
+        let mark = fixture.mark();
+        fixture.deliver(connect(2));
+        assert!(stopped_since(&fixture, mark));
+        fixture.deliver(disconnect(2));
+        assert!(fixture.fake.is_advertising(), "restarted");
+        fixture.fake.create_link(3);
+        let mark = fixture.mark();
+        fixture.deliver(connect(3));
+        assert!(!stopped_since(&fixture, mark));
+    }
+
+    #[test]
+    fn running_advertising_is_kept_when_no_client_is_connected() {
+        // A start between the controller accepting a client and NimBLE
+        // reporting its connection as failed keeps advertising for the next.
+        let fixture = fixture_with(Some(demo_advertising().build().unwrap()));
+        let (gate, starting) = start_before_connection_report(&fixture);
+        gate.release();
+        starting.join().unwrap().unwrap();
+        let mark = fixture.mark();
+        fixture.deliver(GapEvent::Connect {
+            connection: 2,
+            status: HOST_EAGAIN,
+        });
+        assert!(!stopped_since(&fixture, mark));
+        assert!(fixture.fake.is_advertising());
     }
 
     #[test]
@@ -2534,11 +2665,19 @@ mod tests {
 
     type Starting = thread::JoinHandle<Result<Started<FakeBackend>, StartError>>;
 
-    /// Start until startup's first advertising call is held, then mark the
-    /// host unsynchronized, as NimBLE does when a reset begins.
-    fn reset_before_startup_advertises(
+    /// Start until startup's advertising call `held` is entered, then begin
+    /// a host reset on another thread (NimBLE marks the host unsynchronized
+    /// first, then reports the reset, which waits for startup's call) and
+    /// let the call proceed.
+    fn reset_while_startup_advertises(
+        held: Operation,
         sync_timeout: std::time::Duration,
-    ) -> (FakeBackend, Arc<HostEvents>, Starting) {
+    ) -> (
+        FakeBackend,
+        Arc<HostEvents>,
+        Starting,
+        thread::JoinHandle<()>,
+    ) {
         let fake = FakeBackend::new();
         let mut configured = take(fake.clone(), slot()).unwrap();
         configured.set_advertising(demo_advertising().build().unwrap());
@@ -2546,51 +2685,92 @@ mod tests {
         let events = configured.events.clone();
         let (gatt, _, _) = server();
         let started = fake.hold(Operation::HostStart);
-        let data = fake.hold(Operation::AdvertisingData);
+        let call = fake.hold(held);
         let starting = thread::spawn(move || configured.start(gatt));
         started.wait_entered();
         fake.inject(NativeEvent::HostSynced);
         started.release();
-        data.wait_entered();
-        fake.set_synced(false);
-        data.release();
-        (fake, events, starting)
+        call.wait_entered();
+        let reset = {
+            let fake = fake.clone();
+            thread::spawn(move || {
+                fake.inject(NativeEvent::HostReset { reason: 19 });
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while fake.is_synced() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reset did not begin"
+            );
+            thread::yield_now();
+        }
+        call.release();
+        (fake, events, starting, reset)
     }
 
-    #[test]
-    fn startup_waits_for_a_resynchronization_that_interrupts_advertising() {
-        let (fake, events, starting) =
-            reset_before_startup_advertises(std::time::Duration::from_secs(3600));
-        // NimBLE refused the command (not synchronized); startup waits.
+    fn startup_resumes_after_resynchronization(held: Operation) {
+        let (fake, events, starting, reset) =
+            reset_while_startup_advertises(held, std::time::Duration::from_secs(3600));
+        // NimBLE refused the call; startup waits for the resynchronization.
         events.wait_until_parked(1);
-        let refused = fake
-            .calls()
-            .iter()
-            .filter(|call| matches!(call, NativeCall::AdvertisingData(_)))
-            .count();
-        assert_eq!(refused, 1);
-        fake.inject(NativeEvent::HostReset { reason: 19 });
+        reset.join().unwrap();
+        assert!(!fake.is_advertising());
         fake.inject(NativeEvent::HostSynced);
         let running = starting.join().unwrap().expect("startup completes");
         let calls = fake.calls();
-        let start = calls
+        let data: Vec<_> = calls
             .iter()
-            .rposition(|call| matches!(call, NativeCall::AdvertisingData(_)))
-            .unwrap();
-        assert!(is_advertising_start(&calls[start..]));
+            .enumerate()
+            .filter(|(_, call)| matches!(call, NativeCall::AdvertisingData(_)))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(data.len(), 2, "tried again: {calls:?}");
+        assert!(is_advertising_start(&calls[data[1]..]));
         assert!(fake.is_advertising());
         drop(running);
     }
 
     #[test]
+    fn startup_waits_for_a_resynchronization_that_refuses_advertising_commands() {
+        // The reset refuses the HCI command (BLE_HS_ENOTSYNCED).
+        startup_resumes_after_resynchronization(Operation::AdvertisingData);
+    }
+
+    #[test]
+    fn startup_waits_for_a_resynchronization_that_clears_the_address() {
+        // The payloads were sent; the reset cleared the identity address, so
+        // the start fails with BLE_HS_ENOADDR before any HCI command.
+        startup_resumes_after_resynchronization(Operation::AdvertisingStart);
+    }
+
+    #[test]
     fn startup_fails_if_the_host_does_not_resynchronize_in_time() {
-        let (fake, _, starting) =
-            reset_before_startup_advertises(std::time::Duration::from_millis(100));
+        let (fake, _, starting, reset) = reset_while_startup_advertises(
+            Operation::AdvertisingData,
+            std::time::Duration::from_millis(100),
+        );
         let error = starting.join().unwrap().unwrap_err();
+        reset.join().unwrap();
         assert_eq!(error.stage(), StartStage::Advertising);
         assert_eq!(error.error().kind(), ErrorKind::Timeout);
+        assert_eq!(error.last_host_reset(), Some(19));
         assert_eq!(error.cleanup(), Cleanup::Released);
         assert!(!fake.is_advertising());
+    }
+
+    #[test]
+    fn a_failure_while_synchronized_fails_startup_without_waiting() {
+        let fake = FakeBackend::new();
+        fake.fail_next(Operation::AdvertisingStart, 3);
+        let mut configured = take(fake.clone(), slot()).unwrap();
+        configured.set_advertising(demo_advertising().build().unwrap());
+        configured.set_sync_timeout(std::time::Duration::from_secs(3600));
+        let (gatt, _, _) = server();
+        let error = start_with(&fake, configured, gatt).unwrap_err();
+        assert_eq!(error.stage(), StartStage::Advertising);
+        assert_eq!(error.error().kind(), ErrorKind::Backend);
+        assert_eq!(error.last_host_reset(), None);
     }
 
     #[test]

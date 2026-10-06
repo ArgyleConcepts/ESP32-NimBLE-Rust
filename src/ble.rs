@@ -429,6 +429,11 @@ impl HostEvents {
 }
 
 impl HostEvents {
+    /// The reason of the last host reset, if any.
+    pub(crate) fn last_reset(&self) -> Option<i32> {
+        self.lock().last_reset
+    }
+
     /// How many times the host has synchronized so far.
     pub(crate) fn syncs(&self) -> u64 {
         self.lock().syncs
@@ -677,7 +682,12 @@ impl<B: Backend> Configured<B> {
         started.core().runtime.prepare(address_type, value_handles);
 
         if let Err(error) = started.core().runtime.begin(self.sync_timeout) {
-            return Err(started.fail(StartStage::Advertising, error, None));
+            // A timeout here waited for a resynchronization after a reset.
+            let last_reset = match error.kind() {
+                ErrorKind::Timeout => started.core().runtime.host().last_reset(),
+                _ => None,
+            };
+            return Err(started.fail(StartStage::Advertising, error, last_reset));
         }
         Ok(started)
     }
@@ -919,7 +929,10 @@ impl StartError {
     }
 
     /// The reason of the last host reset seen while waiting for
-    /// synchronization, if any: a NimBLE host status, for diagnosis.
+    /// synchronization (at [`StartStage::Synchronization`], or at
+    /// [`StartStage::Advertising`] when a reset interrupted advertising and
+    /// the host did not resynchronize in time), if any: a NimBLE host
+    /// status, for diagnosis.
     pub fn last_host_reset(&self) -> Option<i32> {
         self.inner.last_host_reset
     }

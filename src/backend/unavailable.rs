@@ -66,10 +66,10 @@ impl Backend for Unavailable {
     fn set_scan_response_data(&self, _: &[u8]) -> NativeResult<()> {
         match *self {}
     }
-    fn advertising_start(&self, _: u8) -> NativeResult<()> {
+    fn advertising_start(&self, _: u8) -> NativeResult<bool> {
         match *self {}
     }
-    fn advertising_stop(&self) -> NativeResult<()> {
+    fn advertising_stop(&self) -> NativeResult<bool> {
         match *self {}
     }
     fn is_synced(&self) -> bool {
