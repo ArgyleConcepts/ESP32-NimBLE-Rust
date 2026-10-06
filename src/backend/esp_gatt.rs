@@ -12,10 +12,11 @@
 //! The decisions here (flag mapping, handle-slot order, handler lookup, and
 //! request handling) live in platform-neutral code with host tests; this file
 //! only fills in NimBLE's structures. The trampolines check that the context
-//! is present, read only its plain `op` and `om` fields (never its union),
-//! and never free the context's buffer, which NimBLE owns. A panic in a
-//! handler aborts (`extern "C"` and the ESP targets' `panic=abort`) rather
-//! than unwinding into C.
+//! is present, read only its plain `op`, `om`, and `offset` fields (never its
+//! union), and never free the context's buffer, which NimBLE owns. NimBLE
+//! sets `offset` on every path that calls back (`ble_gatts_chr_val_access`
+//! and `ble_gatts_dsc_access`). A panic in a handler aborts (`extern "C"`
+//! and the ESP targets' `panic=abort`) rather than unwinding into C.
 
 use super::bindings;
 use super::esp::{EspBackend, EspMbuf};
@@ -238,7 +239,16 @@ unsafe fn access(
         .map(|buffer| AccessBuffer::new(&EspBackend, buffer));
     // SAFETY: the argument is the slot registered with this callback kind;
     // the server it points into outlives the registration.
-    unsafe { dispatch_access(kind, argument, u32::from(context.op), &ACCESS_CODES, buffer) }
+    unsafe {
+        dispatch_access(
+            kind,
+            argument,
+            u32::from(context.op),
+            context.offset,
+            &ACCESS_CODES,
+            buffer,
+        )
+    }
 }
 
 /// Access callback of every registered characteristic.

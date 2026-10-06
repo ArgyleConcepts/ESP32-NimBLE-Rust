@@ -10,9 +10,41 @@
 //! owns the request and response buffers of an access callback. Reads append
 //! the encoded value; writes are length-checked against the attribute's
 //! `MAX_LEN` before anything is copied, then copied, decoded, and delivered.
+//!
+//! # Offsets and long values
+//!
+//! This follows what ESP-IDF 6.1's NimBLE does around an access callback
+//! (`ble_gatts_val_access` in `ble_gatts.c` and the request handlers in
+//! `ble_att_svr.c`):
+//!
+//! - **Read and Read Blob.** NimBLE calls the callback for every request,
+//!   with the request's offset in the context. At offset 0 the callback
+//!   appends to the response, which already holds the ATT opcode; otherwise
+//!   it appends to a fresh buffer, from which NimBLE copies the bytes after
+//!   the offset (`BLE_ATT_ERR_INVALID_OFFSET` if the value is shorter) and
+//!   frees it. NimBLE then truncates the response to the ATT MTU. A read
+//!   therefore always appends the handler's complete value and never applies
+//!   the offset itself.
+//! - **Write Request, Write Command, and Signed Write.** One callback with
+//!   the whole PDU value at offset 0.
+//! - **Prepare Write and Execute Write.** NimBLE queues the prepared parts
+//!   itself without calling back. On execute it requires each attribute's
+//!   parts to start at offset 0 and be contiguous (otherwise
+//!   `BLE_ATT_ERR_INVALID_OFFSET`) and, unless `BLE_GATT_BLOB_TRANSFER` is
+//!   enabled, to total at most `BLE_ATT_ATTR_MAX_LEN` (512) bytes (otherwise
+//!   `BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN`). It then calls back once per
+//!   attribute with the parts chained into one buffer at offset 0.
+//!
+//! So every write reaching a callback is a complete value at offset 0. A
+//! write at any other offset would be part of a value, which this framework
+//! does not reassemble; it is refused with
+//! [`AttError::REQUEST_NOT_SUPPORTED`] before the buffer is read.
 
 // Used by the ESP backend and tests; host builds have no native registration.
 #![cfg_attr(not(any(test, argyle_nimble_esp)), allow(dead_code))]
+
+#[cfg(test)]
+pub(crate) mod att_model;
 
 use super::descriptor::{DescriptorAccess, RegisteredDescriptor};
 use super::{Access, EndpointId, GattServer, RegisteredCharacteristic};
@@ -267,16 +299,32 @@ impl<'a, B: Backend> AccessBuffer<'a, B> {
     }
 }
 
-/// Serve one native attribute access through `buffer`, which is never freed
-/// or kept here.
+/// Serve one native attribute access at `offset` through `buffer`, which is
+/// never freed or kept here.
 ///
 /// An operation for the other kind of attribute, an unknown operation, or a
 /// missing buffer is answered with [`AttError::UNLIKELY`]. Undeclared
 /// operations are refused by the handler's declared access, independent of
 /// the native permission flags.
+///
+/// A read encodes the handler's complete value into a Rust-owned buffer of
+/// at most `MAX_LEN` bytes and appends it in one call only if encoding
+/// succeeded, whatever `offset` is; NimBLE slices it (see the
+/// [module documentation](self#offsets-and-long-values)). Nothing a failed
+/// handler or codec produced reaches the response. If the append itself
+/// fails part-way, the error status makes NimBLE discard what was appended:
+/// it frees the fresh buffer of a nonzero offset, and `ble_att_svr_tx_rsp`
+/// empties the response before sending an Error Response.
+///
+/// A write is refused, in this order, if it is undeclared, at a nonzero
+/// `offset`, or longer than `MAX_LEN`, all before any byte is copied. It is
+/// then copied from every segment of the chain into a zeroed, owned buffer
+/// of exactly its length, decoded, and delivered; a failed copy reaches no
+/// handler.
 pub(crate) fn serve_access<B: Backend>(
     target: Target<'_>,
     op: AccessOp,
+    offset: u16,
     buffer: Option<AccessBuffer<'_, B>>,
 ) -> Result<(), AttError> {
     let mut buffer = buffer.ok_or(AttError::UNLIKELY)?;
@@ -293,9 +341,12 @@ pub(crate) fn serve_access<B: Backend>(
         buffer.append(&value)
     } else {
         // Permission comes first, so an undeclared write is refused as such
-        // whatever its length.
+        // whatever its offset or length.
         if !target.writable() {
             return Err(AttError::WRITE_NOT_PERMITTED);
+        }
+        if offset != 0 {
+            return Err(AttError::REQUEST_NOT_SUPPORTED);
         }
         let length = buffer.len();
         if length > target.max_len() {
@@ -315,9 +366,9 @@ pub(crate) enum AttributeKind {
 }
 
 /// The body of a native access callback after the context was found: recover
-/// the handler from the callback argument and serve the operation, returning
-/// the status for NimBLE. A null argument is answered with
-/// [`AttError::UNLIKELY`].
+/// the handler from the callback argument and serve the operation at the
+/// context's `offset`, returning the status for NimBLE. A null argument is
+/// answered with [`AttError::UNLIKELY`].
 ///
 /// # Safety
 ///
@@ -327,6 +378,7 @@ pub(crate) unsafe fn dispatch_access<B: Backend>(
     kind: AttributeKind,
     argument: *mut c_void,
     op: u32,
+    offset: u16,
     codes: &AccessCodes,
     buffer: Option<AccessBuffer<'_, B>>,
 ) -> i32 {
@@ -340,7 +392,7 @@ pub(crate) unsafe fn dispatch_access<B: Backend>(
         }
     };
     access_status(match target {
-        Some(target) => serve_access(target, AccessOp::from_code(op, codes), buffer),
+        Some(target) => serve_access(target, AccessOp::from_code(op, codes), offset, buffer),
         None => Err(AttError::UNLIKELY),
     })
 }
@@ -534,7 +586,7 @@ mod tests {
     ) -> (Result<(), AttError>, Vec<u8>) {
         let mut buffer = fake.mbuf_from_flat(&[]).unwrap();
         let id = buffer.id();
-        let result = serve_access(target, op, Some(AccessBuffer::new(fake, &mut buffer)));
+        let result = serve_access(target, op, 0, Some(AccessBuffer::new(fake, &mut buffer)));
         let data = fake.mbuf_data(id).unwrap();
         fake.mbuf_free(buffer).unwrap();
         (result, data)
@@ -547,7 +599,7 @@ mod tests {
         data: &[u8],
     ) -> Result<(), AttError> {
         let mut buffer = fake.mbuf_from_flat(data).unwrap();
-        let result = serve_access(target, op, Some(AccessBuffer::new(fake, &mut buffer)));
+        let result = serve_access(target, op, 0, Some(AccessBuffer::new(fake, &mut buffer)));
         fake.mbuf_free(buffer).unwrap();
         result
     }
@@ -754,7 +806,7 @@ mod tests {
         }
         // No buffer in the context.
         assert_eq!(
-            serve_access::<FakeBackend>(level, AccessOp::ReadCharacteristic, None),
+            serve_access::<FakeBackend>(level, AccessOp::ReadCharacteristic, 0, None),
             Err(AttError::UNLIKELY)
         );
         // Operations that were not declared stay refused even if NimBLE
@@ -926,6 +978,7 @@ mod tests {
             serve_access(
                 target,
                 AccessOp::WriteCharacteristic,
+                0,
                 Some(AccessBuffer::new(&fake, &mut chain))
             ),
             Ok(())
@@ -947,6 +1000,7 @@ mod tests {
             serve_access(
                 target,
                 AccessOp::WriteCharacteristic,
+                0,
                 Some(AccessBuffer::new(&fake, &mut chain))
             ),
             Err(AttError::INVALID_ATTRIBUTE_VALUE_LENGTH)
@@ -961,6 +1015,7 @@ mod tests {
             serve_access(
                 target,
                 AccessOp::WriteCharacteristic,
+                0,
                 Some(AccessBuffer::new(&fake, &mut chain))
             ),
             Err(AttError::UNLIKELY)
@@ -974,6 +1029,7 @@ mod tests {
             serve_access(
                 target,
                 AccessOp::ReadCharacteristic,
+                0,
                 Some(AccessBuffer::new(&fake, &mut response))
             ),
             Ok(())
@@ -1062,6 +1118,7 @@ mod tests {
                     kind,
                     argument,
                     op,
+                    0,
                     &CODES,
                     buffer
                         .as_mut()
@@ -1197,5 +1254,438 @@ mod tests {
             .collect();
         assert_eq!(indexes, [0, 1, 2]);
         assert_eq!(plan.endpoints().len(), indexes.len());
+    }
+
+    /// Text up to 12 bytes, as a characteristic and as a descriptor. The
+    /// handler refuses text starting with `!`.
+    #[derive(Clone)]
+    struct Text {
+        value: Arc<Mutex<String>>,
+        written: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Text {
+        fn new(value: &str) -> Self {
+            Self {
+                value: Arc::new(Mutex::new(value.into())),
+                written: Arc::default(),
+            }
+        }
+
+        fn accept(&self, value: String) -> Result<(), AttError> {
+            if value.starts_with('!') {
+                return Err(AttError::WRITE_REQUEST_REJECTED);
+            }
+            self.written.lock().unwrap().push(value.clone());
+            *self.value.lock().unwrap() = value;
+            Ok(())
+        }
+
+        fn written(&self) -> Vec<String> {
+            self.written.lock().unwrap().clone()
+        }
+    }
+
+    impl Characteristic for Text {
+        type Value = String;
+        const MAX_LEN: usize = 12;
+        fn uuid(&self) -> Uuid {
+            Uuid::Uuid16(0xfff5)
+        }
+    }
+
+    impl Readable for Text {
+        fn read(&self) -> Result<String, AttError> {
+            Ok(self.value.lock().unwrap().clone())
+        }
+    }
+
+    impl Writable for Text {
+        fn write(&self, value: String) -> Result<(), AttError> {
+            self.accept(value)
+        }
+    }
+
+    impl Descriptor for Text {
+        type Value = String;
+        const MAX_LEN: usize = 12;
+        fn uuid(&self) -> Uuid {
+            Uuid::Uuid16(0xfff6)
+        }
+    }
+
+    impl ReadableDescriptor for Text {
+        fn read(&self) -> Result<String, AttError> {
+            Ok(self.value.lock().unwrap().clone())
+        }
+    }
+
+    impl WritableDescriptor for Text {
+        fn write(&self, value: String) -> Result<(), AttError> {
+            self.accept(value)
+        }
+    }
+
+    /// One server with `text` as a characteristic and as its descriptor.
+    fn text_server(text: &Text) -> GattServer {
+        let definition = CharacteristicDef::new(text.clone())
+            .readable()
+            .writable()
+            .descriptor(
+                DescriptorDef::new(text.clone())
+                    .unwrap()
+                    .readable()
+                    .writable(),
+            );
+        GattServer::new([Service::primary(Uuid::Uuid16(0x181c)).characteristic(definition)])
+            .unwrap()
+    }
+
+    /// Both attributes of [`text_server`] with their read and write
+    /// operations.
+    fn text_targets(server: &GattServer) -> [(Target<'_>, AccessOp, AccessOp); 2] {
+        let characteristic = server.services()[0].characteristics()[0].as_ref();
+        [
+            (
+                Target::Characteristic(characteristic),
+                AccessOp::ReadCharacteristic,
+                AccessOp::WriteCharacteristic,
+            ),
+            (
+                Target::Descriptor(characteristic.descriptors()[0].as_ref()),
+                AccessOp::ReadDescriptor,
+                AccessOp::WriteDescriptor,
+            ),
+        ]
+    }
+
+    /// Serve one access over a NimBLE-owned chain of `segments`, then free
+    /// it as NimBLE would; returns the result and the buffer's final bytes.
+    fn serve(
+        fake: &FakeBackend,
+        target: Target<'_>,
+        op: AccessOp,
+        offset: u16,
+        segments: &[&[u8]],
+    ) -> (Result<(), AttError>, Vec<u8>) {
+        let mut buffer = fake.mbuf_from_segments(segments);
+        let result = serve_access(
+            target,
+            op,
+            offset,
+            Some(AccessBuffer::new(fake, &mut buffer)),
+        );
+        let data = fake.mbuf_data(buffer.id()).unwrap();
+        fake.mbuf_free(buffer).unwrap();
+        (result, data)
+    }
+
+    fn appended(fake: &FakeBackend) -> Vec<usize> {
+        fake.calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                NativeCall::MbufAppend { length, .. } => Some(length),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn touched(fake: &FakeBackend) -> usize {
+        fake.calls()
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call,
+                    NativeCall::MbufLen { .. } | NativeCall::MbufCopy { .. }
+                )
+            })
+            .count()
+    }
+
+    /// The Read Response opcode NimBLE puts in the response before calling
+    /// back.
+    const OPCODE: &[u8] = &[0x0b];
+
+    #[test]
+    fn empty_exact_and_over_limit_text_follows_max_len() {
+        let text = Text::new("");
+        let server = text_server(&text);
+        let fake = FakeBackend::new();
+        for (target, read, write) in text_targets(&server) {
+            text.written.lock().unwrap().clear();
+            assert_eq!(serve(&fake, target, write, 0, &[]).0, Ok(()));
+            assert_eq!(text.written(), [""], "an empty write is a value");
+            assert_eq!(
+                serve(&fake, target, read, 0, &[OPCODE]),
+                (Ok(()), OPCODE.to_vec())
+            );
+            assert_eq!(appended(&fake).last(), Some(&0));
+
+            let exact = "twelve bytes";
+            assert_eq!(
+                serve(&fake, target, write, 0, &[exact.as_bytes()]).0,
+                Ok(())
+            );
+            assert_eq!(
+                serve(&fake, target, read, 0, &[OPCODE]),
+                (Ok(()), [OPCODE, exact.as_bytes()].concat())
+            );
+
+            let before = touched(&fake);
+            assert_eq!(
+                serve(&fake, target, write, 0, &[b"thirteen", b"bytes"]).0,
+                Err(AttError::INVALID_ATTRIBUTE_VALUE_LENGTH)
+            );
+            assert_eq!(touched(&fake), before + 1, "measured, never copied");
+            assert_eq!(text.written(), ["", exact]);
+
+            // A handler value over MAX_LEN is the server's fault and is
+            // never truncated into the response.
+            *text.value.lock().unwrap() = "thirteen byte".into();
+            let appends = appended(&fake).len();
+            assert_eq!(
+                serve(&fake, target, read, 0, &[OPCODE]),
+                (Err(AttError::UNLIKELY), OPCODE.to_vec())
+            );
+            assert_eq!(appended(&fake).len(), appends, "nothing appended");
+        }
+        assert_eq!(fake.assert_balanced(), Ok(()));
+        assert!(fake.violations().is_empty());
+    }
+
+    #[test]
+    fn text_split_at_every_segment_boundary_arrives_whole() {
+        let text = Text::new("");
+        let server = text_server(&text);
+        let fake = FakeBackend::new();
+        // One-, two-, three-, and four-byte characters: 11 bytes.
+        let value = "aé€😀b";
+        let bytes = value.as_bytes();
+        // The same text with the emoji's last byte corrupted.
+        let mut malformed = bytes.to_vec();
+        malformed[9] = b'!';
+        for (target, _, write) in text_targets(&server) {
+            for first in 0..=bytes.len() {
+                for second in first..=bytes.len() {
+                    let split = |data: &[u8]| {
+                        serve(
+                            &fake,
+                            target,
+                            write,
+                            0,
+                            &[&data[..first], &data[first..second], &data[second..]],
+                        )
+                    };
+                    text.written.lock().unwrap().clear();
+                    assert_eq!(split(bytes).0, Ok(()), "split at {first}, {second}");
+                    assert_eq!(text.written(), [value]);
+                    assert_eq!(split(&malformed).0, Err(AttError::VALUE_NOT_ALLOWED));
+                    assert_eq!(text.written(), [value], "the handler never saw it");
+                }
+            }
+        }
+        assert_eq!(fake.assert_balanced(), Ok(()));
+    }
+
+    #[test]
+    fn malformed_text_is_refused_before_the_handler() {
+        let text = Text::new("keep");
+        let server = text_server(&text);
+        let fake = FakeBackend::new();
+        let malformed: [&[u8]; 6] = [
+            &[0xff],
+            &[b'o', b'k', 0xc3],       // truncated sequence
+            &[0xc0, 0xaf],             // overlong encoding
+            &[0xed, 0xa0, 0x80],       // UTF-16 surrogate
+            &[0xf4, 0x90, 0x80, 0x80], // above U+10FFFF
+            &[0xe2, 0x82, b'x'],       // bad continuation byte
+        ];
+        for (target, read, write) in text_targets(&server) {
+            for value in malformed {
+                assert_eq!(
+                    serve(&fake, target, write, 0, &[value]).0,
+                    Err(AttError::VALUE_NOT_ALLOWED),
+                    "{value:x?}"
+                );
+            }
+            // NUL is valid UTF-8 and the encoding has no terminator.
+            assert_eq!(serve(&fake, target, write, 0, &[b"a\0b"]).0, Ok(()));
+            assert_eq!(
+                serve(&fake, target, read, 0, &[OPCODE]).1,
+                [OPCODE, b"a\0b"].concat()
+            );
+            *text.value.lock().unwrap() = "keep".into();
+        }
+        assert_eq!(text.written(), ["a\0b", "a\0b"]);
+        assert_eq!(fake.assert_balanced(), Ok(()));
+    }
+
+    #[test]
+    fn write_failures_at_every_stage_leave_state_and_request_untouched() {
+        let text = Text::new("keep");
+        let server = text_server(&text);
+        let fake = FakeBackend::new();
+        // The request's segments, a native fault to inject, and the result.
+        type Case<'a> = (&'a [&'a [u8]], Option<Operation>, AttError);
+        for (target, _, write) in text_targets(&server) {
+            let cases: [Case<'_>; 4] = [
+                (
+                    &[b"too long ", b"by far"],
+                    None,
+                    AttError::INVALID_ATTRIBUTE_VALUE_LENGTH,
+                ),
+                (
+                    &[b"ok", b"ay"],
+                    Some(Operation::MbufCopy),
+                    AttError::UNLIKELY,
+                ),
+                (&[b"bad", &[0xff]], None, AttError::VALUE_NOT_ALLOWED),
+                (&[b"!", b"no"], None, AttError::WRITE_REQUEST_REJECTED),
+            ];
+            for (segments, fault, error) in cases {
+                if let Some(operation) = fault {
+                    fake.fail_next(operation, -1);
+                }
+                let (result, request) = serve(&fake, target, write, 0, segments);
+                assert_eq!(result, Err(error));
+                assert_eq!(request, segments.concat(), "the request is never modified");
+                assert_eq!(*text.value.lock().unwrap(), "keep");
+            }
+        }
+        assert!(text.written().is_empty());
+        assert_eq!(
+            fake.assert_balanced(),
+            Ok(()),
+            "the request is never freed here"
+        );
+        assert!(fake.violations().is_empty());
+    }
+
+    #[test]
+    fn writes_at_an_offset_are_refused_and_reads_ignore_it() {
+        let text = Text::new("value");
+        let server = text_server(&text);
+        let fake = FakeBackend::new();
+        for (target, read, write) in text_targets(&server) {
+            for offset in [1, 22, u16::MAX] {
+                let before = touched(&fake);
+                assert_eq!(
+                    serve(&fake, target, write, offset, &[b"part"]).0,
+                    Err(AttError::REQUEST_NOT_SUPPORTED)
+                );
+                assert_eq!(touched(&fake), before, "the buffer was not read");
+                // NimBLE slices reads itself, so the full value is appended
+                // to the fresh buffer it passes for a nonzero offset.
+                assert_eq!(
+                    serve(&fake, target, read, offset, &[]),
+                    (Ok(()), b"value".to_vec())
+                );
+            }
+        }
+        // An undeclared write is refused as such, whatever its offset.
+        let read_only = CharacteristicDef::new(text.clone()).readable();
+        assert_eq!(
+            serve(
+                &fake,
+                Target::Characteristic(&read_only),
+                AccessOp::WriteCharacteristic,
+                3,
+                &[b"x"]
+            )
+            .0,
+            Err(AttError::WRITE_NOT_PERMITTED)
+        );
+        assert!(text.written().is_empty());
+        assert_eq!(fake.assert_balanced(), Ok(()));
+    }
+
+    /// A value whose encoding fails part-way or overruns its capacity.
+    #[derive(Clone, Copy, Debug)]
+    enum Fault {
+        Partial,
+        Overrun,
+        Valid,
+    }
+
+    impl crate::codec::Encode for Fault {
+        fn encode(
+            &self,
+            writer: &mut crate::codec::ValueWriter<'_>,
+        ) -> Result<(), crate::codec::EncodeError> {
+            match self {
+                Self::Partial => {
+                    writer.write_bytes(&[1, 2, 3])?;
+                    Err(crate::codec::EncodeError::InvalidValue { reason: "partial" })
+                }
+                Self::Overrun => {
+                    writer.write_bytes(&[4; 8])?;
+                    writer.write_bytes(&[5])
+                }
+                Self::Valid => writer.write_bytes(&[6; 8]),
+            }
+        }
+    }
+
+    /// Reads [`Fault`] values up to 8 bytes, or fails in its handler.
+    struct Faulty(Mutex<Result<Fault, AttError>>);
+
+    impl Characteristic for Faulty {
+        type Value = Fault;
+        const MAX_LEN: usize = 8;
+        fn uuid(&self) -> Uuid {
+            Uuid::Uuid16(0xfff7)
+        }
+    }
+
+    impl Readable for Faulty {
+        fn read(&self) -> Result<Fault, AttError> {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    #[test]
+    fn failed_or_partial_encodings_never_reach_the_response() {
+        let application = AttError::application(0x80).unwrap();
+        let faulty = CharacteristicDef::new(Faulty(Mutex::new(Ok(Fault::Valid)))).readable();
+        let target = Target::Characteristic(&faulty);
+        let fake = FakeBackend::new();
+        let read = |state, offset| {
+            *faulty.characteristic.0.lock().unwrap() = state;
+            serve(
+                &fake,
+                target,
+                AccessOp::ReadCharacteristic,
+                offset,
+                &[OPCODE],
+            )
+        };
+        for (state, error) in [
+            (Ok(Fault::Partial), AttError::UNLIKELY),
+            (Ok(Fault::Overrun), AttError::UNLIKELY),
+            (Err(application), application),
+        ] {
+            for offset in [0, 5] {
+                assert_eq!(
+                    read(state, offset),
+                    (Err(error), OPCODE.to_vec()),
+                    "{state:?}"
+                );
+            }
+        }
+        assert!(appended(&fake).is_empty(), "no handler output was appended");
+
+        assert_eq!(
+            read(Ok(Fault::Valid), 0),
+            (Ok(()), [OPCODE, &[6; 8]].concat())
+        );
+        assert_eq!(appended(&fake), [8]);
+        // An append failing part-way returns the status NimBLE discards the
+        // response for; nothing beyond the value was written.
+        fake.fail_next(Operation::MbufAppend, 6);
+        let (result, response) = read(Ok(Fault::Valid), 0);
+        assert_eq!(result, Err(AttError::INSUFFICIENT_RESOURCES));
+        assert_eq!(response, [OPCODE, &[6; 4]].concat());
+        assert_eq!(fake.assert_balanced(), Ok(()));
+        assert!(fake.violations().is_empty());
     }
 }
