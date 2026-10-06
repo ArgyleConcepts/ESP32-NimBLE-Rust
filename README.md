@@ -54,10 +54,10 @@ the BLE boundary and the declaration of a GATT server:
   chained buffers, long values clients read with Read Blob, and prepared
   (long) writes that NimBLE reassembles within its buffer pool, which with
   the ESP32-C3/S3 defaults holds at most 216 bytes of parts at the minimum
-  MTU.
-  Partial writes at an offset are refused. The `gatt` documentation states NimBLE's long-value behavior and
-  a generic, application-managed chunked-transfer pattern whose framing and
-  session state stay with the application.
+  MTU. Partial writes at an offset are refused. The `gatt` documentation
+  states NimBLE's long-value behavior and a generic, application-managed
+  chunked-transfer pattern whose framing and session state stay with the
+  application.
 
 The firmware fixtures compile the startup, registration, advertising, and
 connection paths for ESP32-C3 and ESP32-S3, and host tests drive them against
