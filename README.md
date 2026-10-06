@@ -14,10 +14,12 @@ the BLE boundary and the declaration of a GATT server:
   application codecs over Rust-owned bytes only.
 - `AttError` for ATT results returned to a client, kept separate from
   `Error` for framework lifecycle, backend, encoding, and definition failures.
-- `gatt`: services and characteristics declared with application structs and
-  traits. Read and write capabilities require their handlers, and notify
-  requires an encodable value, at compile time; `GattServer` freezes the
-  validated definition with typed notification endpoints.
+- `gatt`: services, characteristics, and custom descriptors declared with
+  application structs and traits. Read and write capabilities require their
+  handlers, and notify requires an encodable value, at compile time; the
+  stack-managed CCCD and GATT declaration UUIDs cannot be used as custom
+  descriptors. `GattServer` freezes the validated definition with typed
+  notification endpoints.
 
 It has **no BLE controller, NimBLE registration of these definitions,
 implemented BLE behavior, or published package**. See the rustdoc on each type for contracts and examples. Its private,
@@ -86,7 +88,8 @@ milestones.
 - `src/lib.rs`: library entry point and crate documentation.
 - `src/uuid.rs`, `src/codec.rs`, and `src/error.rs`: public UUID, value codec,
   and error types with their contracts and tests.
-- `src/gatt.rs`: public GATT authoring API; `tests/gatt_authoring.rs` checks its
+- `src/gatt.rs` and `src/gatt/descriptor.rs`: public GATT authoring API;
+  `tests/gatt_authoring.rs` checks its
   compile-time contracts with the `tests/ui/gatt` pass and compile-fail
   fixtures.
 - `build_support/context.rs` and `cmake/`: private build-context validation and

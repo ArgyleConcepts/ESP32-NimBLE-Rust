@@ -1,0 +1,19 @@
+error[E0308]: mismatched types
+  --> tests/ui/gatt/fail/descriptor_check_not_skippable.rs:42:21
+   |
+42 |         .descriptor(DescriptorDef::new(Subscriptions));
+   |          ---------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `DescriptorDef<_>`, found `Result<DescriptorDef<...>, ...>`
+   |          |
+   |          arguments to this method are incorrect
+   |
+   = note: expected struct `DescriptorDef<_>`
+                found enum `Result<DescriptorDef<Subscriptions>, argyle_nimble::Error>`
+note: method defined here
+  --> src/gatt.rs
+   |
+   |     pub fn descriptor<D: Descriptor>(mut self, definition: DescriptorDef<D>) -> Self {
+   |            ^^^^^^^^^^
+help: consider using `Result::expect` to unwrap the `Result<DescriptorDef<Subscriptions>, argyle_nimble::Error>` value, panicking if the value is a `Result::Err`
+   |
+42 |         .descriptor(DescriptorDef::new(Subscriptions).expect("REASON"));
+   |                                                      +++++++++++++++++

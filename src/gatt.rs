@@ -8,8 +8,11 @@
 //! 2. A [`CharacteristicDef`] declares which capabilities the characteristic
 //!    offers. Each declaration method requires the matching handler trait, so
 //!    a capability without its handler does not compile.
-//! 3. A [`Service`] groups characteristic definitions under a service UUID.
-//! 4. [`GattServer::new`] validates the services and freezes them into an
+//! 3. Optional custom descriptors work the same way through [`Descriptor`],
+//!    [`ReadableDescriptor`], [`WritableDescriptor`], and [`DescriptorDef`],
+//!    attached with [`CharacteristicDef::descriptor`].
+//! 4. A [`Service`] groups characteristic definitions under a service UUID.
+//! 5. [`GattServer::new`] validates the services and freezes them into an
 //!    owned server definition, ready to transfer to the BLE owner.
 //!
 //! ```
@@ -87,6 +90,30 @@
 //! of GATT's own declaration types (`0x2800`–`0x2803`, in any width), and a
 //! [`Characteristic::MAX_LEN`] above the 512-byte attribute limit.
 //!
+//! # Descriptors
+//!
+//! Descriptors use their own traits and access, separate from characteristic
+//! capabilities, and the same codecs and handler contract. They are checked
+//! at three points:
+//!
+//! - **Compile time:** read and write access require [`ReadableDescriptor`]
+//!   and [`WritableDescriptor`]; descriptors have no notify or
+//!   write-without-response access; a [`DescriptorDef`] attaches only to a
+//!   [`CharacteristicDef`]; and descriptor types have the same thread,
+//!   lifetime, and owned-value bounds as characteristics.
+//! - **Construction:** [`DescriptorDef::new`] rejects the Client
+//!   Characteristic Configuration descriptor (CCCD, `0x2902`) and GATT
+//!   declaration types (`0x2800`–`0x2803`), in any UUID width. UUIDs are
+//!   runtime values, so this cannot happen at compile time; it does happen
+//!   before the definition can reach a server or NimBLE.
+//! - **[`GattServer::new`]:** every descriptor must declare read or write
+//!   access, and its `MAX_LEN` must not exceed 512 bytes.
+//!
+//! NimBLE adds and manages the CCCD of every notify-capable characteristic,
+//! including client subscription state. This crate never creates a CCCD or
+//! keeps subscription state of its own, and applications cannot supply one.
+//! Indications are not supported.
+//!
 //! # Planned request handling
 //!
 //! Registering a server with NimBLE is not implemented yet, so no handler is
@@ -122,11 +149,17 @@
 //! serves one client with open access; if context is added, it will arrive
 //! as new provided trait methods so existing handlers keep compiling.
 //!
-//! Registration with NimBLE, descriptors, and sending notifications are not
-//! part of this module yet.
+//! Registration with NimBLE and sending notifications are not part of this
+//! module yet. Descriptor requests follow the same planned contract as
+//! characteristic requests.
+
+mod descriptor;
+
+pub use descriptor::{Descriptor, DescriptorDef, ReadableDescriptor, WritableDescriptor};
 
 use crate::codec::{decode_value, DecodeOwned, Encode, ValueWriter, MAX_ATTRIBUTE_VALUE_LEN};
 use crate::{AttError, Error, Uuid};
+use descriptor::RegisteredDescriptor;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -282,6 +315,7 @@ pub struct CharacteristicDef<C: Characteristic> {
     read: Option<ReadThunk<C>>,
     write: Option<WriteThunk<C>>,
     endpoint: Option<EndpointId>,
+    descriptors: Vec<Box<dyn RegisteredDescriptor>>,
 }
 
 impl<C: Characteristic> CharacteristicDef<C> {
@@ -296,7 +330,18 @@ impl<C: Characteristic> CharacteristicDef<C> {
             read: None,
             write: None,
             endpoint: None,
+            descriptors: Vec::new(),
         }
+    }
+
+    /// Attach a custom descriptor after those already attached.
+    ///
+    /// Notify-capable characteristics get their Client Characteristic
+    /// Configuration descriptor from NimBLE; [`DescriptorDef::new`] rejects a
+    /// manual one.
+    pub fn descriptor<D: Descriptor>(mut self, definition: DescriptorDef<D>) -> Self {
+        self.descriptors.push(Box::new(definition));
+        self
     }
 
     /// Allow clients to read the value through [`Readable::read`].
@@ -377,6 +422,9 @@ pub(crate) trait RegisteredCharacteristic: Send + Sync {
     fn access(&self) -> Access;
     fn max_len(&self) -> usize;
     fn endpoint(&self) -> Option<&EndpointId>;
+    /// Custom descriptors in attachment order. The stack-managed CCCD of a
+    /// notify-capable characteristic is not among them.
+    fn descriptors(&self) -> &[Box<dyn RegisteredDescriptor>];
     /// Encode the current value into `output`. A notify-only characteristic
     /// has no read handler, but NimBLE's own notification paths
     /// (`ble_gatts_notify`, `ble_gatts_chr_updated`, and CCCD restore) read
@@ -403,6 +451,10 @@ impl<C: Characteristic> RegisteredCharacteristic for CharacteristicDef<C> {
 
     fn endpoint(&self) -> Option<&EndpointId> {
         self.endpoint.as_ref()
+    }
+
+    fn descriptors(&self) -> &[Box<dyn RegisteredDescriptor>] {
+        &self.descriptors
     }
 
     fn read(&self, output: &mut Vec<u8>) -> Result<(), AttError> {
@@ -460,7 +512,14 @@ impl fmt::Debug for Service {
         let characteristics: Vec<_> = self
             .characteristics
             .iter()
-            .map(|characteristic| (characteristic.uuid(), characteristic.access()))
+            .map(|characteristic| {
+                let descriptors: Vec<_> = characteristic
+                    .descriptors()
+                    .iter()
+                    .map(|descriptor| (descriptor.uuid(), descriptor.access()))
+                    .collect();
+                (characteristic.uuid(), characteristic.access(), descriptors)
+            })
             .collect();
         formatter
             .debug_struct("Service")
@@ -494,12 +553,15 @@ impl GattServer {
     /// Returns an [`ErrorKind::Definition`](crate::ErrorKind::Definition)
     /// error if there are no services, a characteristic declares no
     /// capability, a characteristic uses a GATT declaration UUID
-    /// (`0x2800`–`0x2803`), or a characteristic's `MAX_LEN` exceeds
-    /// [`MAX_ATTRIBUTE_VALUE_LEN`].
+    /// (`0x2800`–`0x2803`), a descriptor declares no access, or a
+    /// characteristic's or descriptor's `MAX_LEN` exceeds
+    /// [`MAX_ATTRIBUTE_VALUE_LEN`]. Reserved descriptor UUIDs were already
+    /// rejected by [`DescriptorDef::new`].
     pub fn new(services: impl IntoIterator<Item = Service>) -> Result<Self, Error> {
         let services: Box<[Service]> = services.into_iter().collect();
         if services.is_empty() {
             return Err(Error::definition(
+                None,
                 None,
                 None,
                 "a server needs at least one service",
@@ -508,7 +570,12 @@ impl GattServer {
         for service in services.iter() {
             for characteristic in &service.characteristics {
                 let located = |problem| {
-                    Error::definition(Some(service.uuid), Some(characteristic.uuid()), problem)
+                    Error::definition(
+                        Some(service.uuid),
+                        Some(characteristic.uuid()),
+                        None,
+                        problem,
+                    )
                 };
                 if characteristic.access().is_empty() {
                     return Err(located("no read, write, or notify capability is declared"));
@@ -521,6 +588,22 @@ impl GattServer {
                 }
                 if characteristic.max_len() > MAX_ATTRIBUTE_VALUE_LEN {
                     return Err(located("MAX_LEN exceeds the 512-byte attribute limit"));
+                }
+                for descriptor in characteristic.descriptors() {
+                    let located = |problem| {
+                        Error::definition(
+                            Some(service.uuid),
+                            Some(characteristic.uuid()),
+                            Some(descriptor.uuid()),
+                            problem,
+                        )
+                    };
+                    if descriptor.access().is_empty() {
+                        return Err(located("no read or write access is declared"));
+                    }
+                    if descriptor.max_len() > MAX_ATTRIBUTE_VALUE_LEN {
+                        return Err(located("MAX_LEN exceeds the 512-byte attribute limit"));
+                    }
                 }
             }
         }
@@ -967,5 +1050,195 @@ mod tests {
             read(server.services()[0].characteristics()[1].as_ref()),
             Ok(vec![33])
         );
+    }
+
+    /// A per-characteristic setting descriptor with its own state.
+    struct Setting {
+        uuid: u16,
+        value: Arc<Mutex<u8>>,
+    }
+
+    impl Descriptor for Setting {
+        type Value = u8;
+        fn uuid(&self) -> Uuid {
+            Uuid::Uuid16(self.uuid)
+        }
+    }
+
+    impl ReadableDescriptor for Setting {
+        fn read(&self) -> Result<u8, AttError> {
+            Ok(*self.value.lock().unwrap())
+        }
+    }
+
+    impl WritableDescriptor for Setting {
+        fn write(&self, value: u8) -> Result<(), AttError> {
+            *self.value.lock().unwrap() = value;
+            Ok(())
+        }
+    }
+
+    struct Oversized;
+
+    impl Descriptor for Oversized {
+        type Value = Vec<u8>;
+        const MAX_LEN: usize = MAX_ATTRIBUTE_VALUE_LEN + 1;
+        fn uuid(&self) -> Uuid {
+            Uuid::Uuid16(0x2901)
+        }
+    }
+
+    impl ReadableDescriptor for Oversized {
+        fn read(&self) -> Result<Vec<u8>, AttError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn setting(uuid: u16, value: &Arc<Mutex<u8>>) -> DescriptorDef<Setting> {
+        DescriptorDef::new(Setting {
+            uuid,
+            value: Arc::clone(value),
+        })
+        .unwrap()
+    }
+
+    fn descriptor_access(read: bool, write: bool) -> descriptor::DescriptorAccess {
+        descriptor::DescriptorAccess { read, write }
+    }
+
+    #[test]
+    fn descriptors_attach_to_their_characteristic_with_independent_access() {
+        let shared = Arc::new(Shared::default());
+        let (first, second, third) = (Arc::default(), Arc::default(), Arc::default());
+        let (level, _) = CharacteristicDef::new(Level(shared.clone()))
+            .readable()
+            .descriptor(setting(0x2901, &first).readable())
+            .descriptor(setting(0x2904, &second).writable())
+            .notifiable();
+        let name = CharacteristicDef::new(Name(shared))
+            .writable()
+            .descriptor(setting(0x2901, &third).readable().writable());
+        let service = Service::primary(Uuid::Uuid16(0x180f))
+            .characteristic(level)
+            .characteristic(name)
+            .characteristic(CharacteristicDef::new(Alert).notifiable().0);
+        let server = GattServer::new([service]).unwrap();
+        let characteristics = server.services()[0].characteristics();
+
+        let layout: Vec<_> = characteristics
+            .iter()
+            .map(|characteristic| {
+                (
+                    characteristic.access(),
+                    characteristic
+                        .descriptors()
+                        .iter()
+                        .map(|descriptor| (descriptor.uuid(), descriptor.access()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            layout,
+            [
+                (
+                    access(true, false, false, true),
+                    vec![
+                        (Uuid::Uuid16(0x2901), descriptor_access(true, false)),
+                        (Uuid::Uuid16(0x2904), descriptor_access(false, true)),
+                    ]
+                ),
+                (
+                    access(false, true, false, false),
+                    vec![(Uuid::Uuid16(0x2901), descriptor_access(true, true))]
+                ),
+                // Notify-only: the stack supplies the CCCD; no custom
+                // descriptor or subscription state is created here.
+                (access(false, false, false, true), vec![]),
+            ]
+        );
+        assert!(format!("{server:?}").contains("Uuid16(10500)"));
+    }
+
+    #[test]
+    fn descriptor_requests_route_to_their_own_parent() {
+        let shared = Arc::new(Shared::default());
+        let (first, second) = (Arc::new(Mutex::new(1)), Arc::new(Mutex::new(2)));
+        let service = Service::primary(Uuid::Uuid16(0x180f))
+            .characteristic(
+                CharacteristicDef::new(Level(shared.clone()))
+                    .readable()
+                    .descriptor(setting(0x2901, &first).readable().writable()),
+            )
+            .characteristic(
+                CharacteristicDef::new(Level(shared.clone()))
+                    .readable()
+                    .descriptor(setting(0x2901, &second).readable().writable()),
+            );
+        let server = GattServer::new([service]).unwrap();
+        let characteristics = server.services()[0].characteristics();
+        let own = |index: usize| characteristics[index].descriptors()[0].as_ref();
+
+        assert_eq!(own(1).write(&[20]), Ok(()));
+        assert_eq!((*first.lock().unwrap(), *second.lock().unwrap()), (1, 20));
+        let mut output = Vec::new();
+        own(0).read(&mut output).unwrap();
+        assert_eq!(output, [1]);
+
+        // Descriptor writes never reach the parent characteristic's handler.
+        assert_eq!(own(0).write(&[30]), Ok(()));
+        assert_eq!(*shared.level.lock().unwrap(), 0);
+        assert_eq!(
+            characteristics[0].write(&[5]),
+            Err(AttError::WRITE_NOT_PERMITTED),
+            "the read-only characteristic stays read-only despite a writable descriptor"
+        );
+    }
+
+    #[test]
+    fn invalid_descriptors_are_rejected_with_their_location() {
+        let value = Arc::default();
+        let bare = Service::primary(Uuid::Uuid16(0x180f)).characteristic(
+            CharacteristicDef::new(Level(Arc::default()))
+                .readable()
+                .descriptor(setting(0x2901, &value)),
+        );
+        let error = GattServer::new([bare]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Definition);
+        assert_eq!(
+            error.to_string(),
+            "invalid GATT definition: service 180f: characteristic 2a19: descriptor 2901: no read or write access is declared"
+        );
+
+        let oversized = Service::primary(Uuid::Uuid16(0x180f)).characteristic(
+            CharacteristicDef::new(Level(Arc::default()))
+                .readable()
+                .descriptor(DescriptorDef::new(Oversized).unwrap().readable()),
+        );
+        let error = GattServer::new([oversized]).unwrap_err();
+        assert!(error
+            .to_string()
+            .ends_with("descriptor 2901: MAX_LEN exceeds the 512-byte attribute limit"));
+    }
+
+    #[test]
+    fn registered_storage_keeps_its_address_when_the_server_moves() {
+        let value = Arc::default();
+        let service = Service::primary(Uuid::Uuid16(0x180f)).characteristic(
+            CharacteristicDef::new(Level(Arc::default()))
+                .readable()
+                .descriptor(setting(0x2901, &value).readable()),
+        );
+        let server = GattServer::new([service]).unwrap();
+        let addresses = |server: &GattServer| {
+            let characteristic = &server.services()[0].characteristics()[0];
+            (
+                std::ptr::from_ref(characteristic.as_ref()).cast::<()>(),
+                std::ptr::from_ref(characteristic.descriptors()[0].as_ref()).cast::<()>(),
+            )
+        };
+        let before = addresses(&server);
+        let moved = Box::new(server);
+        assert_eq!(addresses(&moved), before);
     }
 }
