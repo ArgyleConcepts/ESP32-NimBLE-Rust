@@ -28,6 +28,8 @@ pub(crate) mod native;
 
 #[cfg(argyle_nimble_esp)]
 pub(crate) mod esp;
+#[cfg(argyle_nimble_esp)]
+mod esp_gatt;
 
 #[cfg(test)]
 pub(crate) mod fake;

@@ -15,7 +15,10 @@ use super::gap::GapEvent;
 use super::native::{
     check, native_length, Backend, NativeError, NativeEvent, NativeResult, Operation,
 };
+use crate::gatt::registration::{CharacteristicSlot, DescriptorSlot, GattPlan};
+use crate::Uuid;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// One-shot rendezvous: a worker calls [`Gate::pass`] and blocks until the
@@ -111,6 +114,10 @@ pub(crate) enum NativeCall {
         connection: u16,
     },
     InferAddress,
+    GattCount,
+    GattAdd,
+    /// The registration's tables were freed.
+    RegistrationFreed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,6 +147,12 @@ pub(crate) struct FakeMbuf {
     id: u32,
 }
 
+impl FakeMbuf {
+    pub(crate) fn id(&self) -> u32 {
+        self.id
+    }
+}
+
 struct MbufRecord {
     data: Vec<u8>,
     state: MbufState,
@@ -160,6 +173,47 @@ struct FakeState {
     notifications: Vec<(u16, u16, Vec<u8>)>,
     mtu: HashMap<u16, u16>,
     host_thread: Option<std::thread::ThreadId>,
+}
+
+/// A characteristic as the fake registered it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FakeCharacteristic {
+    pub(crate) uuid: Uuid,
+    pub(crate) access: crate::gatt::Access,
+    pub(crate) slot: CharacteristicSlot,
+    pub(crate) descriptors: Vec<(Uuid, crate::gatt::DescriptorAccess, DescriptorSlot)>,
+}
+
+/// A service as the fake registered it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FakeService {
+    pub(crate) uuid: Uuid,
+    pub(crate) characteristics: Vec<FakeCharacteristic>,
+}
+
+/// The fake's tables: a snapshot of the plan and the value-handle slots it
+/// fills on registration. Dropping it records
+/// [`NativeCall::RegistrationFreed`].
+pub(crate) struct FakeRegistration {
+    pub(crate) services: Vec<FakeService>,
+    handles: Box<[AtomicU16]>,
+    state: Arc<Mutex<FakeState>>,
+}
+
+// SAFETY: the slot pointers are only compared and dereferenced by tests while
+// the server they point into is alive, as native code would.
+unsafe impl Send for FakeRegistration {}
+// SAFETY: as above; the handles are atomics.
+unsafe impl Sync for FakeRegistration {}
+
+impl Drop for FakeRegistration {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .calls
+            .push(NativeCall::RegistrationFreed);
+    }
 }
 
 /// Cheaply cloneable handle to one shared fake host.
@@ -341,6 +395,7 @@ impl FakeBackend {
 
 impl Backend for FakeBackend {
     type Mbuf = FakeMbuf;
+    type Registration = FakeRegistration;
 
     fn host_init(&self) -> NativeResult<()> {
         check(
@@ -543,6 +598,77 @@ impl Backend for FakeBackend {
     fn mtu(&self, connection: u16) -> Option<u16> {
         self.enter(Operation::Mtu, NativeCall::Mtu { connection });
         self.lock().mtu.get(&connection).copied()
+    }
+
+    fn prepare_gatt(&self, plan: &GattPlan) -> FakeRegistration {
+        let services: Vec<FakeService> = plan
+            .services
+            .iter()
+            .map(|service| FakeService {
+                uuid: service.uuid,
+                characteristics: service
+                    .characteristics
+                    .iter()
+                    .map(|characteristic| FakeCharacteristic {
+                        uuid: characteristic.uuid,
+                        access: characteristic.access,
+                        slot: characteristic.slot,
+                        descriptors: characteristic
+                            .descriptors
+                            .iter()
+                            .map(|descriptor| (descriptor.uuid, descriptor.access, descriptor.slot))
+                            .collect(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let count = plan.characteristics().count();
+        FakeRegistration {
+            services,
+            handles: (0..count).map(|_| AtomicU16::new(0)).collect(),
+            state: self.state.clone(),
+        }
+    }
+
+    /// Assigns handles as NimBLE lays out attributes, starting after the
+    /// stack's own services: each service declaration, then per
+    /// characteristic its declaration, value, the CCCD when notify-capable,
+    /// and its descriptors. (NimBLE assigns them when the host starts.)
+    fn register_gatt(&self, registration: &FakeRegistration) -> NativeResult<()> {
+        check(
+            Operation::GattCount,
+            self.enter(Operation::GattCount, NativeCall::GattCount),
+        )?;
+        check(
+            Operation::GattAdd,
+            self.enter(Operation::GattAdd, NativeCall::GattAdd),
+        )?;
+        // `next` is the next free handle; the stack's services end at 0x10.
+        let mut next = 0x0011_u16;
+        let mut slots = registration.handles.iter();
+        for service in &registration.services {
+            next += 1; // service declaration
+            for characteristic in &service.characteristics {
+                let value = next + 1; // after the characteristic declaration
+                slots
+                    .next()
+                    .expect("one slot per characteristic")
+                    .store(value, Ordering::Relaxed);
+                next = value
+                    + 1
+                    + u16::from(characteristic.access.notify)
+                    + characteristic.descriptors.len() as u16;
+            }
+        }
+        Ok(())
+    }
+
+    fn value_handles(&self, registration: &FakeRegistration) -> Vec<u16> {
+        registration
+            .handles
+            .iter()
+            .map(|handle| handle.load(Ordering::Relaxed))
+            .collect()
     }
 
     fn is_host_task(&self) -> bool {

@@ -4,6 +4,6 @@ use argyle_nimble::gatt::Service;
 use argyle_nimble::Uuid;
 
 fn main() {
-    let service = Service::primary(Uuid::Uuid16(0x1801));
+    let service = Service::primary(Uuid::Uuid16(0x181d));
     let _ = service.characteristics();
 }

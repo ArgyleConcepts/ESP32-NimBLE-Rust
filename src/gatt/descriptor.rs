@@ -41,7 +41,7 @@ pub trait Descriptor: Send + Sync + 'static {
 pub trait ReadableDescriptor: Descriptor<Value: Encode> {
     /// Return the current value, or the ATT error to send to the client.
     /// One client read of a long value may call this more than once; see the
-    /// [module documentation](crate::gatt#planned-request-handling).
+    /// [module documentation](crate::gatt#request-handling).
     fn read(&self) -> Result<Self::Value, AttError>;
 }
 
