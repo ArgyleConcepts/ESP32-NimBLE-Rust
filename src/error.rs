@@ -6,8 +6,8 @@
 //!   connected client, such as "write not permitted". It is a valid ATT error
 //!   code, not a failure of this framework.
 //! - [`Error`] reports a failure of the framework itself: lifecycle misuse,
-//!   native backend failures, values that cannot be encoded, or invalid GATT
-//!   definitions. It is never sent to the client.
+//!   native backend failures, time limits, values that cannot be encoded, or
+//!   invalid GATT definitions. It is never sent to the client.
 //!
 //! No conversion exists from [`AttError`] to [`Error`]. A decode failure in a
 //! handler converts to the ATT error the client should see with `?`; see the
@@ -238,6 +238,9 @@ pub enum ErrorKind {
     /// An outgoing value could not be encoded. The error's
     /// [`source`](std::error::Error::source) is the [`EncodeError`].
     Encode,
+    /// An operation did not complete within its time limit, such as host
+    /// synchronization during startup.
+    Timeout,
     /// A GATT definition is structurally invalid, such as a characteristic
     /// with no read, write, or notify capability, or a reserved or repeated
     /// descriptor UUID.
@@ -250,6 +253,7 @@ impl fmt::Display for ErrorKind {
             Self::Lifecycle => "lifecycle error",
             Self::Backend => "native backend error",
             Self::Encode => "encoding error",
+            Self::Timeout => "timed out",
             Self::Definition => "invalid GATT definition",
         })
     }
@@ -276,6 +280,8 @@ enum Cause {
     Encode(EncodeError),
     // Boxed so the common error paths stay small.
     Definition(Box<DefinitionLocation>),
+    // The cleanup failure that poisoned the host.
+    Poisoned(Box<Error>),
 }
 
 #[derive(Debug)]
@@ -335,6 +341,16 @@ impl Error {
     }
 }
 
+impl Error {
+    /// The host is poisoned because cleanup failed with `cause`.
+    pub(crate) fn poisoned(cause: Error) -> Self {
+        Self {
+            kind: ErrorKind::Lifecycle,
+            cause: Cause::Poisoned(Box::new(cause)),
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.cause {
@@ -365,6 +381,11 @@ impl fmt::Display for Error {
                 operation: None,
                 message,
             } => write!(formatter, "{}: {message}", self.kind),
+            Cause::Poisoned(cause) => write!(
+                formatter,
+                "{}: the BLE host could not be shut down cleanly and is poisoned: {cause}",
+                self.kind
+            ),
             Cause::Backend(error) => write!(formatter, "{}: {error}", self.kind),
             Cause::Encode(error) => write!(formatter, "{}: {error}", self.kind),
         }
@@ -377,6 +398,7 @@ impl std::error::Error for Error {
             Cause::Message { .. } | Cause::Definition(_) => None,
             Cause::Backend(error) => Some(error),
             Cause::Encode(error) => Some(error),
+            Cause::Poisoned(cause) => Some(cause.as_ref()),
         }
     }
 }

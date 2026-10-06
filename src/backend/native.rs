@@ -35,6 +35,7 @@ pub(crate) enum Operation {
     Terminate,
     AdvertisingStop,
     Mtu,
+    InferAddress,
 }
 
 impl Operation {
@@ -56,6 +57,7 @@ impl Operation {
             Self::Terminate => "ble_gap_terminate",
             Self::AdvertisingStop => "ble_gap_adv_stop",
             Self::Mtu => "ble_att_mtu",
+            Self::InferAddress => "ble_hs_id_infer_auto",
         }
     }
 
@@ -79,7 +81,8 @@ impl Operation {
             | Self::Notify
             | Self::Terminate
             | Self::AdvertisingStop
-            | Self::Mtu => BackendDetail::HostStatus(code),
+            | Self::Mtu
+            | Self::InferAddress => BackendDetail::HostStatus(code),
         }
     }
 }
@@ -274,6 +277,13 @@ pub(crate) trait Backend: Send + Sync {
     fn advertising_stop(&self) -> NativeResult<()>;
     /// ATT MTU for a connection, or `None` when the SDK reports no connection.
     fn mtu(&self, connection: u16) -> Option<u16>;
+    /// The own-address type to advertise with, without privacy. Valid only
+    /// after the host has synchronized.
+    fn infer_address_type(&self) -> NativeResult<u8>;
+    /// Whether the caller is running on the native host task. Operations that
+    /// wait for the host task, such as stopping it, would wait for themselves
+    /// there; this covers every native callback, not only dispatched events.
+    fn is_host_task(&self) -> bool;
 }
 
 #[cfg(test)]
@@ -437,6 +447,7 @@ mod tests {
             Operation::Terminate,
             Operation::AdvertisingStop,
             Operation::Mtu,
+            Operation::InferAddress,
         ];
         let names: std::collections::BTreeSet<_> = operations
             .iter()

@@ -1,0 +1,16 @@
+warning: unreachable expression
+ --> tests/ui/ble/fail/forged_owner.rs:6:27
+  |
+6 |     let _: Ble<Running> = Ble { state: todo!() };
+  |                           ^^^^^^^^^^^^^-------^^
+  |                           |            |
+  |                           |            any code following this expression is unreachable
+  |                           unreachable expression
+  |
+  = note: `#[warn(unreachable_code)]` on by default
+
+error[E0451]: field `state` of struct `Ble` is private
+ --> tests/ui/ble/fail/forged_owner.rs:6:33
+  |
+6 |     let _: Ble<Running> = Ble { state: todo!() };
+  |                                 ^^^^^ private field
