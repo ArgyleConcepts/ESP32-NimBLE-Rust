@@ -127,7 +127,7 @@ impl Transfer {
 
     /// Discard the transfer in progress, if any. Committed transfers were
     /// already handed over and are unaffected. `reset_on_disconnect` calls
-    /// this when the client's connection ends.
+    /// this when the served client's link ends.
     pub fn reset(&self) {
         *self.session() = None;
     }
@@ -265,6 +265,10 @@ impl Writable for Data {
 /// client is connected, so they never discard the served client's transfer.
 /// It ignores `ConnectionRejected`, which concerns a second link while the
 /// served client stays connected.
+///
+/// Requests carry no connection, so a link the framework is terminating
+/// can still reach the session until it closes, and its end is not
+/// reported; a client aborts or reads the status before it begins.
 pub fn reset_on_disconnect(transfer: &Arc<Transfer>) -> impl ConnectionHandler {
     let transfer = transfer.clone();
     move |event: ConnectionEvent| match event {
@@ -281,5 +285,9 @@ pub fn transfer_service(transfer: &Arc<Transfer>) -> Service {
     Service::primary(SERVICE)
         .characteristic(CharacteristicDef::new(Control(transfer.clone())).writable())
         .characteristic(CharacteristicDef::new(Status(transfer.clone())).readable())
-        .characteristic(CharacteristicDef::new(Data(transfer.clone())).writable())
+        .characteristic(
+            CharacteristicDef::new(Data(transfer.clone()))
+                .writable()
+                .writable_without_response(),
+        )
 }

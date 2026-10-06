@@ -226,10 +226,12 @@
 //!   (`ble_gatts_val_access`), so when its buffers run out a Read Blob
 //!   response can come back short, which a client takes as the end of the
 //!   value. NimBLE also answers Read Using Characteristic UUID and Read
-//!   Multiple requests from the read handler, within one response: the
-//!   first refuses a first matching value longer than 19 bytes with
-//!   `UNLIKELY` and leaves out later matches that long, and the second
-//!   truncates its response to the MTU. Clients read long values by handle.
+//!   Multiple requests from the read handler, within one response. For Read
+//!   Using Characteristic UUID, the first matching value longer than 19
+//!   bytes ends the response (`ble_att_svr_build_read_type_rsp`): if it is
+//!   the first match the request fails with `UNLIKELY`, otherwise it and
+//!   every later match are left out. Read Multiple truncates its response
+//!   to the MTU. Clients read long values by handle.
 //! - **Writing long values.** Every write that reaches a handler is one
 //!   complete value. A client writes more than MTU - 3 bytes with a GATT
 //!   long write: Prepare Write requests of at most MTU - 5 bytes that NimBLE
@@ -295,20 +297,29 @@
 //!   supplies. If the channel is full, Commit fails with an application
 //!   error and the transfer stays complete, so the client commits again
 //!   later. Nothing committed waits in the session to be discarded.
-//! - The session holds only an uncommitted transfer and belongs to the
-//!   client's connection. The application registers `reset_on_disconnect`
-//!   with [`Ble::connection_handler`](crate::Ble::connection_handler), so
+//! - The session holds only an uncommitted transfer and is meant for the
+//!   served client's connection. The application registers
+//!   `reset_on_disconnect` with
+//!   [`Ble::connection_handler`](crate::Ble::connection_handler), so
 //!   [`ConnectionEvent::Disconnected`](crate::ConnectionEvent::Disconnected)
-//!   resets the session and a later client starts afresh. It also resets on
-//!   `ConnectionFailed` and `HostReset`, which end links that may have made
-//!   requests before their connection was reported and are reported only
-//!   while no client is connected, and ignores `ConnectionRejected`, which
-//!   leaves the served client connected. Reset and Abort never affect
-//!   committed transfers; a client that abandons a transfer while connected
-//!   aborts it before beginning another.
-//! - Data uses Write Requests so the client sees each result. Write Commands
-//!   are faster but carry no response, so a client using them must check the
-//!   status before committing.
+//!   resets it. It also resets on `ConnectionFailed` and `HostReset`, which
+//!   end links that may have made requests before their connection was
+//!   reported and are reported only while no client is connected, and
+//!   ignores `ConnectionRejected`, which leaves the served client connected.
+//!   Reset and Abort never affect committed transfers.
+//! - Handlers do not see which link a request came from, and NimBLE serves
+//!   ATT on every link. A link the framework is terminating, such as a
+//!   rejected second client or one whose connection was reported as failed,
+//!   can still make requests until it closes; they share the session, and
+//!   that link's end is not reported, so a transfer it began can remain. A
+//!   client therefore aborts (which succeeds when nothing is in progress)
+//!   or reads the status before it begins, and a client that abandons a
+//!   transfer aborts it before beginning another.
+//! - The data characteristic accepts Write Requests and Write Commands.
+//!   Requests let the client see each result; commands are faster but carry
+//!   no response, so a client using them reads the status before
+//!   committing. (NimBLE grants both once either is declared; the example
+//!   declares both.)
 //! - To transfer in the other direction, a client can write the offset it
 //!   wants and then read one chunk of at most MTU - 1 bytes, so each chunk
 //!   arrives in a single read.

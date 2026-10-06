@@ -79,6 +79,13 @@ impl<'s> Client<'s> {
         self.model.write(self.data, &value)
     }
 
+    /// Send one chunk as a Write Command, whose result the client never
+    /// sees.
+    fn chunk_command(&self, offset: usize, bytes: &[u8]) {
+        let value = [&(offset as u32).to_le_bytes()[..], bytes].concat();
+        let _ = self.model.write_command(self.data, &value);
+    }
+
     /// Send `bytes` from `from` in chunks of the documented size.
     fn send(&self, bytes: &[u8], from: usize) -> Result<(), AttError> {
         let chunk_len = self.chunk_len();
@@ -115,6 +122,7 @@ impl Host {
                 ConnectionEvent::Disconnected { .. } => "disconnected",
                 ConnectionEvent::ConnectionFailed { .. } => "failed",
                 ConnectionEvent::HostReset { .. } => "reset",
+                ConnectionEvent::ConnectionRejected { .. } => "rejected",
                 _ => "other",
             });
             reset.on_event(event);
@@ -276,6 +284,9 @@ fn refused_and_failed_chunks_change_nothing_and_the_client_resumes() {
         client.begin(TRANSFER_LIMIT as u32 + 1),
         Err(AttError::OUT_OF_RANGE)
     );
+    client.begin(TRANSFER_LIMIT as u32).unwrap();
+    assert_eq!(client.progress(), (0, TRANSFER_LIMIT));
+    client.abort().unwrap();
     client.begin(4).unwrap();
     assert_eq!(
         client.begin(4),
@@ -408,5 +419,118 @@ fn disconnect_and_abort_discard_the_uncommitted_transfer() {
     client.commit().unwrap();
     assert_eq!(host.committed.try_recv(), Ok(first));
     assert!(host.committed.try_recv().is_err());
+    assert_eq!(host.fake.assert_balanced(), Ok(()));
+}
+
+#[test]
+fn write_commands_carry_chunks_and_the_status_confirms_them() {
+    let (transfer, committed) = application(1);
+    let server = GattServer::new([transfer_service(&transfer)]).unwrap();
+    let plan = super::registration::GattPlan::new(&server);
+    let data = plan.characteristics().nth(2).unwrap().access;
+    assert!(data.write && data.write_without_response);
+    let fake = FakeBackend::new();
+    let client = Client::connect(&fake, &server, 23);
+    let bytes = image(40, 4);
+    client.begin(40).unwrap();
+    client.chunk_command(0, &bytes[..16]);
+    // A repeated command is refused without the client knowing; the
+    // status shows where the transfer stands.
+    client.chunk_command(0, &bytes[..16]);
+    assert_eq!(client.progress(), (16, 40));
+    client.chunk_command(16, &bytes[16..32]);
+    client.chunk_command(32, &bytes[32..]);
+    assert_eq!(client.progress(), (40, 40));
+    client.commit().unwrap();
+    assert_eq!(committed.try_recv(), Ok(bytes));
+    assert_eq!(fake.assert_balanced(), Ok(()));
+}
+
+#[test]
+fn other_links_leave_the_session_alone_and_unreported_ones_follow_their_outcome() {
+    let host = Host::start();
+    let client = host.connect(1, 23);
+    assert_eq!(host.seen(), ["connected"]);
+    let bytes = image(100, 5);
+
+    // A second client is rejected while the first is mid-transfer.
+    client.begin(100).unwrap();
+    client.chunk(0, &bytes[..16]).unwrap();
+    host.fake.create_link(2);
+    host.gap(GapEvent::Connect {
+        connection: 2,
+        status: 0,
+    });
+    assert_eq!(host.seen(), ["rejected"]);
+    assert_eq!(client.progress(), (16, 100));
+    let mut client = client;
+    host.disconnect(&mut client, 1);
+    assert_eq!(host.seen(), ["disconnected"]);
+
+    // Requests on a link NimBLE has not reported yet. A failed feature
+    // exchange (raw HCI 0x3b) reports the failure, resetting the session
+    // once, and the framework's termination of the link.
+    host.fake.create_link(4);
+    let early = Client::connect(&host.fake, host.running.server(), 23);
+    early.begin(100).unwrap();
+    early.chunk(0, &bytes[..16]).unwrap();
+    host.gap(GapEvent::Connect {
+        connection: 4,
+        status: 0x3b,
+    });
+    assert_eq!(host.seen(), ["failed", "rejected"]);
+    assert_eq!(early.progress(), (0, 0));
+
+    // Once such a link is reported connected, its earlier requests are the
+    // served client's and stay.
+    host.fake.create_link(5);
+    early.begin(100).unwrap();
+    early.chunk(0, &bytes[..16]).unwrap();
+    host.gap(GapEvent::Connect {
+        connection: 5,
+        status: 0,
+    });
+    assert_eq!(host.seen(), ["connected"]);
+    assert_eq!(early.progress(), (16, 100));
+    assert_eq!(host.fake.assert_balanced(), Ok(()));
+}
+
+#[test]
+fn a_terminated_links_late_transfer_is_cleared_by_the_next_clients_abort() {
+    let host = Host::start();
+    // A link fails its feature exchange after beginning a transfer; the
+    // failure resets the session, but the link stays open until its
+    // termination completes and begins again.
+    host.fake.create_link(3);
+    let late = Client::connect(&host.fake, host.running.server(), 23);
+    late.begin(30).unwrap();
+    host.gap(GapEvent::Connect {
+        connection: 3,
+        status: 0x3b,
+    });
+    assert_eq!(host.seen(), ["failed", "rejected"]);
+    late.begin(50).unwrap();
+    // Its end is not reported, so nothing resets that transfer.
+    host.gap(GapEvent::Disconnect {
+        connection: 3,
+        reason: 0x216,
+    });
+    assert!(host.seen().is_empty());
+    assert_eq!(late.progress(), (0, 50));
+
+    // The next client recovers as documented: Begin is refused, the status
+    // shows a transfer it did not start, and Abort clears it.
+    let client = host.connect(1, 23);
+    assert_eq!(
+        client.begin(20),
+        Err(AttError::PROCEDURE_ALREADY_IN_PROGRESS)
+    );
+    assert_eq!(client.progress(), (0, 50));
+    client.abort().unwrap();
+    let bytes = image(20, 6);
+    client.begin(20).unwrap();
+    client.send(&bytes, 0).unwrap();
+    client.commit().unwrap();
+    assert_eq!(host.committed.try_recv(), Ok(bytes));
     assert_eq!(host.fake.assert_balanced(), Ok(()));
 }

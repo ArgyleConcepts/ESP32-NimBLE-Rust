@@ -267,6 +267,13 @@ impl<'s> AttModel<'s> {
         self.deliver(handle, &[value])
     }
 
+    /// A Write Command: the same callback as a Write Request
+    /// (`ble_att_svr_rx_write_no_rsp`), but NimBLE sends no response, so
+    /// the client never sees the result returned here.
+    pub(crate) fn write_command(&self, handle: Handle, value: &[u8]) -> Result<(), AttError> {
+        self.write(handle, value)
+    }
+
     /// Deliver one write whose value NimBLE holds as a chain of `segments`.
     pub(crate) fn deliver(&self, handle: Handle, segments: &[&[u8]]) -> Result<(), AttError> {
         let mut request = self.fake.mbuf_from_segments(segments);
