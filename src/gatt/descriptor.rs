@@ -11,6 +11,8 @@ const CCCD: u128 = Uuid::Uuid16(0x2902).to_u128();
 const EXTENDED_PROPERTIES: u128 = Uuid::Uuid16(0x2900).to_u128();
 const SERVER_CONFIGURATION: u128 = Uuid::Uuid16(0x2903).to_u128();
 const AGGREGATE_FORMAT: u128 = Uuid::Uuid16(0x2905).to_u128();
+const USER_DESCRIPTION: u128 = Uuid::Uuid16(0x2901).to_u128();
+const PRESENTATION_FORMAT: u128 = Uuid::Uuid16(0x2904).to_u128();
 
 /// An application descriptor: its UUID and the type of its value.
 ///
@@ -95,7 +97,8 @@ fn write_thunk<D: WritableDescriptor>(descriptor: &D, data: &[u8]) -> Result<(),
 ///   which applications never see.
 ///
 /// User Description (`0x2901`), Presentation Format (`0x2904`), and other
-/// descriptors are application-defined.
+/// descriptors are application-defined; [`write_restriction`] keeps the first
+/// two read-only.
 fn reserved(uuid: Uuid) -> Option<&'static str> {
     let value = uuid.to_u128();
     if value == CCCD {
@@ -113,10 +116,78 @@ fn reserved(uuid: Uuid) -> Option<&'static str> {
     }
 }
 
+/// Why a descriptor type cannot be writable, if it cannot.
+pub(super) fn write_restriction(uuid: Uuid) -> Option<&'static str> {
+    let value = uuid.to_u128();
+    if value == USER_DESCRIPTION {
+        Some("the User Description descriptor (0x2901) is read-only: writing it requires the Writable Auxiliaries extended property, which is not supported")
+    } else if value == PRESENTATION_FORMAT {
+        Some("the Characteristic Presentation Format descriptor (0x2904) is read-only")
+    } else {
+        None
+    }
+}
+
 /// A descriptor with its declared access.
 ///
 /// Each access method requires the matching handler trait, so undeclarable
 /// access fails to compile. Repeating a declaration has no further effect.
+///
+/// ```
+/// use argyle_nimble::gatt::{
+///     Characteristic, CharacteristicDef, Descriptor, DescriptorDef, GattServer, Readable,
+///     ReadableDescriptor, Service,
+/// };
+/// use argyle_nimble::{AttError, Uuid};
+///
+/// struct Level;
+///
+/// impl Characteristic for Level {
+///     type Value = u8;
+///     fn uuid(&self) -> Uuid {
+///         Uuid::Uuid16(0x2a19)
+///     }
+/// }
+///
+/// impl Readable for Level {
+///     fn read(&self) -> Result<u8, AttError> {
+///         Ok(80)
+///     }
+/// }
+///
+/// /// A User Description, which is read-only.
+/// struct Label;
+///
+/// impl Descriptor for Label {
+///     type Value = String;
+///     fn uuid(&self) -> Uuid {
+///         Uuid::Uuid16(0x2901)
+///     }
+/// }
+///
+/// impl ReadableDescriptor for Label {
+///     fn read(&self) -> Result<String, AttError> {
+///         Ok("main battery".into())
+///     }
+/// }
+///
+/// let level = CharacteristicDef::new(Level)
+///     .readable()
+///     .descriptor(DescriptorDef::new(Label)?.readable());
+/// let server = GattServer::new([Service::primary(Uuid::Uuid16(0x180f)).characteristic(level)])?;
+/// # let _ = server;
+///
+/// // The stack manages the CCCD, so a manual one is rejected.
+/// struct Subscriptions;
+/// impl Descriptor for Subscriptions {
+///     type Value = u16;
+///     fn uuid(&self) -> Uuid {
+///         Uuid::Uuid16(0x2902)
+///     }
+/// }
+/// assert!(DescriptorDef::new(Subscriptions).is_err());
+/// # Ok::<(), argyle_nimble::Error>(())
+/// ```
 pub struct DescriptorDef<D: Descriptor> {
     // Called through `RegisteredDescriptor` by registration in a later ticket
     // and by tests.
@@ -248,14 +319,14 @@ mod tests {
         }
     }
 
-    /// A user-description-style text descriptor limited to 6 bytes.
+    /// A writable text descriptor limited to 6 bytes.
     struct Label(Arc<Mutex<String>>);
 
     impl Descriptor for Label {
         type Value = String;
         const MAX_LEN: usize = 6;
         fn uuid(&self) -> Uuid {
-            Uuid::Uuid16(0x2901)
+            Uuid::parse("9b2a1c4e-7d3f-4e8a-b5c6-2f1d0e9a8b7c").unwrap()
         }
     }
 
@@ -376,6 +447,38 @@ mod tests {
         let bare = DescriptorDef::new(Label(label.clone())).unwrap();
         assert!(bare.access().is_empty());
         assert_eq!(*label.lock().unwrap(), "pump");
-        assert!(format!("{bare:?}").contains("Uuid16(10497)"));
+        assert!(format!("{bare:?}").contains("Uuid128("));
+    }
+
+    /// Reports a safe UUID the first time and the CCCD afterwards.
+    struct Shifty(std::sync::atomic::AtomicBool);
+
+    impl Descriptor for Shifty {
+        type Value = u8;
+        fn uuid(&self) -> Uuid {
+            if self.0.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                Uuid::Uuid16(0x2902)
+            } else {
+                Uuid::Uuid16(0xff10)
+            }
+        }
+    }
+
+    impl ReadableDescriptor for Shifty {
+        fn read(&self) -> Result<u8, AttError> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn the_uuid_is_read_once_so_a_later_value_cannot_bypass_the_check() {
+        let definition = DescriptorDef::new(Shifty(Default::default()))
+            .unwrap()
+            .readable();
+        assert_eq!(definition.descriptor.uuid(), Uuid::Uuid16(0x2902));
+        assert_eq!(
+            RegisteredDescriptor::uuid(&definition),
+            Uuid::Uuid16(0xff10)
+        );
     }
 }

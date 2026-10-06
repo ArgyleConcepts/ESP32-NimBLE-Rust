@@ -40,7 +40,7 @@ struct Trigger;
 impl Descriptor for Trigger {
     type Value = bool;
     fn uuid(&self) -> Uuid {
-        Uuid::Uuid128(0x0000_0001_0000_1000_8000_0080_5f9b_34fb)
+        Uuid::Uuid128(0x5c3a_9e21_8b4f_4d6a_a1e7_3f0c_2b9d_7e45)
     }
 }
 impl WritableDescriptor for Trigger {
@@ -74,7 +74,7 @@ impl WritableDescriptor for Setting {
 }
 
 fn main() -> Result<(), argyle_nimble::Error> {
-    let configured: Uuid = "a0b1c2d3-0000-1000-8000-00805f9b34fb".parse().expect("valid UUID");
+    let configured: Uuid = "d4e8f1a2-6b3c-4f9e-8a7d-1c2b3e4f5a6b".parse().expect("valid UUID");
     let setting = Setting {
         uuid: configured,
         value: Arc::new(Mutex::new(0)),

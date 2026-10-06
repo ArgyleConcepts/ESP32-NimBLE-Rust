@@ -109,13 +109,20 @@
 //!   happen at compile time; it does happen before the definition can reach
 //!   a server or NimBLE.
 //! - **[`GattServer::new`]:** every descriptor must declare read or write
-//!   access, its `MAX_LEN` must not exceed 512 bytes, and no two
-//!   descriptors of one characteristic may share a UUID, since clients look
-//!   descriptors up by UUID.
+//!   access and its `MAX_LEN` must not exceed 512 bytes. User Description
+//!   (`0x2901`) and Presentation Format (`0x2904`) descriptors must be
+//!   read-only: a writable User Description needs the Writable Auxiliaries
+//!   extended property, which is not supported, and the Presentation Format
+//!   is read-only by definition.
+//! - **Not supported:** repeating a descriptor type on one characteristic.
+//!   The specification forbids repeats of most standard descriptors, and
+//!   NimBLE's descriptor lookup and common client APIs return only the first
+//!   match, so [`GattServer::new`] rejects any repeat.
 //!
 //! NimBLE adds and manages the CCCD of every notify-capable characteristic,
-//! including client subscription state. This crate never creates a CCCD or
-//! keeps subscription state of its own, and applications cannot supply one.
+//! including client subscription state. This crate does not create a CCCD
+//! or keep subscription state of its own, and the planned notification
+//! support relies on NimBLE's; applications cannot supply one.
 //! Indications are not supported.
 //!
 //! # Planned request handling
@@ -558,9 +565,11 @@ impl GattServer {
     /// Returns an [`ErrorKind::Definition`](crate::ErrorKind::Definition)
     /// error if there are no services, a characteristic declares no
     /// capability, a characteristic uses a GATT declaration UUID
-    /// (`0x2800`–`0x2803`), a descriptor declares no access, two descriptors
-    /// of one characteristic share a UUID, or a characteristic's or
-    /// descriptor's `MAX_LEN` exceeds [`MAX_ATTRIBUTE_VALUE_LEN`]. Reserved descriptor UUIDs were already
+    /// (`0x2800`–`0x2803`), a descriptor declares no access, a User
+    /// Description (`0x2901`) or Presentation Format (`0x2904`) descriptor
+    /// declares write access, two descriptors of one characteristic share a
+    /// UUID, or a characteristic's or descriptor's `MAX_LEN` exceeds
+    /// [`MAX_ATTRIBUTE_VALUE_LEN`]. Reserved descriptor UUIDs were already
     /// rejected by [`DescriptorDef::new`].
     pub fn new(services: impl IntoIterator<Item = Service>) -> Result<Self, Error> {
         let services: Box<[Service]> = services.into_iter().collect();
@@ -609,13 +618,18 @@ impl GattServer {
                     if descriptor.max_len() > MAX_ATTRIBUTE_VALUE_LEN {
                         return Err(located("MAX_LEN exceeds the 512-byte attribute limit"));
                     }
+                    if descriptor.access().write {
+                        if let Some(problem) = descriptor::write_restriction(descriptor.uuid()) {
+                            return Err(located(problem));
+                        }
+                    }
                     let uuid = descriptor.uuid().to_u128();
                     if characteristic.descriptors()[..index]
                         .iter()
                         .any(|earlier| earlier.uuid().to_u128() == uuid)
                     {
                         return Err(located(
-                            "another descriptor of this characteristic has the same UUID",
+                            "this characteristic already has a descriptor of this type",
                         ));
                     }
                 }
@@ -1068,14 +1082,14 @@ mod tests {
 
     /// A per-characteristic setting descriptor with its own state.
     struct Setting {
-        uuid: u16,
+        uuid: Uuid,
         value: Arc<Mutex<u8>>,
     }
 
     impl Descriptor for Setting {
         type Value = u8;
         fn uuid(&self) -> Uuid {
-            Uuid::Uuid16(self.uuid)
+            self.uuid
         }
     }
 
@@ -1110,7 +1124,7 @@ mod tests {
 
     fn setting(uuid: u16, value: &Arc<Mutex<u8>>) -> DescriptorDef<Setting> {
         DescriptorDef::new(Setting {
-            uuid,
+            uuid: Uuid::Uuid16(uuid),
             value: Arc::clone(value),
         })
         .unwrap()
@@ -1127,11 +1141,11 @@ mod tests {
         let (level, _) = CharacteristicDef::new(Level(shared.clone()))
             .readable()
             .descriptor(setting(0x2901, &first).readable())
-            .descriptor(setting(0x2904, &second).writable())
+            .descriptor(setting(0xff02, &second).writable())
             .notifiable();
         let name = CharacteristicDef::new(Name(shared))
             .writable()
-            .descriptor(setting(0x2901, &third).readable().writable());
+            .descriptor(setting(0xff01, &third).readable().writable());
         let service = Service::primary(Uuid::Uuid16(0x180f))
             .characteristic(level)
             .characteristic(name)
@@ -1159,19 +1173,19 @@ mod tests {
                     access(true, false, false, true),
                     vec![
                         (Uuid::Uuid16(0x2901), descriptor_access(true, false)),
-                        (Uuid::Uuid16(0x2904), descriptor_access(false, true)),
+                        (Uuid::Uuid16(0xff02), descriptor_access(false, true)),
                     ]
                 ),
                 (
                     access(false, true, false, false),
-                    vec![(Uuid::Uuid16(0x2901), descriptor_access(true, true))]
+                    vec![(Uuid::Uuid16(0xff01), descriptor_access(true, true))]
                 ),
                 // Notify-only: the stack supplies the CCCD; no custom
                 // descriptor or subscription state is created here.
                 (access(false, false, false, true), vec![]),
             ]
         );
-        assert!(format!("{server:?}").contains("Uuid16(10500)"));
+        assert!(format!("{server:?}").contains("Uuid16(65282)"));
     }
 
     #[test]
@@ -1182,12 +1196,12 @@ mod tests {
             .characteristic(
                 CharacteristicDef::new(Level(shared.clone()))
                     .readable()
-                    .descriptor(setting(0x2901, &first).readable().writable()),
+                    .descriptor(setting(0xff01, &first).readable().writable()),
             )
             .characteristic(
                 CharacteristicDef::new(Level(shared.clone()))
                     .readable()
-                    .descriptor(setting(0x2901, &second).readable().writable()),
+                    .descriptor(setting(0xff01, &second).readable().writable()),
             );
         let server = GattServer::new([service]).unwrap();
         let characteristics = server.services()[0].characteristics();
@@ -1242,17 +1256,17 @@ mod tests {
                 .descriptor(setting(0x2904, &value).readable())
                 .descriptor(
                     DescriptorDef::new(Setting {
-                        uuid: 0x2904,
+                        uuid: Uuid::Uuid128(Uuid::Uuid16(0x2904).to_u128()),
                         value: Arc::clone(&value),
                     })
                     .unwrap()
-                    .writable(),
+                    .readable(),
                 ),
         );
         let error = GattServer::new([duplicate]).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "invalid GATT definition: service 180f: characteristic 2a19: descriptor 2904: another descriptor of this characteristic has the same UUID"
+            "invalid GATT definition: service 180f: characteristic 2a19: descriptor 00002904-0000-1000-8000-00805f9b34fb: this characteristic already has a descriptor of this type"
         );
         let spread = Service::primary(Uuid::Uuid16(0x180f))
             .characteristic(
@@ -1266,15 +1280,37 @@ mod tests {
                     .descriptor(setting(0x2904, &value).readable()),
             );
         assert!(GattServer::new([spread]).is_ok());
-        let oversized = Service::primary(Uuid::Uuid16(0x180f)).characteristic(
-            CharacteristicDef::new(Level(Arc::default()))
-                .readable()
-                .descriptor(DescriptorDef::new(Oversized).unwrap().readable()),
-        );
-        let error = GattServer::new([oversized]).unwrap_err();
-        assert!(error
-            .to_string()
-            .ends_with("descriptor 2901: MAX_LEN exceeds the 512-byte attribute limit"));
+
+        // User Description and Presentation Format are read-only here, in
+        // every UUID width.
+        let wide = DescriptorDef::new(Setting {
+            uuid: Uuid::Uuid32(0x2901),
+            value: Arc::clone(&value),
+        })
+        .unwrap()
+        .writable();
+        for (definition, problem) in [
+            (
+                setting(0x2901, &value).readable().writable(),
+                "the User Description descriptor (0x2901) is read-only",
+            ),
+            (
+                wide,
+                "the User Description descriptor (0x2901) is read-only",
+            ),
+            (
+                setting(0x2904, &value).writable(),
+                "the Characteristic Presentation Format descriptor (0x2904) is read-only",
+            ),
+        ] {
+            let service = Service::primary(Uuid::Uuid16(0x180f)).characteristic(
+                CharacteristicDef::new(Level(Arc::default()))
+                    .readable()
+                    .descriptor(definition),
+            );
+            let error = GattServer::new([service]).unwrap_err();
+            assert!(error.to_string().contains(problem), "{error}");
+        }
     }
 
     #[test]

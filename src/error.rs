@@ -239,7 +239,8 @@ pub enum ErrorKind {
     /// [`source`](std::error::Error::source) is the [`EncodeError`].
     Encode,
     /// A GATT definition is structurally invalid, such as a characteristic
-    /// with no read, write, or notify capability.
+    /// with no read, write, or notify capability, or a reserved or repeated
+    /// descriptor UUID.
     Definition,
 }
 
