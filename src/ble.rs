@@ -43,7 +43,7 @@
 //! let ble = Ble::take()?.sync_timeout(Duration::from_secs(3));
 //! let running = ble.start(server, Access::Open)?;
 //! // ... later work uses `running`; dropping it shuts the host down.
-//! running.shutdown()?;
+//! let _server = running.shutdown()?;
 //! # Ok(())
 //! # }
 //! ```
@@ -100,9 +100,17 @@
 //! step failed. A host task that has not started its host by the time a
 //! sync wait ends cannot be stopped, which also poisons.
 //!
-//! Stopping the host waits for the host task to finish its queued work.
-//! Do not drop or shut down a running owner while holding a lock that a BLE
-//! callback may take, or the two will wait for each other.
+//! Stopping the host waits for the host task to finish its queued work, and
+//! NimBLE also runs some callbacks (such as advertising completion) on the
+//! thread that stops it. Do not drop or shut down a running owner while
+//! holding a lock that a BLE callback may take, or the shutdown will wait for
+//! itself or for the host task.
+//!
+//! After shutdown, the old host task deletes itself asynchronously through
+//! ESP-IDF's single host-task handle. Take and start the host again from a
+//! thread whose priority is below the NimBLE host task's (ESP-IDF creates it
+//! at `configMAX_PRIORITIES - 4`, normally 21), so the old task finishes
+//! before a new one exists.
 //!
 //! Recovery from host faults while running, and quiescing connections and
 //! notifications before shutdown, are not implemented yet.
@@ -203,6 +211,10 @@ impl Drop for Ownership {
 struct HostState {
     synced: bool,
     last_reset: Option<i32>,
+    /// How many times a waiter has blocked, so tests can deliver events
+    /// while startup is waiting.
+    #[cfg(test)]
+    parks: usize,
 }
 
 /// Host sync and reset notifications from the native callbacks.
@@ -228,6 +240,11 @@ impl HostEvents {
             if state.synced {
                 return Ok(());
             }
+            #[cfg(test)]
+            {
+                state.parks += 1;
+                self.changed.notify_all();
+            }
             state = match deadline {
                 None => self
                     .changed
@@ -244,6 +261,28 @@ impl HostEvents {
                         .0
                 }
             };
+        }
+    }
+}
+
+#[cfg(test)]
+impl HostEvents {
+    /// Block until a waiter has blocked at least `parks` times; a waiter
+    /// that is never woken fails the test after a generous limit.
+    fn wait_until_parked(&self, parks: usize) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut state = self.lock();
+        while state.parks < parks {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the waiter was not woken to block again"
+            );
+            state = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
         }
     }
 }
@@ -288,6 +327,7 @@ pub(crate) struct Configured<B: Backend> {
     backend: B,
     ownership: Ownership,
     sync_timeout: Duration,
+    events: Arc<HostEvents>,
 }
 
 /// Acquire `slot` for an owner that drives `backend`.
@@ -300,6 +340,7 @@ pub(crate) fn take<B: Backend>(
         backend,
         ownership: slot.acquire()?,
         sync_timeout: DEFAULT_SYNC_TIMEOUT,
+        events: Arc::default(),
     })
 }
 
@@ -309,7 +350,7 @@ impl<B: Backend> Configured<B> {
     }
 
     pub(crate) fn start(self, server: GattServer) -> Result<Started<B>, StartError> {
-        let events = Arc::new(HostEvents::default());
+        let events = self.events;
         let dispatcher = Arc::new(EventDispatcher::new());
         dispatcher
             .attach(events.clone())
@@ -670,15 +711,21 @@ impl Ble<Configuring> {
 }
 
 impl Ble<Running> {
-    /// Shut the host down and release ownership, reporting whether cleanup
-    /// succeeded. Dropping the owner does the same without a report.
+    /// Shut the host down and release ownership, returning the GATT server
+    /// for a later start. Dropping the owner does the same without a report.
     ///
     /// Fails with an [`ErrorKind::Lifecycle`] error if the host is now
     /// poisoned; its [`source`](std::error::Error::source) is the cleanup
     /// failure. Call it from an application thread, never from a BLE
     /// callback or the host task.
-    pub fn shutdown(mut self) -> Result<(), Error> {
-        self.state.inner.shutdown().map(drop)
+    pub fn shutdown(mut self) -> Result<GattServer, Error> {
+        self.state.inner.shutdown()?.ok_or_else(|| {
+            Error::new(
+                ErrorKind::Lifecycle,
+                Some("shutdown"),
+                "the host was already shut down",
+            )
+        })
     }
 }
 
@@ -842,6 +889,64 @@ mod tests {
         assert_eq!(fake.calls(), expected, "no other native call, such as NVS");
         assert_eq!(freed_after.lock().unwrap().as_deref(), Some(&expected[..]));
         assert!(take(fake, slot).is_ok(), "released after shutdown");
+    }
+
+    #[test]
+    fn startup_waits_for_a_sync_that_arrives_while_it_is_blocked() {
+        let fake = FakeBackend::new();
+        let (server, _) = witness_server(&fake);
+        let mut configured = take(fake.clone(), new_slot()).unwrap();
+        // Far longer than the bound below, so only a prompt wake-up passes.
+        configured.set_sync_timeout(Duration::from_secs(3600));
+        let events = configured.events.clone();
+        let starting = thread::spawn(move || configured.start(server));
+
+        events.wait_until_parked(1);
+        assert_eq!(
+            fake.calls(),
+            [
+                NativeCall::HostInit,
+                NativeCall::InstallCallbacks,
+                NativeCall::HostStart
+            ],
+            "not ready, so no address inference yet"
+        );
+        // A reset while waiting wakes the waiter, which blocks again.
+        fake.inject(NativeEvent::HostReset { reason: 19 });
+        events.wait_until_parked(2);
+        assert_eq!(fake.calls().len(), 3);
+        let synced_at = Instant::now();
+        fake.inject(NativeEvent::HostSynced);
+        let running = starting.join().unwrap().expect("ready after the sync");
+        assert!(
+            synced_at.elapsed() < Duration::from_secs(30),
+            "the sync wakes the waiter instead of the timeout"
+        );
+        assert_eq!(fake.calls(), STARTUP);
+        drop(running);
+    }
+
+    #[test]
+    fn a_reset_after_sync_clears_readiness() {
+        use NativeCall::*;
+        let (error, _) = failing_start(
+            StartStage::Synchronization,
+            |_| {},
+            vec![
+                NativeEvent::HostSynced,
+                NativeEvent::HostReset { reason: 7 },
+            ],
+            &[
+                HostInit,
+                InstallCallbacks,
+                HostStart,
+                HostStop,
+                HostDeinit,
+                RemoveCallbacks,
+            ],
+        );
+        assert_eq!(error.error().kind(), ErrorKind::Timeout);
+        assert_eq!(error.last_host_reset(), Some(7));
     }
 
     #[test]
