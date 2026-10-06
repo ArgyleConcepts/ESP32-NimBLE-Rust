@@ -1,0 +1,21 @@
+error[E0277]: the trait bound `Raw: argyle_nimble::codec::Encode` is not satisfied
+  --> tests/ui/gatt/fail/read_without_encoding.rs:21:6
+   |
+21 | impl Readable for Status {
+   |      ^^^^^^^^ the trait `argyle_nimble::codec::Encode` is not implemented for `Raw`
+   |
+   = help: the following other types implement trait `argyle_nimble::codec::Encode`:
+             &T
+             BigEndian<f32>
+             BigEndian<f64>
+             BigEndian<i128>
+             BigEndian<i16>
+             BigEndian<i32>
+             BigEndian<i64>
+             BigEndian<i8>
+           and $N others
+note: required by a bound in `Readable`
+  --> src/gatt.rs
+   |
+   | pub trait Readable: Characteristic<Value: Encode> {
+   |                                           ^^^^^^ required by this bound in `Readable`

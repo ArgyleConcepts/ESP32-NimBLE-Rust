@@ -108,7 +108,10 @@ Second, [`eng/validate-firmware-link.py`](../eng/validate-firmware-link.py)
 packages the crate with `cargo package`. It instantiates the generic
 [firmware fixture](../eng/test/fixture/firmware/main/CMakeLists.txt) in the job directory against
 the extracted package, and Cargo metadata must resolve argyle-nimble there.
-The fixture lockfile must equal the repository lock plus the fixture package.
+Apart from the fixture package, every package in the fixture lockfile must
+match the repository lock exactly. The only repository packages allowed to
+drop out are those reachable solely through the crate's dev-dependencies,
+which a consumer never resolves.
 The script then fetches host and `-Zbuild-std` sources once. Every build uses
 `--locked --offline`, its own `idf.py` build directory, and its own
 `SDKCONFIG`. The cases are:
@@ -196,7 +199,11 @@ scripted SDK status codes, and keeps a buffer ledger that detects leaks,
 double frees, and double transfers. Its gates coordinate overlapping
 operations without sleeps. The tests show framework logic on the host only;
 they are not SDK, target, or hardware evidence. The firmware fixtures compile
-the real ESP backend for C3 and S3. The Python tests
+the real ESP backend for C3 and S3. `tests/gatt_authoring.rs` uses
+[trybuild](https://docs.rs/trybuild) to compile the `tests/ui/gatt` fixtures:
+`pass` fixtures must build, and each `compile_fail` fixture must fail with its
+recorded compiler error. Those messages come from the pinned host toolchain,
+so a toolchain update may require reviewing and regenerating them. The Python tests
 exercise context export/capture token handling as well as CI failure propagation,
 missing executables, diagnostic retention, report encoding, unexpected
 exceptions/interrupts, inherited configuration, exact-case tracked-file links,

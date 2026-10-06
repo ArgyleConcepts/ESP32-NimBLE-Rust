@@ -1,0 +1,37 @@
+error[E0478]: lifetime bound not satisfied
+  --> tests/ui/gatt/fail/state_borrowed.rs:10:10
+   |
+10 | impl<'a> Characteristic for Level<'a> {
+   |          ^^^^^^^^^^^^^^
+   |
+note: lifetime parameter instantiated with the lifetime `'a` as defined here
+  --> tests/ui/gatt/fail/state_borrowed.rs:10:6
+   |
+10 | impl<'a> Characteristic for Level<'a> {
+   |      ^^
+   = note: but lifetime parameter must outlive the static lifetime
+
+error[E0803]: cannot infer an appropriate lifetime for lifetime parameter `'a` due to conflicting requirements
+  --> tests/ui/gatt/fail/state_borrowed.rs:10:29
+   |
+10 | impl<'a> Characteristic for Level<'a> {
+   |                             ^^^^^^^^^
+   |
+note: first, the lifetime cannot outlive the lifetime `'a` as defined here...
+  --> tests/ui/gatt/fail/state_borrowed.rs:10:6
+   |
+10 | impl<'a> Characteristic for Level<'a> {
+   |      ^^
+note: ...so that the types are compatible
+  --> tests/ui/gatt/fail/state_borrowed.rs:10:29
+   |
+10 | impl<'a> Characteristic for Level<'a> {
+   |                             ^^^^^^^^^
+   = note: expected `<Level<'a> as Characteristic>`
+              found `<Level<'_> as Characteristic>`
+   = note: but, the lifetime must be valid for the static lifetime...
+note: ...so that the declared lifetime parameter bounds are satisfied
+  --> tests/ui/gatt/fail/state_borrowed.rs:10:29
+   |
+10 | impl<'a> Characteristic for Level<'a> {
+   |                             ^^^^^^^^^
