@@ -60,6 +60,7 @@ pub const REQUIRED_FUNCTIONS: &[&str] = &[
     "ble_gap_adv_start",
     "ble_gap_adv_stop",
     "ble_gap_adv_rsp_set_data",
+    "ble_gap_adv_set_data",
     "ble_gap_adv_set_fields",
     "ble_gap_adv_rsp_set_fields",
     "ble_gap_terminate",

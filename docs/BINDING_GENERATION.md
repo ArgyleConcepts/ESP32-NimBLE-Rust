@@ -175,8 +175,8 @@ failure messages.
 Bindgen roots are closed exact-name lists in `bindings.rs`; recursive type
 selection follows only declarations referenced by those roots. The current
 surface covers NimBLE port lifecycle, GAP/GATT service initialization and
-registration, the GAP device name, legacy advertising (fields for the
-advertising data, raw bytes for the scan response), host sync state, connection termination and MTU lookup, identity inference,
+registration, the GAP device name, legacy advertising with raw payloads,
+host sync state, connection termination and MTU lookup, identity inference,
 custom notifications, and mbuf creation. Required C
 functions, types, and constants are checked in the parsed generated Rust so a
 missing SDK declaration cannot silently produce an incomplete file.
@@ -213,12 +213,10 @@ payload limits, the default ATT MTU, the HCI status base, and the
 `BLE_HS_EALREADY`, `BLE_HS_EAGAIN`, and `BLE_HS_ENOTCONN` statuses are roots
 so that real target builds check those values against the consumer's SDK
 and fail compilation on a mismatch. `CONFIG_BT_NIMBLE_MAX_CONNECTIONS` is a
-root so the build can require at least two connections. The advertising
-data goes through `ble_hs_adv_fields` (flags and the 16- and 128-bit UUID
-lists only) because ESP-IDF's connection re-attempt re-sends it from a copy
-of those fields; its record layout is checked against GCC like every other
-bound record, and host tests check that NimBLE's encoding of those fields
-equals the payload this crate validates. The SDK's remote-user-termination reason is a
+root so the build can require at least two connections. The private C shim
+fails compilation with an `#error` when NimBLE's connection re-attempt
+(`MYNEWT_VAL(BLE_ENABLE_CONN_REATTEMPT)`) is enabled; a host test checks that
+preprocessor logic against the synthetic SDK. The SDK's remote-user-termination reason is a
 variant of a broad named error enum, so the private shim re-exports only that
 value through one anonymous enum constant; unrelated SDK error variants are
 not binding roots. The `BLE_HS_FOREVER` macro expands through `INT32_MAX`, so

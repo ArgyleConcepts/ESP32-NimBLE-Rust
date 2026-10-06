@@ -390,6 +390,8 @@ def make_fixture(project: Path, root: Path, chip: str, cafd: bool) -> None:
         "CONFIG_LIBC_NEWLIB=y\n"
         "CONFIG_BT_ENABLED=y\n"
         "CONFIG_BT_NIMBLE_ENABLED=y\n"
+        # argyle-nimble's C shim rejects NimBLE's connection re-attempt.
+        "CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT=n\n"
         f"{CAFD_OPTION}={'y' if cafd else 'n'}\n",
         encoding="utf-8",
     )

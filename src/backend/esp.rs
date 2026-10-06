@@ -12,12 +12,12 @@ use super::gap::{GapCodes, GapEvent, GapEventView};
 use super::native::{
     check, native_length, Backend, NativeError, NativeEvent, NativeResult, Operation,
 };
-use crate::ble::advertising::{ad, AdvertisingFields, LEGACY_PAYLOAD_CAPACITY};
+use crate::ble::advertising::{ad, LEGACY_PAYLOAD_CAPACITY};
 use crate::ble::connection::{
     ATT_CHANNEL, ATT_DEFAULT_MTU, HCI_STATUS_BASE, HOST_EAGAIN, HOST_ENOTCONN,
 };
 use crate::error::ATT_STATUS_BASE;
-use crate::{AttError, Uuid};
+use crate::AttError;
 use std::ffi::{c_int, c_void, CStr};
 use std::ptr::{null, null_mut, NonNull};
 use std::sync::Arc;
@@ -105,8 +105,9 @@ const _: () = assert!(
     "argyle-nimble requires CONFIG_BT_NIMBLE_MAX_CONNECTIONS of at least 2 (ESP-IDF's default is 3)"
 );
 
-/// NimBLE's "already in that state" status, which advertising start and stop
-/// report when there is nothing to change.
+/// NimBLE's "already in that state" status: advertising start and stop
+/// report it when there is nothing to change, and termination when the link
+/// is already being terminated.
 const ALREADY: c_int = bindings::BLE_HS_EALREADY as c_int;
 
 /// Copy a payload into a full-size buffer, so the SDK always receives a
@@ -204,44 +205,15 @@ extern "C" fn host_task(_argument: *mut c_void) {
 /// An owned native buffer chain.
 pub(crate) struct EspMbuf(pub(super) NonNull<bindings::os_mbuf>);
 
-/// Native advertising fields: the UUID arrays `ble_hs_adv_fields` points to.
-///
-/// `ble_gap_adv_set_fields` copies the fields structure, including these
-/// pointers, into `ble_adv_reattempt.fields` (`ble_gap.c`), and ESP-IDF's
-/// connection re-attempt encodes from that copy later, without any event. The
-/// arrays are therefore owned by the connection runtime, never changed after
-/// they are built (so their heap buffers never move), and dropped only after
-/// the host is deinitialized (or never, if the host is poisoned). The next
-/// start of the host replaces NimBLE's copy before it advertises, so a stale
-/// copy cannot be used.
-pub(crate) struct EspAdvertisingFields {
-    flags: u8,
-    uuids16: Vec<bindings::ble_uuid16_t>,
-    uuids16_complete: bool,
-    uuids128: Vec<bindings::ble_uuid128_t>,
-    uuids128_complete: bool,
-}
-
-fn native_uuid128(value: u128) -> bindings::ble_uuid128_t {
-    let bytes = Uuid::Uuid128(value).to_wire_bytes();
-    // SAFETY: `ble_uuid128_t` is plain data; zero is a valid value.
-    let mut native: bindings::ble_uuid128_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `bytes` holds 16 readable bytes in wire order and `native` is
-    // a separate writable UUID; the shim fails only for null pointers.
-    let status = unsafe { bindings::argyle_nimble_uuid128(bytes.as_ref().as_ptr(), &mut native) };
-    debug_assert_eq!(status, 0);
-    native
-}
-
 /// The ESP-IDF NimBLE host. There is one native host per firmware; the
 /// [`Ble`](crate::Ble) owner controls its lifecycle.
 #[derive(Clone)]
 pub(crate) struct EspBackend;
 
 impl Backend for EspBackend {
+    const MAX_LINKS: usize = bindings::CONFIG_BT_NIMBLE_MAX_CONNECTIONS as usize;
     type Mbuf = EspMbuf;
     type Registration = super::esp_gatt::EspRegistration;
-    type AdvertisingFields = EspAdvertisingFields;
 
     fn prepare_gatt(&self, plan: &crate::gatt::registration::GattPlan) -> Self::Registration {
         super::esp_gatt::prepare(plan)
@@ -380,9 +352,12 @@ impl Backend for EspBackend {
         let reason = u8::try_from(bindings::ARGYLE_NIMBLE_ERR_REM_USER_CONN_TERM)
             .expect("the remote-user termination reason is an HCI byte");
         // SAFETY: plain SDK call with value arguments.
-        check(Operation::Terminate, unsafe {
-            bindings::ble_gap_terminate(connection, reason)
-        })
+        let code = unsafe { bindings::ble_gap_terminate(connection, reason) };
+        // The link is already being terminated; its disconnection follows.
+        if code == ALREADY {
+            return Ok(());
+        }
+        check(Operation::Terminate, code)
     }
 
     fn set_device_name(&self, name: &CStr) -> NativeResult<()> {
@@ -393,52 +368,12 @@ impl Backend for EspBackend {
         })
     }
 
-    fn prepare_advertising_fields(&self, fields: &AdvertisingFields) -> EspAdvertisingFields {
-        EspAdvertisingFields {
-            flags: fields.flags,
-            uuids16: fields
-                .uuids16
-                .iter()
-                // SAFETY: the shim builds a UUID value from a plain argument.
-                .map(|value| unsafe { bindings::argyle_nimble_uuid16(*value) })
-                .collect(),
-            uuids16_complete: fields.uuids16_complete,
-            uuids128: fields
-                .uuids128
-                .iter()
-                .copied()
-                .map(native_uuid128)
-                .collect(),
-            uuids128_complete: fields.uuids128_complete,
-        }
-    }
-
-    fn set_advertising_fields(&self, fields: &EspAdvertisingFields) -> NativeResult<()> {
-        let count = |length: usize| {
-            u8::try_from(length).map_err(|_| NativeError::InvalidLength {
-                operation: Operation::AdvertisingData,
-                length,
-            })
-        };
-        // SAFETY: the fields are plain data; zero (null pointers, no
-        // entries) leaves every other AD type out.
-        let mut native: bindings::ble_hs_adv_fields = unsafe { std::mem::zeroed() };
-        native.flags = fields.flags;
-        if !fields.uuids16.is_empty() {
-            native.uuids16 = fields.uuids16.as_ptr();
-            native.num_uuids16 = count(fields.uuids16.len())?;
-            native.set_uuids16_is_complete(fields.uuids16_complete.into());
-        }
-        if !fields.uuids128.is_empty() {
-            native.uuids128 = fields.uuids128.as_ptr();
-            native.num_uuids128 = count(fields.uuids128.len())?;
-            native.set_uuids128_is_complete(fields.uuids128_complete.into());
-        }
-        // SAFETY: `native` is valid for the call and its arrays live in
-        // `fields`, which outlives every later use NimBLE makes of its copy
-        // (see `EspAdvertisingFields`).
+    fn set_advertising_data(&self, data: &[u8]) -> NativeResult<()> {
+        let (buffer, length) = payload(Operation::AdvertisingData, data)?;
+        // SAFETY: `buffer` is readable for `length` (at most 31) bytes for
+        // the call; NimBLE copies them into its HCI command.
         check(Operation::AdvertisingData, unsafe {
-            bindings::ble_gap_adv_set_fields(&native)
+            bindings::ble_gap_adv_set_data(buffer.as_ptr(), length)
         })
     }
 

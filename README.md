@@ -36,14 +36,18 @@ the BLE boundary and the declaration of a GATT server:
   specific errors instead of silently trimmed payloads. The name also
   becomes the GAP Device Name. Advertising starts only once the host is
   synchronized and restarts by itself after a disconnection, failed
-  connection, or host reset unless turned off.
+  connection, or host reset unless turned off. It requires
+  `CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT=n` and
+  `CONFIG_BT_NIMBLE_MAX_CONNECTIONS` of at least 2; target builds fail
+  otherwise (see the [idf.py integration guide](docs/IDF_INTEGRATION.md)).
 - Single-client connection state: a `ConnectionId` with a generation, so a
   reused NimBLE connection handle never revives earlier state, plus the ATT
   MTU and per-notify-endpoint subscriptions, cleared on disconnection and
   host reset. Applications observe it through `Ble::connection` snapshots
   and `ConnectionEvent`s delivered to a `ConnectionHandler` on the host
-  task. If a second client connects, the framework requests termination
-  of its link without affecting the first. Access is open: no pairing or
+  task. Advertising is stopped once a client is connected. If a second
+  client connects, the framework requests termination of its link without
+  affecting the first. Access is open: no pairing or
   bonding is requested.
 
 The firmware fixtures compile the startup, registration, advertising, and

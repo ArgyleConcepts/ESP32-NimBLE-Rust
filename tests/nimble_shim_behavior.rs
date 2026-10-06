@@ -182,3 +182,51 @@ fn private_c_shim_behaves_with_sdk_free_controlled_stubs() {
     let mut run = Command::new(&executable);
     assert_command_success(&mut run, "the compiled C shim behavior fixture");
 }
+
+#[test]
+fn private_c_shim_rejects_nimbles_connection_reattempt() {
+    // The guard is plain preprocessor logic over the macro esp_nimble_cfg.h
+    // defines; check it with the synthetic SDK, enabled and disabled.
+    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture = repository.join("tests/fixtures/nimble_shim");
+    let scratch = ScratchDirectory::new();
+    let shim_source = scratch.0.join("nimble_shim.c");
+    fs::copy(repository.join("src/backend/nimble_shim.c"), &shim_source)
+        .expect("copy actual shim implementation into isolated fixture");
+    fs::copy(
+        repository.join("src/backend/nimble_shim.h"),
+        scratch.0.join("nimble_shim.h"),
+    )
+    .expect("copy actual shim declarations into isolated fixture");
+    fs::copy(
+        fixture.join("nimble_test_sdk.h"),
+        scratch.0.join("nimble_test_sdk.h"),
+    )
+    .expect("copy synthetic SDK declarations into isolated fixture");
+    let sdk_includes = create_sdk_include_headers(&scratch.0);
+    let check = |definition: &str| {
+        let mut compile = Command::new(host_clang());
+        compile
+            .arg("-std=c11")
+            .arg("-fsyntax-only")
+            .arg("-isysroot")
+            .arg(macos_sdk_root())
+            .arg("-I")
+            .arg(&scratch.0)
+            .arg("-I")
+            .arg(&sdk_includes)
+            .arg(definition)
+            .arg(&shim_source);
+        compile.output().expect("run clang on the copied C shim")
+    };
+    let disabled = check("-DMYNEWT_VAL_BLE_ENABLE_CONN_REATTEMPT=(0)");
+    assert!(disabled.status.success(), "{}", output_message(&disabled));
+    let enabled = check("-DMYNEWT_VAL_BLE_ENABLE_CONN_REATTEMPT=(1)");
+    assert!(!enabled.status.success(), "{}", output_message(&enabled));
+    assert!(
+        String::from_utf8_lossy(&enabled.stderr)
+            .contains("argyle-nimble requires CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT=n"),
+        "{}",
+        output_message(&enabled)
+    );
+}

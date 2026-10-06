@@ -423,14 +423,11 @@ impl Advertising {
             return Err(AdvertisingError::UnknownService(self.services[index]));
         }
 
-        let mut fields = AdvertisingFields {
-            flags: ad::GENERAL_DISCOVERABLE | ad::BREDR_UNSUPPORTED,
-            uuids16: Vec::new(),
-            uuids16_complete: false,
-            uuids128: Vec::new(),
-            uuids128_complete: false,
-        };
-        let mut advertising_data = vec![(FLAGS_LEN - 1) as u8, ad::FLAGS, fields.flags];
+        let mut advertising_data = vec![
+            (FLAGS_LEN - 1) as u8,
+            ad::FLAGS,
+            ad::GENERAL_DISCOVERABLE | ad::BREDR_UNSUPPORTED,
+        ];
         for (width, complete_type, incomplete_type) in [
             (2, ad::COMPLETE_UUIDS16, ad::INCOMPLETE_UUIDS16),
             (16, ad::COMPLETE_UUIDS128, ad::INCOMPLETE_UUIDS128),
@@ -455,15 +452,6 @@ impl Advertising {
             });
             for uuid in listed {
                 advertising_data.extend_from_slice(uuid.to_wire_bytes().as_ref());
-                match *uuid {
-                    Uuid::Uuid16(value) => fields.uuids16.push(value),
-                    _ => fields.uuids128.push(uuid.to_u128()),
-                }
-            }
-            if width == 2 {
-                fields.uuids16_complete = complete;
-            } else {
-                fields.uuids128_complete = complete;
             }
         }
         debug_assert!(advertising_data.len() <= LEGACY_PAYLOAD_CAPACITY);
@@ -481,7 +469,6 @@ impl Advertising {
         debug_assert!(scan_response.len() <= LEGACY_PAYLOAD_CAPACITY);
 
         Ok(AdvertisingPlan {
-            fields,
             advertising_data,
             scan_response,
             device_name: self
@@ -493,34 +480,10 @@ impl Advertising {
     }
 }
 
-/// The advertising data's contents as NimBLE's `ble_hs_adv_fields` carries
-/// them: flags, then 16-bit and 128-bit service UUID lists in that order.
-///
-/// The advertising data is handed to NimBLE as fields rather than raw bytes
-/// because ESP-IDF's connection re-attempt (`CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT`)
-/// restarts advertising by itself, without any event, from the fields last
-/// passed to `ble_gap_adv_set_fields` (`ble_gap_slave_adv_reattempt` in
-/// `ble_gap.c`); raw data would leave it re-advertising an empty packet.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AdvertisingFields {
-    pub(crate) flags: u8,
-    pub(crate) uuids16: Vec<u16>,
-    pub(crate) uuids16_complete: bool,
-    /// Canonical 128-bit values; NimBLE stores them in wire order.
-    pub(crate) uuids128: Vec<u128>,
-    pub(crate) uuids128_complete: bool,
-}
-
 /// The encoded packets and policy of a configuration checked against its
 /// server.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AdvertisingPlan {
-    /// The advertising data as NimBLE's field encoder receives it; see
-    /// [`AdvertisingFields`].
-    pub(crate) fields: AdvertisingFields,
-    /// The advertising data as this crate encodes and validates it. NimBLE
-    /// encodes `fields` to the same bytes (checked by host tests against a
-    /// model of `ble_hs_adv_set_fields`).
     pub(crate) advertising_data: Vec<u8>,
     pub(crate) scan_response: Vec<u8>,
     pub(crate) device_name: Option<CString>,
@@ -879,62 +842,6 @@ mod tests {
             error.to_string().contains("not a primary service"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn nimbles_field_encoder_produces_the_validated_payload() {
-        use crate::backend::fake::nimble_encode;
-        let sixteen = |count: u16| (0..count).map(|index| Uuid::Uuid16(0x1810 + index));
-        let cases: Vec<(Vec<Uuid>, Vec<Uuid>)> = vec![
-            (vec![], vec![CUSTOM]),
-            (
-                vec![Uuid::Uuid16(0x180f)],
-                vec![Uuid::Uuid16(0x180f), CUSTOM],
-            ),
-            (vec![CUSTOM], vec![Uuid::Uuid16(0x180f), CUSTOM, OTHER]),
-            (
-                vec![Uuid::Uuid16(0x180f), CUSTOM],
-                vec![Uuid::Uuid16(0x180f), Uuid::Uuid16(0x181c), CUSTOM, OTHER],
-            ),
-            (sixteen(13).collect(), sixteen(13).collect()),
-            (
-                std::iter::once(CUSTOM).chain(sixteen(4)).collect(),
-                std::iter::once(CUSTOM).chain(sixteen(5)).collect(),
-            ),
-        ];
-        for (advertised, services) in cases {
-            let advertising = advertised
-                .iter()
-                .fold(
-                    Advertising::builder().name("argyle-demo"),
-                    |builder, uuid| builder.service(*uuid),
-                )
-                .build()
-                .unwrap();
-            let plan = advertising.plan(&server(&services)).unwrap();
-            assert_eq!(
-                nimble_encode(&plan.fields),
-                Ok(plan.advertising_data.clone()),
-                "{advertised:?} of {services:?}"
-            );
-        }
-
-        // NimBLE's size accounting rejects what the builder rejects.
-        let mut fields = AdvertisingFields {
-            flags: ad::GENERAL_DISCOVERABLE | ad::BREDR_UNSUPPORTED,
-            uuids16: (0..14).collect(),
-            uuids16_complete: true,
-            uuids128: Vec::new(),
-            uuids128_complete: false,
-        };
-        assert_eq!(nimble_encode(&fields), Err(4));
-        fields.uuids16.pop();
-        assert_eq!(nimble_encode(&fields).map(|data| data.len()), Ok(31));
-        fields.uuids16 = vec![1, 2, 3, 4, 5];
-        fields.uuids128 = vec![CUSTOM.to_u128()];
-        assert_eq!(nimble_encode(&fields), Err(4));
-        fields.uuids16.pop();
-        assert_eq!(nimble_encode(&fields).map(|data| data.len()), Ok(31));
     }
 
     #[test]

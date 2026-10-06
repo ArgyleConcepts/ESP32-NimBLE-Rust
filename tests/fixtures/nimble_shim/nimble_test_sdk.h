@@ -5,6 +5,11 @@
 
 #define BLE_HS_FOREVER INT32_MAX
 
+/* esp_nimble_cfg.h defines this to the Kconfig value or 0. */
+#ifndef MYNEWT_VAL_BLE_ENABLE_CONN_REATTEMPT
+#define MYNEWT_VAL_BLE_ENABLE_CONN_REATTEMPT (0)
+#endif
+
 typedef void ble_hs_sync_fn(void);
 typedef void ble_hs_reset_fn(int reason);
 

@@ -187,7 +187,8 @@ The SDK-free Rust integration tests validate the private context contract and mo
 selection with SDK-free filesystem fixtures, exercise Cargo binding-output
 identity and transaction failure paths, private binding generation with
 generic host C fixtures, and compile the copied private C shim
-against controlled stubs to test its wrappers. They do not parse real
+against controlled stubs to test its wrappers and its rejection of NimBLE's
+connection re-attempt. They do not parse real
 ESP-IDF/NimBLE headers, establish a target ABI, compile firmware, or test BLE
 stack interoperability. The target-integration tests cover runtime-selection
 rejection, record selection, and the GCC probe-to-rustc assertion mechanism.
@@ -211,9 +212,9 @@ advertising only after synchronization, connect/subscribe/MTU/disconnect/
 reconnect, numeric-handle reuse, second clients, duplicate, stale, and
 out-of-order events, failed connections and restarts, host reset and
 resynchronization, re-entrant handlers, overlapping advertising starts, and
-shutdown ordering. The fake also models ESP-IDF's late connection report,
-its silent connection re-attempt, links left open after a failed
-connection, and NimBLE's advertising-field encoder. The ESP advertising calls and their constants are only
+shutdown ordering. The fake also models ESP-IDF's late connection report
+(advertising ends at link creation, before the report), links left open or
+already freed after a failed connection, and repeated terminations. The ESP advertising calls and their constants are only
 compiled for the targets. The tests show framework logic on the host only;
 they are not SDK, target, or hardware evidence. The firmware fixtures compile
 the real ESP backend for C3 and S3. `tests/compile_contracts.rs` uses
