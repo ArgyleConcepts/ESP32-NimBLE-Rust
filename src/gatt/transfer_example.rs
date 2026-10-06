@@ -1,11 +1,13 @@
 // An application-managed chunked transfer: the client begins a transfer of a
-// known length, writes chunks at increasing offsets, and commits. Framing,
-// limits, errors, and session state below belong to the application, not
-// the framework; this is one generic way to build such a protocol.
+// known length, writes chunks at increasing offsets, and commits, which hands
+// the bytes to the application. Framing, limits, errors, and session state
+// below belong to the application, not the framework; this is one generic
+// way to build such a protocol.
 
 use argyle_nimble::codec::{Decode, DecodeError, Encode, EncodeError, ValueReader, ValueWriter};
 use argyle_nimble::gatt::{Characteristic, CharacteristicDef, Readable, Service, Writable};
 use argyle_nimble::{AttError, Uuid};
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 // Example UUIDs only; generate your own for a real service.
@@ -17,8 +19,10 @@ const DATA: Uuid = Uuid::Uuid128(0x8d4f_0003_5c1e_4b7a_9f62_0d3c_2a1b_9e70);
 /// The most bytes one transfer may carry, which bounds the receive buffer.
 pub const TRANSFER_LIMIT: usize = 4096;
 
-/// The most data bytes in one chunk. With its 4-byte offset, a full chunk
-/// fills a Write Request at a 247-byte ATT MTU (247 - 3 = 244 bytes).
+/// The most data bytes the data characteristic accepts in one chunk. A
+/// client sends at most MTU - 7 bytes per chunk (a Write Request's MTU - 3,
+/// less the 4-byte offset), so each chunk is a single Write Request and never
+/// a GATT long write; 240 bytes fill a Write Request at a 247-byte MTU.
 pub const CHUNK_LEN: usize = 240;
 
 /// The chunk is not the next one expected; read the status to resume.
@@ -27,6 +31,8 @@ pub const UNEXPECTED_OFFSET: AttError = application_error(0x80);
 pub const NO_TRANSFER: AttError = application_error(0x81);
 /// Commit was requested before every byte arrived.
 pub const INCOMPLETE: AttError = application_error(0x82);
+/// The application has not yet taken earlier transfers; commit again later.
+pub const BUSY: AttError = application_error(0x83);
 
 const fn application_error(code: u8) -> AttError {
     match AttError::application(code) {
@@ -40,9 +46,9 @@ const fn application_error(code: u8) -> AttError {
 pub enum Command {
     /// Start receiving `total` bytes.
     Begin { total: u32 },
-    /// Finish a transfer whose bytes have all arrived.
+    /// Hand a transfer whose bytes have all arrived to the application.
     Commit,
-    /// Discard any transfer in progress.
+    /// Discard the transfer in progress.
     Abort,
 }
 
@@ -92,84 +98,83 @@ impl Encode for Progress {
     }
 }
 
-#[derive(Default)]
-enum Session {
-    #[default]
-    Idle,
-    Receiving {
-        total: usize,
-        data: Vec<u8>,
-    },
-    Complete(Vec<u8>),
+/// A transfer in progress.
+struct Receiving {
+    total: usize,
+    data: Vec<u8>,
 }
 
 /// The application's transfer state, shared by its characteristics.
-#[derive(Default)]
 pub struct Transfer {
-    session: Mutex<Session>,
+    session: Mutex<Option<Receiving>>,
+    completed: SyncSender<Vec<u8>>,
 }
 
 impl Transfer {
-    fn session(&self) -> MutexGuard<'_, Session> {
+    /// State that hands each committed transfer to `completed`. Its bound
+    /// is how many committed transfers may wait for the application.
+    pub fn new(completed: SyncSender<Vec<u8>>) -> Self {
+        Self {
+            session: Mutex::new(None),
+            completed,
+        }
+    }
+
+    fn session(&self) -> MutexGuard<'_, Option<Receiving>> {
         // Handlers must not panic, so a poisoned lock is recovered.
         self.session.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Discard any transfer in progress or not yet taken. Call this when the
-    /// client's connection ends.
+    /// Discard the transfer in progress, if any. Committed transfers were
+    /// already handed over and are unaffected. Call this when the client's
+    /// connection ends.
     pub fn reset(&self) {
-        *self.session() = Session::Idle;
-    }
-
-    /// The bytes of a committed transfer, once.
-    pub fn take_completed(&self) -> Option<Vec<u8>> {
-        let mut session = self.session();
-        match std::mem::take(&mut *session) {
-            Session::Complete(data) => Some(data),
-            other => {
-                *session = other;
-                None
-            }
-        }
+        *self.session() = None;
     }
 
     fn command(&self, command: Command) -> Result<(), AttError> {
         let mut session = self.session();
         match command {
             Command::Begin { total } => {
-                if matches!(*session, Session::Receiving { .. }) {
+                if session.is_some() {
                     return Err(AttError::PROCEDURE_ALREADY_IN_PROGRESS);
                 }
                 let total = usize::try_from(total)
                     .ok()
                     .filter(|total| *total <= TRANSFER_LIMIT)
                     .ok_or(AttError::OUT_OF_RANGE)?;
-                *session = Session::Receiving {
+                *session = Some(Receiving {
                     total,
                     data: Vec::with_capacity(total),
-                };
+                });
             }
-            Command::Commit => match std::mem::take(&mut *session) {
-                Session::Receiving { total, data } if data.len() == total => {
-                    *session = Session::Complete(data);
+            Command::Commit => {
+                let receiving = session.take().ok_or(NO_TRANSFER)?;
+                if receiving.data.len() != receiving.total {
+                    *session = Some(receiving);
+                    return Err(INCOMPLETE);
                 }
-                other => {
-                    let error = match other {
-                        Session::Receiving { .. } => INCOMPLETE,
-                        _ => NO_TRANSFER,
+                // The bytes change hands now or not at all: if the
+                // application cannot take them, the transfer stays complete
+                // and uncommitted, and the client commits again later.
+                let total = receiving.total;
+                if let Err(refused) = self.completed.try_send(receiving.data) {
+                    let (error, data) = match refused {
+                        TrySendError::Full(data) => (BUSY, data),
+                        TrySendError::Disconnected(data) => (AttError::UNLIKELY, data),
                     };
-                    *session = other;
+                    *session = Some(Receiving { total, data });
                     return Err(error);
                 }
-            },
-            Command::Abort => *session = Session::Idle,
+            }
+            Command::Abort => *session = None,
         }
         Ok(())
     }
 
     fn chunk(&self, chunk: Chunk) -> Result<(), AttError> {
         let mut session = self.session();
-        let Session::Receiving { total, data } = &mut *session else {
+        let Some(Receiving { total, data }) = &mut *session else {
             return Err(NO_TRANSFER);
         };
         // Only the next chunk is accepted. A repeated or skipped chunk is
@@ -186,9 +191,8 @@ impl Transfer {
 
     fn progress(&self) -> Progress {
         let (received, total) = match &*self.session() {
-            Session::Idle => (0, 0),
-            Session::Receiving { total, data } => (data.len(), *total),
-            Session::Complete(data) => (data.len(), data.len()),
+            None => (0, 0),
+            Some(Receiving { total, data }) => (data.len(), *total),
         };
         // Both are at most TRANSFER_LIMIT.
         Progress {
@@ -252,7 +256,7 @@ impl Writable for Data {
 }
 
 /// The transfer service: control, status, and data, in that order. The
-/// application keeps `transfer` to take completed transfers and reset it.
+/// application keeps `transfer` to reset it when the connection ends.
 pub fn transfer_service(transfer: &Arc<Transfer>) -> Service {
     Service::primary(SERVICE)
         .characteristic(CharacteristicDef::new(Control(transfer.clone())).writable())

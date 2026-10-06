@@ -250,9 +250,12 @@
 //! bounded, validated values and their handlers; the protocol's framing,
 //! limits, retries, and session state, and what happens to the data, belong
 //! to the application. A GATT long write is a different layer: it moves one
-//! attribute value of at most 512 bytes that NimBLE reassembles before the
-//! handler runs, so each chunk of an application transfer may itself arrive
-//! as a long write.
+//! attribute value of at most 512 bytes that NimBLE reassembles, within its
+//! buffer limits, before the handler runs. Keep the two apart by sending
+//! each chunk in one Write Request, so a transfer never depends on NimBLE's
+//! long-write buffers: the client sends at most MTU - 7 data bytes per chunk
+//! (MTU - 3 for the Write Request, less the chunk's 4-byte offset), up to
+//! the data characteristic's limit.
 //!
 //! The example below keeps one session in application state shared by three
 //! characteristics: control commands begin a transfer of a known length,
@@ -266,14 +269,17 @@
 //!   the offset it reports.
 //! - Memory is bounded: the total is checked against a limit when the
 //!   transfer begins, and each chunk against the remaining length.
-//! - Commit succeeds only once every byte has arrived; the application then
-//!   takes the bytes.
-//! - The session belongs to the client's connection. Call `Transfer::reset`
-//!   when the connection ends so a later client starts afresh. Connection
-//!   events are planned for the framework's connection handling and will be
-//!   where an application makes that call; until they exist, a client should
-//!   abort before it begins. NimBLE discards its own queued long-write parts
-//!   when a connection ends.
+//! - Commit succeeds only once every byte has arrived, and hands the bytes
+//!   to the application at once through a bounded channel the application
+//!   supplies. If the channel is full, Commit fails with an application
+//!   error and the transfer stays complete, so the client commits again
+//!   later. Nothing committed waits in the session to be discarded.
+//! - The session holds only an uncommitted transfer and belongs to the
+//!   client's connection. Call `Transfer::reset` when the connection ends so
+//!   a later client starts afresh; reset and Abort never affect committed
+//!   transfers. Connection events are planned for the framework's connection
+//!   handling and will be where an application makes that call; until they
+//!   exist, a client should abort before it begins.
 //! - Data uses Write Requests so the client sees each result. Write Commands
 //!   are faster but carry no response, so a client using them must check the
 //!   status before committing.
@@ -290,7 +296,9 @@
 //!     use argyle_nimble::codec::decode_value;
 //!     use argyle_nimble::gatt::GattServer;
 //!
-//!     let transfer = Arc::new(Transfer::default());
+//!     // At most one committed transfer waits for the application.
+//!     let (completed, committed) = std::sync::mpsc::sync_channel(1);
+//!     let transfer = Arc::new(Transfer::new(completed));
 //!     let server = GattServer::new([transfer_service(&transfer)])?;
 //!     // `server` goes to the BLE owner. Here the client is simulated by
 //!     // calling the handlers with the values the framework would decode.
@@ -314,7 +322,7 @@
 //!     }
 //!     assert_eq!(status.read()?, Progress { received: 600, total: 600 });
 //!     control.write(Command::Commit)?;
-//!     assert_eq!(transfer.take_completed(), Some(image));
+//!     assert_eq!(committed.try_recv()?, image);
 //!
 //!     // The connection ends part-way through the next transfer.
 //!     control.write(Command::Begin { total: 10 })?;
