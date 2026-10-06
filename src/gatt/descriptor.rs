@@ -30,9 +30,9 @@ pub trait Descriptor: Send + Sync + 'static {
 
     /// The largest encoded value, in bytes, this descriptor produces or
     /// accepts. It must not exceed [`MAX_ATTRIBUTE_VALUE_LEN`], the default.
-    /// Values up to this length are served at every ATT MTU, in several
-    /// requests when they exceed one packet; see
-    /// [variable-length values](crate::gatt#variable-length-values).
+    /// Reads up to this length work at every ATT MTU; writes longer than one
+    /// packet need a GATT long write, which NimBLE's buffers limit. See
+    /// [long values](crate::gatt#long-values-and-offsets).
     const MAX_LEN: usize = MAX_ATTRIBUTE_VALUE_LEN;
 
     /// The descriptor UUID. It is read once, by [`DescriptorDef::new`], which

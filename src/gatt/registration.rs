@@ -22,9 +22,10 @@
 //!   appends to the response, which already holds the ATT opcode; otherwise
 //!   it appends to a fresh buffer, from which NimBLE copies the bytes after
 //!   the offset (`BLE_ATT_ERR_INVALID_OFFSET` if the value is shorter) and
-//!   frees it. NimBLE then truncates the response to the ATT MTU. A read
-//!   therefore always appends the handler's complete value and never applies
-//!   the offset itself.
+//!   frees it, without checking that copy (so it can come back short when
+//!   NimBLE's buffers run out). NimBLE then truncates the response to the
+//!   ATT MTU. A read therefore always appends the handler's complete value
+//!   and never applies the offset itself.
 //! - **Write Request, Write Command, and Signed Write.** One callback with
 //!   the whole PDU value at offset 0.
 //! - **Prepare Write and Execute Write.** NimBLE queues the prepared parts
@@ -33,7 +34,9 @@
 //!   `BLE_ATT_ERR_INVALID_OFFSET`) and, unless `BLE_GATT_BLOB_TRANSFER` is
 //!   enabled, to total at most `BLE_ATT_ATTR_MAX_LEN` (512) bytes (otherwise
 //!   `BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN`). It then calls back once per
-//!   attribute with the parts chained into one buffer at offset 0.
+//!   attribute with the parts chained into one buffer at offset 0. Each
+//!   queued part holds its own MSYS_1 buffer, so the pool's free blocks
+//!   bound how many parts can be queued.
 //!
 //! So every write reaching a callback is a complete value at offset 0. A
 //! write at any other offset would be part of a value, which this framework

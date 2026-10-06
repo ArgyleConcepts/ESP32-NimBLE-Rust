@@ -8,7 +8,8 @@
 //! `ble_att.c` (`ble_att_truncate_to_mtu`); see the
 //! [registration module](super#offsets-and-long-values) for the behavior
 //! relied on. Permissions, security, MTU exchange, the queued-write timeout,
-//! and the transport are not modeled. Passing tests here are evidence about
+//! and the transport are not modeled, and NimBLE's buffer pool only roughly
+//! (see [`AttModel::set_part_budget`]). Passing tests here are evidence about
 //! the framework's side of these procedures against this transcription, not
 //! about NimBLE, a target, or hardware.
 
@@ -40,6 +41,9 @@ const ATTRIBUTE_MAX_LEN: usize = 512;
 /// The default of `CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES`.
 const MAX_PREPARED: usize = 64;
 
+/// The ESP32-C3 and ESP32-S3 default of `CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT`.
+pub(crate) const MSYS_1_BLOCKS: usize = 12;
+
 /// An attribute handle in the model's database. Handles only order the
 /// prepared-write queue; they are not NimBLE's.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -65,6 +69,7 @@ pub(crate) struct AttModel<'s> {
     descriptors: Vec<Vec<Handle>>,
     queue: Vec<Prepared>,
     max_prepared: usize,
+    part_budget: usize,
     blob_transfer: bool,
     // The callback arguments point into the server.
     server: PhantomData<&'s GattServer>,
@@ -119,6 +124,7 @@ impl<'s> AttModel<'s> {
             descriptors,
             queue: Vec::new(),
             max_prepared: MAX_PREPARED,
+            part_budget: MSYS_1_BLOCKS,
             blob_transfer: false,
             server: PhantomData,
         }
@@ -142,6 +148,20 @@ impl<'s> AttModel<'s> {
     /// Limit the prepared-write queue, `BLE_ATT_SVR_MAX_PREP_ENTRIES`.
     pub(crate) fn set_max_prepared(&mut self, entries: usize) {
         self.max_prepared = entries;
+    }
+
+    /// Limit how many prepared parts NimBLE's buffers can hold; by default
+    /// [`MSYS_1_BLOCKS`], as on the ESP32-C3 and ESP32-S3.
+    ///
+    /// `ble_att_svr_prep_alloc` gives each queued part its own buffer from
+    /// the MSYS_1 pool (`ble_hs_mbuf_l2cap_pkt`), and the pool is chosen by
+    /// size with no fallback (`os_msys_get_pkthdr`), so a part that finds the
+    /// pool empty is refused with `BLE_ATT_ERR_INSUFFICIENT_RES`. This is an
+    /// approximation: the pool is shared with all other traffic, so fewer
+    /// blocks are usually free, and a part larger than one block's data area
+    /// takes more than one.
+    pub(crate) fn set_part_budget(&mut self, parts: usize) {
+        self.part_budget = parts;
     }
 
     /// Model `CONFIG_BT_NIMBLE_BLE_GATT_BLOB_TRANSFER`, which removes Execute
@@ -271,6 +291,9 @@ impl<'s> AttModel<'s> {
         assert!(self.attributes.contains_key(&handle), "unknown handle");
         if self.queue.len() >= self.max_prepared {
             return Err(AttError::PREPARE_QUEUE_FULL);
+        }
+        if self.queue.len() >= self.part_budget {
+            return Err(AttError::INSUFFICIENT_RESOURCES);
         }
         let position = self
             .queue
@@ -573,6 +596,13 @@ mod tests {
         let fake = FakeBackend::new();
         for mtu in [23_u16, 64, 247] {
             let mut model = AttModel::new(&fake, &server, mtu);
+            // 512 bytes at MTU 23 take 29 parts, more than the default pool
+            // holds: as with CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT raised to at
+            // least 29 and that many blocks free. MTUs 64 and 247 take 9 and
+            // 3 parts, within the default.
+            if mtu == 23 {
+                model.set_part_budget(29);
+            }
             let handle = model.characteristic(0);
             let part = model.mtu() - 5;
             for length in [model.mtu() - 2, 100, 512] {
@@ -611,7 +641,9 @@ mod tests {
         assert_eq!(copies(&fake).len(), copied, "refused before copying");
         assert_eq!(small.writes(), [vec![7; 100]]);
 
-        // Beyond 512 bytes NimBLE refuses before calling back...
+        // Beyond 512 bytes NimBLE refuses before calling back. These
+        // writes use MTU 247, so their three parts fit the default pool.
+        let mut model = AttModel::new(&fake, &server, 247);
         let measured = lengths_read(&fake);
         assert_eq!(
             model.write_long(large_handle, &[9; 513]),
@@ -627,6 +659,35 @@ mod tests {
         assert_eq!(lengths_read(&fake), measured + 1, "the callback ran");
         assert_eq!(copies(&fake).len(), copied);
         assert!(large.writes().is_empty());
+        assert_eq!(fake.assert_balanced(), Ok(()));
+    }
+
+    #[test]
+    fn long_writes_beyond_the_buffer_pool_fail_without_reaching_the_handler() {
+        let store = Store::default();
+        let server = server([service().characteristic(blob::<512>(&store))]);
+        let fake = FakeBackend::new();
+        let mut model = AttModel::new(&fake, &server, 23);
+        let handle = model.characteristic(0);
+
+        // With the C3/S3 default of 12 blocks, 12 parts of 18 bytes fit and a
+        // 13th does not; the client's procedure then cancels the queue.
+        assert_eq!(model.write_long(handle, &[1; 12 * 18]), Ok(()));
+        for length in [12 * 18 + 1, 512] {
+            assert_eq!(
+                model.write_long(handle, &vec![2; length]),
+                Err(AttError::INSUFFICIENT_RESOURCES),
+                "{length} bytes"
+            );
+        }
+        assert_eq!(store.writes(), [vec![1; 12 * 18]], "only the fitting write");
+        assert_eq!(copies(&fake).len(), 1);
+        assert_eq!(model.execute(true), Ok(()), "nothing left queued");
+
+        // A larger MTU needs fewer parts: 512 bytes in 3 at MTU 247.
+        let mut model = AttModel::new(&fake, &server, 247);
+        assert_eq!(model.write_long(handle, &[3; 512]), Ok(()));
+        assert_eq!(store.writes().last(), Some(&vec![3; 512]));
         assert_eq!(fake.assert_balanced(), Ok(()));
     }
 

@@ -183,8 +183,10 @@
 //!   handler.
 //! - **Reads** encode the handler's value into a Rust buffer limited to
 //!   `MAX_LEN`. A value that does not fit, or a codec that fails part-way, is
-//!   reported to the client as [`AttError::UNLIKELY`]: nothing is truncated,
-//!   and bytes from a failed encoding never reach the response.
+//!   reported to the client as [`AttError::UNLIKELY`]: the framework never
+//!   truncates a value, and bytes from a failed encoding never reach the
+//!   response. NimBLE's own copy of a Read Blob part is an exception; see
+//!   [long values](#long-values-and-offsets).
 //! - Handlers receive owned values and return values; they never see native
 //!   buffers, so they cannot keep a borrow of a request or add bytes of
 //!   their own to a response.
@@ -195,17 +197,19 @@
 //! # Long values and offsets
 //!
 //! The ATT MTU, negotiated per connection, limits one packet, not one value.
-//! Values up to `MAX_LEN` bytes (at most 512) are served at every MTU. This
-//! section describes ESP-IDF 6.1's NimBLE (`ble_att_svr.c` and
-//! `ble_gatts.c`); the framework's part has host tests against a model of
-//! it, not tests on hardware.
+//! Reads of values up to `MAX_LEN` bytes (at most 512) work at every MTU.
+//! Writes longer than one packet need a GATT long write, whose capacity
+//! NimBLE's buffer pool limits, as below. This section is derived from
+//! ESP-IDF 6.1's NimBLE sources (`ble_att_svr.c`, `ble_gatts.c`, and
+//! `os_mbuf.c`); the framework's part has host tests against a model of
+//! them, and none of it is verified on hardware.
 //!
 //! | Client request | Value per request | Handler calls |
 //! | --- | --- | --- |
 //! | Read | the first MTU - 1 bytes | one |
 //! | Read Blob at an offset | up to MTU - 1 bytes from the offset | one per request |
 //! | Write Request, Write Command | at most MTU - 3 bytes | one |
-//! | Prepare Write, then Execute Write | at most MTU - 5 bytes per part, 512 in total | one, after Execute, with the whole value |
+//! | Prepare Write, then Execute Write | at most MTU - 5 bytes per part; parts limited by NimBLE's buffers, 512 bytes in total | one, after Execute, with the whole value |
 //!
 //! - **Reading long values.** A client reads a value longer than MTU - 1
 //!   bytes with a Read and then Read Blob requests at increasing offsets.
@@ -217,20 +221,37 @@
 //!   long value stable while a client reads it is the application's
 //!   responsibility, for example by changing it only at defined points, or by
 //!   keeping values that change within MTU - 1 bytes (22 at the default MTU
-//!   of 23). NimBLE refuses a Read Using Characteristic UUID request for a
-//!   value longer than 19 bytes with `UNLIKELY`; clients read such values by
-//!   handle.
+//!   of 23). For a nonzero offset NimBLE copies the requested part into the
+//!   response without checking that the copy succeeded
+//!   (`ble_gatts_val_access`), so when its buffers run out a Read Blob
+//!   response can come back short, which a client takes as the end of the
+//!   value. NimBLE also answers Read Using Characteristic UUID and Read
+//!   Multiple requests from the read handler, within one response: the
+//!   first refuses a first matching value longer than 19 bytes with
+//!   `UNLIKELY` and leaves out later matches that long, and the second
+//!   truncates its response to the MTU. Clients read long values by handle.
 //! - **Writing long values.** Every write that reaches a handler is one
 //!   complete value. A client writes more than MTU - 3 bytes with a GATT
-//!   long write: Prepare Write requests that NimBLE queues without calling
-//!   back (at most `CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES` parts, 64 by
-//!   default, shared by all connections), then an Execute Write request.
-//!   NimBLE then requires each attribute's parts to start at offset 0 and be
+//!   long write: Prepare Write requests of at most MTU - 5 bytes that NimBLE
+//!   queues without calling back, then an Execute Write request. On Execute,
+//!   NimBLE requires each attribute's parts to start at offset 0 and be
 //!   contiguous (otherwise `INVALID_OFFSET`) and to total at most 512 bytes
 //!   (otherwise `INVALID_ATTRIBUTE_VALUE_LENGTH`), and calls the handler once
 //!   with the whole value, which `MAX_LEN` and decoding then check as above.
 //!   A long write replaces the whole value; it cannot change part of one. A
 //!   cancelled, refused, or disconnected queue reaches no handler.
+//! - **Long-write capacity.** Each queued part holds at least one buffer
+//!   from NimBLE's MSYS_1 pool (`CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT`, 12
+//!   blocks by default on the ESP32-C3 and ESP32-S3, shared with all other
+//!   BLE traffic), and at most `CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES` parts
+//!   (64 by default) are queued across all connections. A part that finds
+//!   none free is refused with `INSUFFICIENT_RESOURCES` (or
+//!   `PREPARE_QUEUE_FULL`) and the long write fails. At the default MTU of
+//!   23, at most 12 parts of 18 bytes, 216 bytes, and usually fewer fit by
+//!   default. Negotiate a larger MTU, which needs fewer parts, raise the
+//!   block count, or keep written values within one Write Request. NimBLE
+//!   ends the whole connection if Execute Write does not arrive within 30
+//!   seconds of the last part (`BLE_ATT_SVR_QUEUED_WRITE_TMO`).
 //! - **Several attributes in one queue** are written in turn, and the first
 //!   failure ends the execution with earlier attributes already written. No
 //!   write is atomic across attributes; the Reliable Write property is not
@@ -377,9 +398,9 @@ pub trait Characteristic: Send + Sync + 'static {
 
     /// The largest encoded value, in bytes, this characteristic produces or
     /// accepts. It must not exceed [`MAX_ATTRIBUTE_VALUE_LEN`], the default.
-    /// Values up to this length are served at every ATT MTU, in several
-    /// requests when they exceed one packet; see
-    /// [variable-length values](crate::gatt#variable-length-values).
+    /// Reads up to this length work at every ATT MTU; writes longer than one
+    /// packet need a GATT long write, which NimBLE's buffers limit. See
+    /// [long values](crate::gatt#long-values-and-offsets).
     const MAX_LEN: usize = MAX_ATTRIBUTE_VALUE_LEN;
 
     /// The characteristic UUID. It is read once, when the characteristic is

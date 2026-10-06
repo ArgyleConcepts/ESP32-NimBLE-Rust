@@ -51,9 +51,11 @@ the BLE boundary and the declaration of a GATT server:
   bonding is requested.
 - Variable-length values: text, bytes, and application codecs bounded by each
   attribute's `MAX_LEN`, including empty values, writes NimBLE delivers in
-  chained buffers, and long values clients read with Read Blob or write with
-  prepared writes that NimBLE reassembles. Partial writes at an offset are
-  refused. The `gatt` documentation states NimBLE's long-value behavior and
+  chained buffers, long values clients read with Read Blob, and prepared
+  (long) writes that NimBLE reassembles within its buffer pool, which with
+  the ESP32-C3/S3 defaults holds at most 216 bytes of parts at the minimum
+  MTU.
+  Partial writes at an offset are refused. The `gatt` documentation states NimBLE's long-value behavior and
   a generic, application-managed chunked-transfer pattern whose framing and
   session state stay with the application.
 
