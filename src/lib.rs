@@ -12,8 +12,13 @@
 //! - [`gatt`]: declarative services, characteristics, and custom descriptors
 //!   whose capabilities are checked at compile time, frozen into a
 //!   [`gatt::GattServer`] definition.
+//! - [`Ble`]: the exclusive owner of the process's BLE host, whose type
+//!   tracks configuring and running states, with staged startup, structured
+//!   [`StartError`]s, and cleanup that never leaves native code pointing at
+//!   freed storage.
 //!
-//! There is no BLE controller, NimBLE registration, or runtime behavior yet. Private
+//! GATT definitions are not yet registered with NimBLE, and there is no
+//! advertising or connection handling yet. Private
 //! tooling validates consumer build context and generates bindings from the
 //! selected ESP-IDF configuration; generated declarations and C shims remain
 //! private. A reusable CMake module builds an application's Rust static
@@ -26,10 +31,12 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod backend;
+pub mod ble;
 pub mod codec;
 mod error;
 pub mod gatt;
 mod uuid;
 
+pub use ble::{Access, Ble, Cleanup, Configuring, Running, StartError, StartStage};
 pub use error::{AttError, BackendError, Error, ErrorKind, InvalidAttErrorCode};
 pub use uuid::{Uuid, UuidBytes, UuidError, BLUETOOTH_BASE_UUID};

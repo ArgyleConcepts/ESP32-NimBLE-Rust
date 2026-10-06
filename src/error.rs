@@ -6,8 +6,8 @@
 //!   connected client, such as "write not permitted". It is a valid ATT error
 //!   code, not a failure of this framework.
 //! - [`Error`] reports a failure of the framework itself: lifecycle misuse,
-//!   native backend failures, values that cannot be encoded, or invalid GATT
-//!   definitions. It is never sent to the client.
+//!   native backend failures, time limits, values that cannot be encoded, or
+//!   invalid GATT definitions. It is never sent to the client.
 //!
 //! No conversion exists from [`AttError`] to [`Error`]. A decode failure in a
 //! handler converts to the ATT error the client should see with `?`; see the
@@ -238,6 +238,9 @@ pub enum ErrorKind {
     /// An outgoing value could not be encoded. The error's
     /// [`source`](std::error::Error::source) is the [`EncodeError`].
     Encode,
+    /// An operation did not complete within its time limit, such as host
+    /// synchronization during startup.
+    Timeout,
     /// A GATT definition is structurally invalid, such as a characteristic
     /// with no read, write, or notify capability, or a reserved or repeated
     /// descriptor UUID.
@@ -250,6 +253,7 @@ impl fmt::Display for ErrorKind {
             Self::Lifecycle => "lifecycle error",
             Self::Backend => "native backend error",
             Self::Encode => "encoding error",
+            Self::Timeout => "timed out",
             Self::Definition => "invalid GATT definition",
         })
     }

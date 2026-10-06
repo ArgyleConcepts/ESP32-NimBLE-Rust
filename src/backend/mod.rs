@@ -9,6 +9,8 @@
 //! - `esp` (ESP builds only): the real backend, the only caller of the
 //!   generated bindings.
 //! - `fake` (`cfg(test)` only): a deterministic host backend for tests.
+//! - `unavailable` (non-ESP builds only): an uninhabited backend, so builds
+//!   without NimBLE cannot construct a running host.
 //!
 //! No safe runtime backend or public BLE API exists yet; the controller and
 //! GATT runtime build on this boundary in later work. Generated bindings come
@@ -29,6 +31,9 @@ pub(crate) mod esp;
 
 #[cfg(test)]
 pub(crate) mod fake;
+
+#[cfg(not(argyle_nimble_esp))]
+pub(crate) mod unavailable;
 
 #[cfg(argyle_nimble_esp)]
 #[allow(

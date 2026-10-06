@@ -281,6 +281,16 @@ impl Backend for EspBackend {
         })
     }
 
+    fn infer_address_type(&self) -> NativeResult<u8> {
+        let mut address_type = 0;
+        // SAFETY: the out pointer refers to a live local for the call; no
+        // privacy (0) is requested.
+        check(Operation::InferAddress, unsafe {
+            bindings::ble_hs_id_infer_auto(0, &mut address_type)
+        })?;
+        Ok(address_type)
+    }
+
     fn mtu(&self, connection: u16) -> Option<u16> {
         // SAFETY: plain SDK call with a value argument; 0 means no connection.
         match unsafe { bindings::ble_att_mtu(connection) } {

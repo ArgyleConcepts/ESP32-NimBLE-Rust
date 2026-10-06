@@ -1,0 +1,11 @@
+error[E0277]: the trait bound `Ble<Configuring>: Clone` is not satisfied
+ --> tests/ui/ble/fail/owner_not_clone.rs:6:14
+  |
+6 |     let _ = <Ble<Configuring> as Clone>::clone(configuring);
+  |              ^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `Ble<Configuring>`
+
+error[E0277]: the trait bound `Ble<Running>: Clone` is not satisfied
+ --> tests/ui/ble/fail/owner_not_clone.rs:7:14
+  |
+7 |     let _ = <Ble<Running> as Clone>::clone(running);
+  |              ^^^^^^^^^^^^ the trait `Clone` is not implemented for `Ble<Running>`

@@ -1,0 +1,15 @@
+error[E0061]: this method takes 2 arguments but 1 argument was supplied
+ --> tests/ui/ble/fail/start_without_access_choice.rs:7:17
+  |
+7 |     let _ = ble.start(server);
+  |                 ^^^^^-------- argument #2 of type `Access` is missing
+  |
+note: method defined here
+ --> src/ble.rs
+  |
+  |     pub fn start(self, server: GattServer, access: Access) -> Result<Ble<Running>, StartError> {
+  |            ^^^^^
+help: provide the argument
+  |
+7 |     let _ = ble.start(server, /* Access */);
+  |                             ++++++++++++++

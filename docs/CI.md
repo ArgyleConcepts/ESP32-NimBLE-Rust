@@ -197,10 +197,13 @@ callback dispatcher, GAP event translation, and owned-buffer logic against a
 `cfg(test)`-only fake backend. The fake records native call order, returns
 scripted SDK status codes, and keeps a buffer ledger that detects leaks,
 double frees, and double transfers. Its gates coordinate overlapping
-operations without sleeps. The tests show framework logic on the host only;
+operations without sleeps. The `Ble` owner tests drive singleton contention,
+every startup stage, failure and cleanup at each stage, poisoning, and owner
+moves through the same fake. The tests show framework logic on the host only;
 they are not SDK, target, or hardware evidence. The firmware fixtures compile
-the real ESP backend for C3 and S3. `tests/gatt_authoring.rs` uses
-[trybuild](https://docs.rs/trybuild) to compile the `tests/ui/gatt` fixtures:
+the real ESP backend for C3 and S3. `tests/compile_contracts.rs` uses
+[trybuild](https://docs.rs/trybuild) to compile the `tests/ui/gatt` and
+`tests/ui/ble` fixtures:
 `pass` fixtures must build, and each `compile_fail` fixture must fail with its
 recorded compiler error. Those messages come from the pinned host toolchain,
 so a toolchain update may require reviewing and regenerating them. The Python tests

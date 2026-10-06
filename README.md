@@ -21,8 +21,16 @@ the BLE boundary and the declaration of a GATT server:
   framework-controlled state cannot be used as custom descriptors. `GattServer` freezes the validated definition with typed
   notification endpoints.
 
-It has **no BLE controller, NimBLE registration of these definitions,
-implemented BLE behavior, or published package**. See the rustdoc on each type for contracts and examples. Its private,
+- `Ble`: the single owner of the NimBLE host. Its type tracks configuring
+  and running states; startup runs host initialization, callback
+  installation, host start, synchronization with a finite timeout, and
+  address inference, reporting a structured `StartError` per stage. Cleanup
+  never frees storage native code can reach and never touches NVS.
+
+The startup path compiles for ESP32-C3 and ESP32-S3 and is tested on the host
+against a fake backend; it has **not been run on hardware**. It has **no NimBLE
+registration of GATT definitions, advertising, connection handling, or
+published package**. See the rustdoc on each type for contracts and examples. Its private,
 versioned ESP-IDF build-context contract can validate the configured SDK,
 consumer compiler arguments, and Bluetooth/NimBLE configuration for ESP32-C3
 and ESP32-S3. Private binding-generation code and narrow C shims define the
@@ -88,9 +96,10 @@ milestones.
 - `src/lib.rs`: library entry point and crate documentation.
 - `src/uuid.rs`, `src/codec.rs`, and `src/error.rs`: public UUID, value codec,
   and error types with their contracts and tests.
+- `src/ble.rs`: the exclusive host owner, startup stages, and cleanup.
 - `src/gatt.rs` and `src/gatt/descriptor.rs`: public GATT authoring API;
-  `tests/gatt_authoring.rs` checks its
-  compile-time contracts with the `tests/ui/gatt` pass and compile-fail
+  `tests/compile_contracts.rs` checks its
+  compile-time contracts with the `tests/ui/gatt` and `tests/ui/ble` pass and compile-fail
   fixtures.
 - `build_support/context.rs` and `cmake/`: private build-context validation and
   CMake export contract.

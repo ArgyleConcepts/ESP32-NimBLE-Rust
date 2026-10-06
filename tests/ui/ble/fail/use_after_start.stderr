@@ -1,0 +1,15 @@
+error[E0382]: use of moved value: `ble`
+ --> tests/ui/ble/fail/use_after_start.rs:9:13
+  |
+7 | fn start_then_configure(ble: Ble<Configuring>, server: GattServer) {
+  |                         --- move occurs because `ble` has type `Ble<Configuring>`, which does not implement the `Copy` trait
+8 |     let _running = ble.start(server, Access::Open);
+  |                        --------------------------- `ble` moved due to this method call
+9 |     let _ = ble.sync_timeout(Duration::from_secs(1));
+  |             ^^^ value used here after move
+  |
+note: `Ble::<Configuring>::start` takes ownership of the receiver `self`, which moves `ble`
+ --> src/ble.rs
+  |
+  |     pub fn start(self, server: GattServer, access: Access) -> Result<Ble<Running>, StartError> {
+  |                  ^^^^

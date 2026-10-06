@@ -1,0 +1,8 @@
+error[E0599]: no method named `sync_timeout` found for struct `Ble<Running>` in the current scope
+ --> tests/ui/ble/fail/configure_after_start.rs:7:21
+  |
+7 |     let _ = running.sync_timeout(Duration::from_secs(1));
+  |                     ^^^^^^^^^^^^ method not found in `Ble<Running>`
+  |
+  = note: the method was found for
+          - `Ble<Configuring>`

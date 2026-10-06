@@ -110,6 +110,7 @@ pub(crate) enum NativeCall {
     Mtu {
         connection: u16,
     },
+    InferAddress,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -536,6 +537,13 @@ impl Backend for FakeBackend {
     fn mtu(&self, connection: u16) -> Option<u16> {
         self.enter(Operation::Mtu, NativeCall::Mtu { connection });
         self.lock().mtu.get(&connection).copied()
+    }
+
+    /// Reports a public address (type 0) unless a failure is scripted.
+    fn infer_address_type(&self) -> NativeResult<u8> {
+        let code = self.enter(Operation::InferAddress, NativeCall::InferAddress);
+        check(Operation::InferAddress, code)?;
+        Ok(0)
     }
 }
 
