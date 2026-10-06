@@ -122,9 +122,10 @@
 //!   match, so [`GattServer::new`] rejects any repeat.
 //!
 //! NimBLE adds and manages the CCCD of every notify-capable characteristic,
-//! including client subscription state. This crate does not create a CCCD
-//! or keep subscription state of its own, and the planned notification
-//! support relies on NimBLE's; applications cannot supply one.
+//! including client subscription state; applications cannot supply one.
+//! The running [`Ble`](crate::Ble) owner follows NimBLE's subscription
+//! events for the connected client and reports them per [`NotifyEndpoint`]
+//! (see [`ConnectionEvent::SubscriptionChanged`](crate::ConnectionEvent)).
 //! Indications are not supported.
 //!
 //! # Request handling
@@ -282,6 +283,39 @@ impl<V> NotifyEndpoint<V> {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn id(&self) -> &EndpointId {
         &self.id
+    }
+
+    /// The endpoint's identity without its value type, as subscription
+    /// events report it. Keys of the same endpoint (and its clones) are
+    /// equal; keys of different endpoints never are.
+    pub fn key(&self) -> EndpointKey {
+        EndpointKey(self.id.clone())
+    }
+}
+
+/// The identity of a [`NotifyEndpoint`] without its value type.
+///
+/// Subscription events and connection snapshots report endpoints this way;
+/// compare with [`NotifyEndpoint::key`]. Keys can be hashed and compared, but
+/// not built from numbers or native handles.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct EndpointKey(EndpointId);
+
+impl EndpointKey {
+    pub(crate) fn from_id(id: EndpointId) -> Self {
+        Self(id)
+    }
+
+    pub(crate) fn id(&self) -> &EndpointId {
+        &self.0
+    }
+}
+
+impl fmt::Debug for EndpointKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EndpointKey")
+            .finish_non_exhaustive()
     }
 }
 

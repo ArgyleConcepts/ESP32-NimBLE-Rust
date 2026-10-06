@@ -15,17 +15,24 @@
 //! - [`Ble`]: the exclusive owner of the process's BLE host, whose type
 //!   tracks configuring and running states, with staged startup, structured
 //!   [`StartError`]s, and cleanup that never leaves native code pointing at
-//!   freed storage.
+//!   freed storage. Starting it registers the GATT server with NimBLE.
+//! - [`Advertising`]: checked legacy advertising and scan-response payloads
+//!   and the GAP device name, advertised once the host is ready and
+//!   restarted by itself unless configured otherwise.
+//! - Single-client connection state: a [`ConnectionId`] that a reused native
+//!   handle can never revive, the ATT MTU, and per-endpoint subscriptions,
+//!   observed through [`Ble::connection`] snapshots and
+//!   [`ConnectionEvent`]s delivered to a [`ConnectionHandler`].
 //!
-//! GATT definitions are not yet registered with NimBLE, and there is no
-//! advertising or connection handling yet. Private
+//! Notification sending is not implemented yet. Private
 //! tooling validates consumer build context and generates bindings from the
 //! selected ESP-IDF configuration; generated declarations and C shims remain
 //! private. A reusable CMake module builds an application's Rust static
 //! library with this crate for ESP32-C3/S3 inside `idf.py`; real target builds
 //! check Rust layouts against the consumer's GCC. Azure compiles and links
-//! generic fixtures but does not run them. See the integration, build-context,
-//! and binding-generation guides for evidence limits.
+//! generic fixtures but does not run them, and nothing has been run on
+//! hardware. See the integration, build-context, and binding-generation
+//! guides for evidence limits.
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -37,6 +44,10 @@ mod error;
 pub mod gatt;
 mod uuid;
 
-pub use ble::{Access, Ble, Cleanup, Configuring, Running, StartError, StartStage};
+pub use ble::{
+    Access, Advertising, AdvertisingBuilder, AdvertisingError, Ble, Cleanup, Configuring,
+    ConnectionEvent, ConnectionHandler, ConnectionId, ConnectionInfo, DisconnectReason, LocalName,
+    Running, StartError, StartStage,
+};
 pub use error::{AttError, BackendError, Error, ErrorKind, InvalidAttErrorCode};
 pub use uuid::{Uuid, UuidBytes, UuidError, BLUETOOTH_BASE_UUID};

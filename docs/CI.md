@@ -2,12 +2,12 @@
 
 ## Pipeline and check
 
-[Pipeline 35, argyle-nimble PR Validation](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build?definitionId=35)
+[Pipeline 35, Argyle NimBLE](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build?definitionId=35)
 runs in Azure DevOps organization `ArgyleConceptsLLC`, project `Argyle Converge`.
 Every build/test job selects the self-hosted `macOS` pool (pool ID 15, project
 queue ID 14) and demands a Darwin agent. There is no publishing job.
 
-The GitHub check name is **`argyle-nimble PR Validation`**, supplied by the
+The GitHub check name is **`Argyle NimBLE`**, supplied by the
 Azure Pipelines GitHub App, app ID **9426**. Branch protections require
 this exact name and App on `develop` and `master`. The initial successful
 validation is [run 7585](https://dev.azure.com/ArgyleConceptsLLC/Argyle%20Converge/_build/results?buildId=7585).
@@ -187,7 +187,8 @@ The SDK-free Rust integration tests validate the private context contract and mo
 selection with SDK-free filesystem fixtures, exercise Cargo binding-output
 identity and transaction failure paths, private binding generation with
 generic host C fixtures, and compile the copied private C shim
-against controlled stubs to test its wrappers. They do not parse real
+against controlled stubs to test its wrappers and its rejection of NimBLE's
+connection re-attempt. They do not parse real
 ESP-IDF/NimBLE headers, establish a target ABI, compile firmware, or test BLE
 stack interoperability. The target-integration tests cover runtime-selection
 rejection, record selection, and the GCC probe-to-rustc assertion mechanism.
@@ -203,6 +204,18 @@ moves through the same fake. GATT registration tests check the plan built
 from a server, value-handle mapping, callback-argument routing, malformed and
 undeclared requests, length checks before copying, buffer failures, and the
 buffer ledger on every path; the native table translation itself is only
+compiled for the targets. Advertising tests check payload placement and
+encoding, the 31-byte packet boundaries, name shortening and character
+boundaries, and every rejected configuration. Connection runtime tests
+inject GAP and host events through the fake to drive whole sequences:
+advertising only after synchronization, connect/subscribe/MTU/disconnect/
+reconnect, numeric-handle reuse, second clients, duplicate, stale, and
+out-of-order events, failed connections and restarts, host reset and
+resynchronization, re-entrant handlers, overlapping advertising starts, and
+shutdown ordering. The fake also models ESP-IDF's late connection report
+(advertising ends at link creation, before the report), links left open or
+already freed after a failed connection, repeated terminations, and
+NimBLE refusing commands while the host is not synchronized. The ESP advertising calls and their constants are only
 compiled for the targets. The tests show framework logic on the host only;
 they are not SDK, target, or hardware evidence. The firmware fixtures compile
 the real ESP backend for C3 and S3. `tests/compile_contracts.rs` uses

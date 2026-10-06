@@ -12,9 +12,9 @@ ESP32-C3 and ESP32-S3 fixtures and inspects the results; it does not flash or
 execute firmware, verify hardware, or test BLE behavior. argyle-nimble's
 public API covers UUIDs, value codecs, error types, GATT server definitions,
 and the exclusive `Ble` host owner with its startup sequence, which registers
-the GATT server with NimBLE. Advertising, connection handling, and
-notification sending are not implemented, and nothing has been run on
-hardware.
+the GATT server with NimBLE, then starts legacy advertising and tracks one
+connected client. Notification sending is not implemented, and nothing has
+been run on hardware.
 
 ## Supported configuration
 
@@ -23,7 +23,7 @@ hardware.
 | ESP-IDF | 6.1 (Azure pins the commit in [`eng/idf-tools.lock.json`](../eng/idf-tools.lock.json)) |
 | Targets | `esp32c3` → `riscv32imc-esp-espidf`; `esp32s3` → `xtensa-esp32s3-espidf` |
 | C library | Newlib (`CONFIG_LIBC_NEWLIB=y`) with Rust `std` |
-| Bluetooth | `CONFIG_BT_ENABLED=y`, `CONFIG_BT_NIMBLE_ENABLED=y` |
+| Bluetooth | `CONFIG_BT_ENABLED=y`, `CONFIG_BT_NIMBLE_ENABLED=y`, `CONFIG_BT_NIMBLE_MAX_CONNECTIONS` of at least 2 (default 3), `CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT=n` (default `y` on C3/S3) |
 | Rust | Espressif Rust toolchain with `rust-src`; Azure pins release `1.90.0.0` in [`eng/rust-target-toolchain.lock.json`](../eng/rust-target-toolchain.lock.json) |
 | Binding tools | ESP-IDF's `esp-clang` and `esp-clang-libs` `esp-21.1.3_20260408` |
 | Compiler launchers | None; set `IDF_CCACHE_ENABLE=0` |
@@ -31,6 +31,34 @@ hardware.
 Picolibc, ESP-IDF's 6.x default, is rejected during CMake configuration and
 again by the build script. No Picolibc support is claimed. Other chips, other
 ESP-IDF versions, and `no_std` builds are outside the validated scope.
+
+Advertising uses NimBLE's legacy advertising API, so keep
+`CONFIG_BT_NIMBLE_EXT_ADV` disabled (its default). With extended advertising
+enabled, the ESP-IDF 6.1 sources compile those calls to return
+`BLE_HS_ENOTSUP`, so startup would fail when advertising starts; that
+configuration is neither built nor tested here. The GAP Device Name is limited by
+`CONFIG_BT_NIMBLE_GAP_DEVICE_NAME_MAX_LEN` (31 bytes by default).
+
+Only one client is served, but NimBLE must be able to hold a second link:
+ESP-IDF 6.1 reports some failed peripheral connections while it still holds
+the link, and restarting advertising then needs a free connection slot. The
+ESP target build checks `CONFIG_BT_NIMBLE_MAX_CONNECTIONS` against the
+consumer's `sdkconfig.h` and fails to compile below 2.
+
+Set `CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT=n` in `sdkconfig.defaults`; the
+private C shim fails the build otherwise, with an `#error` naming the option.
+With the re-attempt enabled (ESP-IDF's default on C3 and S3), NimBLE frees a
+peripheral link that fails to establish (HCI 0x3e, or a supervision timeout
+before the connection is reported) and restarts advertising by itself
+without any GAP event (`ble_hs_hci_evt_disconn_complete` and
+`ble_gap_slave_adv_reattempt` in ESP-IDF 6.1). It would re-send advertising
+data the framework does not set that way, and a link it frees after
+reporting it would never be reported as ended. argyle-nimble restarts
+advertising itself after a failed connection or disconnection
+(`AdvertisingBuilder::remain_available`), which covers the same need.
+Supporting the re-attempt is tracked by NIMBLERS-25. The shim checks
+NimBLE's own `MYNEWT_VAL(BLE_ENABLE_CONN_REATTEMPT)`, which ESP-IDF's
+`esp_nimble_cfg.h` always defines (to 0 when the option is disabled).
 
 ## Consumer setup
 

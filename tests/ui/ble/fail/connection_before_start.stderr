@@ -1,0 +1,23 @@
+error[E0599]: no method named `connection` found for struct `Ble<Configuring>` in the current scope
+ --> tests/ui/ble/fail/connection_before_start.rs:6:17
+  |
+6 |     let _ = ble.connection();
+  |                 ^^^^^^^^^^
+  |
+help: there is a method `connection_handler` with a similar name, but with different arguments
+ --> src/ble.rs
+  |
+  |     pub fn connection_handler(mut self, handler: impl ConnectionHandler) -> Self {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no method named `start_advertising` found for struct `Ble<Configuring>` in the current scope
+ --> tests/ui/ble/fail/connection_before_start.rs:7:17
+  |
+7 |     let _ = ble.start_advertising();
+  |                 ^^^^^^^^^^^^^^^^^
+  |
+help: there is a method `advertise` with a similar name, but with different arguments
+ --> src/ble.rs
+  |
+  |     pub fn advertise(mut self, advertising: Advertising) -> Self {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

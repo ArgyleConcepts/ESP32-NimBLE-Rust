@@ -2,4 +2,7 @@
 CONFIG_LIBC_NEWLIB=y
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
+# argyle-nimble restarts advertising itself and requires NimBLE's own
+# connection re-attempt to be off.
+CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT=n
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y

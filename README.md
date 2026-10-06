@@ -30,11 +30,31 @@ the BLE boundary and the declaration of a GATT server:
   tables from the frozen server, and private access callbacks route client
   reads and writes to the typed handlers through the codecs. Handlers never
   see native buffers.
+- `Advertising`: legacy advertising (flags and service UUIDs) and scan
+  response (complete, or explicitly allowed shortened, local name) payloads
+  checked against the 31-byte packet limits and the GATT server, with
+  specific errors instead of silently trimmed payloads. The name also
+  becomes the GAP Device Name. Advertising starts only once the host is
+  synchronized and restarts by itself after a disconnection, failed
+  connection, or host reset unless turned off. It requires
+  `CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT=n` and
+  `CONFIG_BT_NIMBLE_MAX_CONNECTIONS` of at least 2; target builds fail
+  otherwise (see the [idf.py integration guide](docs/IDF_INTEGRATION.md)).
+- Single-client connection state: a `ConnectionId` with a generation, so a
+  reused NimBLE connection handle never revives earlier state, plus the ATT
+  MTU and per-notify-endpoint subscriptions, cleared on disconnection and
+  host reset. Applications observe it through `Ble::connection` snapshots
+  and `ConnectionEvent`s delivered to a `ConnectionHandler` on the host
+  task. Advertising is stopped once a client is connected. If a second
+  client connects, the framework requests termination of its link without
+  affecting the first. Access is open: no pairing or
+  bonding is requested.
 
-The firmware fixtures compile the startup and registration paths for
-ESP32-C3 and ESP32-S3, and host tests drive them against a fake backend; they
-have **not been run on hardware**. There is **no advertising, connection
-handling, notification sending, or published package**. See the rustdoc on each type for contracts and examples. Its private,
+The firmware fixtures compile the startup, registration, advertising, and
+connection paths for ESP32-C3 and ESP32-S3, and host tests drive them against
+a fake backend; they have **not been run on hardware**, so no BLE behavior
+or interoperability with real clients is established. There is **no
+notification sending or published package**. See the rustdoc on each type for contracts and examples. Its private,
 versioned ESP-IDF build-context contract can validate the configured SDK,
 consumer compiler arguments, and Bluetooth/NimBLE configuration for ESP32-C3
 and ESP32-S3. Private binding-generation code and narrow C shims define the
@@ -100,7 +120,9 @@ milestones.
 - `src/lib.rs`: library entry point and crate documentation.
 - `src/uuid.rs`, `src/codec.rs`, and `src/error.rs`: public UUID, value codec,
   and error types with their contracts and tests.
-- `src/ble.rs`: the exclusive host owner, startup stages, and cleanup.
+- `src/ble.rs`: the exclusive host owner, startup stages, and cleanup;
+  `src/ble/advertising.rs` and `src/ble/connection.rs`: advertising payloads
+  and the single-client connection runtime.
 - `src/gatt.rs` and `src/gatt/descriptor.rs`: public GATT authoring API;
   `tests/compile_contracts.rs` checks its
   compile-time contracts with the `tests/ui/gatt` and `tests/ui/ble` pass and compile-fail
@@ -119,8 +141,6 @@ milestones.
     owned buffers that are freed or transferred exactly once;
   - a `cfg(test)`-only deterministic fake backend for host tests;
   - the C shims.
-
-  No safe or public BLE controller exists yet.
 - [CONTRIBUTING.md](CONTRIBUTING.md): contributor workflow and validation policy.
 - [Maintainer guide](docs/MAINTAINING.md): governance and external contributions.
 

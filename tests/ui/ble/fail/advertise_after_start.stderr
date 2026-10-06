@@ -1,0 +1,20 @@
+error[E0599]: no method named `advertise` found for struct `Ble<Running>` in the current scope
+ --> tests/ui/ble/fail/advertise_after_start.rs:7:21
+  |
+7 |     let _ = running.advertise(advertising);
+  |                     ^^^^^^^^^ method not found in `Ble<Running>`
+  |
+  = note: the method was found for
+          - `Ble<Configuring>`
+
+error[E0599]: no method named `connection_handler` found for struct `Ble<Running>` in the current scope
+  --> tests/ui/ble/fail/advertise_after_start.rs:11:21
+   |
+11 |     let _ = running.connection_handler(|_: ConnectionEvent| {});
+   |                     ^^^^^^^^^^^^^^^^^^
+   |
+help: there is a method `connection` with a similar name, but with different arguments
+  --> src/ble.rs
+   |
+   |     pub fn connection(&self) -> Option<ConnectionInfo> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,15 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> tests/ui/ble/fail/forged_endpoint_key.rs:8:13
+  |
+8 |     let _ = EndpointKey(todo!());
+  |             ^^^^^^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> src/gatt.rs
+  |
+  | pub struct EndpointKey(EndpointId);
+  |                        ^^^^^^^^^^ private field
+help: you might have meant to use the `from_id` associated function
+  |
+8 |     let _ = EndpointKey::from_id(todo!());
+  |                        +++++++++

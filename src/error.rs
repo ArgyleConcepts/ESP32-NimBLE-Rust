@@ -6,13 +6,15 @@
 //!   connected client, such as "write not permitted". It is a valid ATT error
 //!   code, not a failure of this framework.
 //! - [`Error`] reports a failure of the framework itself: lifecycle misuse,
-//!   native backend failures, time limits, values that cannot be encoded, or
-//!   invalid GATT definitions. It is never sent to the client.
+//!   native backend failures, time limits, values that cannot be encoded,
+//!   invalid GATT definitions, or advertising configurations that cannot be
+//!   sent. It is never sent to the client.
 //!
 //! No conversion exists from [`AttError`] to [`Error`]. A decode failure in a
 //! handler converts to the ATT error the client should see with `?`; see the
 //! `From` implementations on [`AttError`].
 
+use crate::ble::AdvertisingError;
 use crate::codec::{DecodeError, EncodeError};
 use crate::Uuid;
 use std::fmt;
@@ -245,6 +247,10 @@ pub enum ErrorKind {
     /// with no read, write, or notify capability, or a reserved or repeated
     /// descriptor UUID.
     Definition,
+    /// An advertising configuration cannot be sent as configured, such as a
+    /// name or service list that does not fit its packet. The error's
+    /// [`source`](std::error::Error::source) is the [`AdvertisingError`].
+    Advertising,
 }
 
 impl fmt::Display for ErrorKind {
@@ -255,6 +261,7 @@ impl fmt::Display for ErrorKind {
             Self::Encode => "encoding error",
             Self::Timeout => "timed out",
             Self::Definition => "invalid GATT definition",
+            Self::Advertising => "invalid advertising configuration",
         })
     }
 }
@@ -278,6 +285,7 @@ enum Cause {
     },
     Backend(BackendError),
     Encode(EncodeError),
+    Advertising(AdvertisingError),
     // Boxed so the common error paths stay small.
     Definition(Box<DefinitionLocation>),
     // The cleanup failure that poisoned the host.
@@ -302,6 +310,15 @@ impl Error {
     pub fn backend(&self) -> Option<&BackendError> {
         match &self.cause {
             Cause::Backend(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// The rejected advertising configuration, for
+    /// [`ErrorKind::Advertising`] errors.
+    pub fn advertising(&self) -> Option<&AdvertisingError> {
+        match &self.cause {
+            Cause::Advertising(error) => Some(error),
             _ => None,
         }
     }
@@ -388,6 +405,7 @@ impl fmt::Display for Error {
             ),
             Cause::Backend(error) => write!(formatter, "{}: {error}", self.kind),
             Cause::Encode(error) => write!(formatter, "{}: {error}", self.kind),
+            Cause::Advertising(error) => write!(formatter, "{}: {error}", self.kind),
         }
     }
 }
@@ -398,6 +416,7 @@ impl std::error::Error for Error {
             Cause::Message { .. } | Cause::Definition(_) => None,
             Cause::Backend(error) => Some(error),
             Cause::Encode(error) => Some(error),
+            Cause::Advertising(error) => Some(error),
             Cause::Poisoned(cause) => Some(cause.as_ref()),
         }
     }
@@ -408,6 +427,15 @@ impl From<EncodeError> for Error {
         Self {
             kind: ErrorKind::Encode,
             cause: Cause::Encode(error),
+        }
+    }
+}
+
+impl From<AdvertisingError> for Error {
+    fn from(error: AdvertisingError) -> Self {
+        Self {
+            kind: ErrorKind::Advertising,
+            cause: Cause::Advertising(error),
         }
     }
 }

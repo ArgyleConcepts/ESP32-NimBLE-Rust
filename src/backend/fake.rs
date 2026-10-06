@@ -43,28 +43,32 @@ impl Gate {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Mark arrival and wait for release.
-    pub(crate) fn pass(&self) {
+    /// Wait until `done` holds, failing the test after a generous limit
+    /// instead of hanging when the awaited step never happens.
+    fn wait_for(&self, what: &str, done: impl Fn(&(bool, bool)) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut state = self.lock();
-        state.0 = true;
-        self.changed.notify_all();
-        while !state.1 {
+        while !done(&state) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "gate: {what} did not happen");
             state = self
                 .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
         }
+    }
+
+    /// Mark arrival and wait for release.
+    pub(crate) fn pass(&self) {
+        self.lock().0 = true;
+        self.changed.notify_all();
+        self.wait_for("the release", |state| state.1);
     }
 
     /// Block until a worker has arrived at the gate.
     pub(crate) fn wait_entered(&self) {
-        let mut state = self.lock();
-        while !state.0 {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
+        self.wait_for("the worker's arrival", |state| state.0);
     }
 
     pub(crate) fn release(&self) {
@@ -118,6 +122,14 @@ pub(crate) enum NativeCall {
     GattAdd,
     /// The registration's tables were freed.
     RegistrationFreed,
+    SetDeviceName {
+        name: String,
+    },
+    AdvertisingData(Vec<u8>),
+    ScanResponseData(Vec<u8>),
+    AdvertisingStart {
+        address_type: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,7 +185,11 @@ struct FakeState {
     violations: Vec<LedgerViolation>,
     holds: HashMap<Operation, Hold>,
     notifications: Vec<(u16, u16, Vec<u8>)>,
-    mtu: HashMap<u16, u16>,
+    /// Links NimBLE knows, by handle, with their ATT MTU, as `ble_att_mtu`
+    /// reports it.
+    links: HashMap<u16, Link>,
+    /// Whether an advertising procedure is active.
+    advertising: bool,
     host_thread: Option<std::thread::ThreadId>,
     /// Handle slots and layout of the last registration, filled in when the
     /// host starts, as NimBLE does.
@@ -181,6 +197,29 @@ struct FakeState {
     /// Leave value handles unassigned at host start, as when NimBLE's
     /// attribute allocation fails with assertions disabled.
     skip_handle_assignment: bool,
+    /// NimBLE's sync state: set by injected sync and reset callbacks, as
+    /// NimBLE sets it before delivering them, or by the test.
+    synced: bool,
+}
+
+/// A link as the fake host knows it.
+#[derive(Clone, Copy, Debug)]
+struct Link {
+    mtu: u16,
+    /// The controller already dropped it; the host has not freed it yet.
+    controller_gone: bool,
+    /// A termination was requested.
+    terminating: bool,
+}
+
+impl Link {
+    fn new(mtu: u16) -> Self {
+        Self {
+            mtu,
+            controller_gone: false,
+            terminating: false,
+        }
+    }
 }
 
 /// Per service, each characteristic's notify flag, descriptor count, and
@@ -287,8 +326,37 @@ impl FakeBackend {
         self.lock().host_thread = Some(thread);
     }
 
+    /// Set the sync state without a callback, as NimBLE does at the start of
+    /// a host reset before it reports the reset's GAP events.
+    pub(crate) fn set_synced(&self, synced: bool) {
+        self.lock().synced = synced;
+    }
+
+    /// Model a link NimBLE knows, with its ATT MTU (23 until an exchange).
     pub(crate) fn set_mtu(&self, connection: u16, mtu: u16) {
-        self.lock().mtu.insert(connection, mtu);
+        self.lock()
+            .links
+            .entry(connection)
+            .or_insert(Link::new(mtu))
+            .mtu = mtu;
+    }
+
+    /// Model the controller accepting a client: NimBLE creates the link and
+    /// ends advertising (`ble_gap_rx_conn_complete` resets the advertising
+    /// state) before it reports the connection, which ESP-IDF does only
+    /// after reading the client's version and features.
+    pub(crate) fn create_link(&self, connection: u16) {
+        let mut state = self.lock();
+        state.links.entry(connection).or_insert(Link::new(23));
+        state.advertising = false;
+    }
+
+    /// Model the controller dropping a link the host still holds:
+    /// terminating it then fails with HCI Unknown Connection Identifier.
+    pub(crate) fn drop_controller_link(&self, connection: u16) {
+        if let Some(link) = self.lock().links.get_mut(&connection) {
+            link.controller_gone = true;
+        }
     }
 
     pub(crate) fn calls(&self) -> Vec<NativeCall> {
@@ -366,9 +434,85 @@ impl FakeBackend {
     }
 
     /// Deliver a native callback through the installed dispatcher, as the
-    /// NimBLE host task would.
+    /// NimBLE host task would. Sync and reset callbacks first update the
+    /// sync state, as NimBLE does before calling them.
     pub(crate) fn inject(&self, event: NativeEvent) -> Option<Delivery> {
-        self.callbacks.deliver(event)
+        let mut free_after = None;
+        {
+            let mut state = self.lock();
+            match &event {
+                NativeEvent::HostSynced => state.synced = true,
+                NativeEvent::HostReset { .. } => {
+                    state.synced = false;
+                    state.links.clear();
+                    state.advertising = false;
+                }
+                // Reporting a connection does not change advertising, which
+                // ended when the link was created (see `create_link`).
+                NativeEvent::Gap(GapEvent::Connect {
+                    connection,
+                    status: 0,
+                }) => {
+                    state.links.entry(*connection).or_insert(Link::new(23));
+                }
+                // `ble_gap_conn_broken` reports a link that broke before it
+                // was reported as failed with BLE_HS_EAGAIN while it still
+                // holds the link, and frees it afterwards.
+                NativeEvent::Gap(GapEvent::Connect { connection, status }) if *status == 1 => {
+                    free_after = Some(*connection);
+                }
+                // NimBLE frees a link before reporting its disconnection.
+                NativeEvent::Gap(GapEvent::Disconnect { connection, .. }) => {
+                    state.links.remove(connection);
+                }
+                NativeEvent::Gap(GapEvent::AdvertisingComplete { .. }) => {
+                    state.advertising = false;
+                }
+                NativeEvent::Gap(_) => {}
+            }
+        }
+        let delivery = self.callbacks.deliver(event);
+        if let Some(connection) = free_after {
+            self.lock().links.remove(&connection);
+        }
+        delivery
+    }
+
+    /// Whether an advertising procedure is active.
+    pub(crate) fn is_advertising(&self) -> bool {
+        self.lock().advertising
+    }
+
+    /// Model the controller's late answer to the feature request for a
+    /// peripheral link NimBLE already reported failed and freed
+    /// (`ble_gap_conn_broken`): `ble_gap_rx_rd_rem_sup_feat_complete` finds
+    /// no link and reports the connection failed again with the raw HCI
+    /// `status`.
+    pub(crate) fn late_feature_failure(&self, connection: u16, status: i32) -> Option<Delivery> {
+        assert!(
+            !self.lock().links.contains_key(&connection),
+            "NimBLE reports this only for a link it freed"
+        );
+        self.inject_gap(GapEvent::Connect { connection, status })
+    }
+
+    /// Deliver a GAP event, as the NimBLE host task would.
+    pub(crate) fn inject_gap(&self, event: GapEvent) -> Option<Delivery> {
+        self.inject(NativeEvent::Gap(event))
+    }
+
+    /// Like an HCI command from an application task: a scripted result, or
+    /// `BLE_HS_ENOTSYNCED` (22) while the host is not synchronized
+    /// (`ble_hs_hci_cmd_send_buf` refuses every task while the sync state is
+    /// bad and other tasks while it brings the controller up), checked when
+    /// the call proceeds past any hold.
+    fn enter_hci(&self, operation: Operation, call: NativeCall) -> i32 {
+        let code = self.enter(operation, call);
+        if code == 0 && !self.lock().synced {
+            22
+        } else {
+            code
+        }
     }
 
     /// Record a call, consume a scripted result, then stop at a hold if one
@@ -439,6 +583,7 @@ impl FakeBackend {
 impl Backend for FakeBackend {
     type Mbuf = FakeMbuf;
     type Registration = FakeRegistration;
+    const MAX_LINKS: usize = 3;
 
     fn host_init(&self) -> NativeResult<()> {
         check(
@@ -648,23 +793,100 @@ impl Backend for FakeBackend {
         check(Operation::Notify, code)
     }
 
+    /// Like `ble_gap_terminate`: a scripted result wins; otherwise an
+    /// unknown link fails with `BLE_HS_ENOTCONN` (7) before any HCI command,
+    /// a repeated request succeeds (the ESP backend maps `BLE_HS_EALREADY`),
+    /// the HCI command is refused with `BLE_HS_ENOTSYNCED` (22) while the
+    /// host is not synchronized, and a link the controller already dropped
+    /// fails with HCI Unknown Connection Identifier (0x202).
     fn terminate(&self, connection: u16) -> NativeResult<()> {
+        let code = self.enter(Operation::Terminate, NativeCall::Terminate { connection });
+        let mut state = self.lock();
+        let synced = state.synced;
+        let code = match state.links.get_mut(&connection) {
+            _ if code != 0 => code,
+            None => 7,
+            Some(link) if link.terminating => 0,
+            Some(_) if !synced => 22,
+            Some(link) if link.controller_gone => 0x202,
+            Some(link) => {
+                link.terminating = true;
+                0
+            }
+        };
+        drop(state);
+        check(Operation::Terminate, code)
+    }
+
+    fn set_device_name(&self, name: &std::ffi::CStr) -> NativeResult<()> {
+        let call = NativeCall::SetDeviceName {
+            name: name.to_string_lossy().into_owned(),
+        };
         check(
-            Operation::Terminate,
-            self.enter(Operation::Terminate, NativeCall::Terminate { connection }),
+            Operation::DeviceName,
+            self.enter(Operation::DeviceName, call),
         )
     }
 
-    fn advertising_stop(&self) -> NativeResult<()> {
+    fn set_advertising_data(&self, data: &[u8]) -> NativeResult<()> {
         check(
-            Operation::AdvertisingStop,
-            self.enter(Operation::AdvertisingStop, NativeCall::AdvertisingStop),
+            Operation::AdvertisingData,
+            self.enter_hci(
+                Operation::AdvertisingData,
+                NativeCall::AdvertisingData(data.to_vec()),
+            ),
         )
+    }
+
+    fn set_scan_response_data(&self, data: &[u8]) -> NativeResult<()> {
+        check(
+            Operation::ScanResponseData,
+            self.enter_hci(
+                Operation::ScanResponseData,
+                NativeCall::ScanResponseData(data.to_vec()),
+            ),
+        )
+    }
+
+    /// Like `ble_gap_adv_start`: while advertising, it succeeds without a
+    /// new procedure (`BLE_HS_EALREADY`); while the host is not synchronized
+    /// after a reset, it fails with `BLE_HS_ENOADDR` (21), as
+    /// `ble_hs_id_use_addr` finds the identity addresses `ble_hs_id_reset`
+    /// cleared before any HCI command.
+    fn advertising_start(&self, address_type: u8) -> NativeResult<bool> {
+        let code = self.enter(
+            Operation::AdvertisingStart,
+            NativeCall::AdvertisingStart { address_type },
+        );
+        let mut state = self.lock();
+        let code = match code {
+            0 if state.advertising => return Ok(false),
+            0 if !state.synced => 21,
+            code => code,
+        };
+        if code == 0 {
+            state.advertising = true;
+        }
+        drop(state);
+        check(Operation::AdvertisingStart, code).map(|()| true)
+    }
+
+    /// Like `ble_gap_adv_stop`: the HCI disable can fail (`BLE_HS_ENOTSYNCED`
+    /// while unsynchronized) before the advertising state is cleared;
+    /// otherwise it returns whether advertising was active.
+    fn advertising_stop(&self) -> NativeResult<bool> {
+        let code = self.enter_hci(Operation::AdvertisingStop, NativeCall::AdvertisingStop);
+        check(Operation::AdvertisingStop, code)?;
+        Ok(std::mem::replace(&mut self.lock().advertising, false))
+    }
+
+    fn is_synced(&self) -> bool {
+        self.lock().synced
     }
 
     fn mtu(&self, connection: u16) -> Option<u16> {
         self.enter(Operation::Mtu, NativeCall::Mtu { connection });
-        self.lock().mtu.get(&connection).copied()
+        self.lock().links.get(&connection).map(|link| link.mtu)
     }
 
     fn prepare_gatt(&self, plan: &GattPlan) -> FakeRegistration {
@@ -771,6 +993,7 @@ mod tests {
     #[test]
     fn calls_are_logged_in_order_and_scripted_codes_are_consumed_fifo() {
         let fake = FakeBackend::new();
+        fake.set_synced(true);
         fake.fail_next(Operation::HostInit, 0x103);
         fake.fail_next(Operation::HostInit, 5);
         assert_eq!(
@@ -793,7 +1016,7 @@ mod tests {
         assert_eq!(fake.mtu(1), Some(185));
         assert_eq!(fake.mtu(2), None);
         assert_eq!(fake.terminate(1), Ok(()));
-        assert_eq!(fake.advertising_stop(), Ok(()));
+        assert_eq!(fake.advertising_stop(), Ok(false));
         assert_eq!(fake.host_stop(), Ok(()));
         assert_eq!(fake.host_deinit(), Ok(()));
         assert_eq!(
@@ -1177,8 +1400,39 @@ mod tests {
     }
 
     #[test]
+    fn native_calls_are_refused_while_the_host_is_not_synchronized() {
+        let fake = FakeBackend::new();
+        let refused = |code: i32, result: NativeResult<()>| matches!(result, Err(NativeError::Status { code: actual, .. }) if actual == code);
+        // HCI commands are refused; starting advertising fails earlier, on
+        // the identity address a reset cleared; terminating an unknown link
+        // fails before any command.
+        assert!(refused(22, fake.set_advertising_data(&[])));
+        assert!(refused(22, fake.set_scan_response_data(&[])));
+        assert!(refused(21, fake.advertising_start(0).map(drop)));
+        assert!(refused(22, fake.advertising_stop().map(drop)));
+        assert!(refused(7, fake.terminate(1)));
+        fake.set_mtu(1, 23);
+        assert!(refused(22, fake.terminate(1)));
+        assert!(!fake.is_advertising());
+        fake.set_synced(true);
+        assert_eq!(fake.advertising_start(0), Ok(true));
+        assert_eq!(fake.advertising_start(0), Ok(false), "already advertising");
+        assert!(fake.is_advertising());
+        // A refused stop leaves advertising running.
+        fake.set_synced(false);
+        assert!(refused(22, fake.advertising_stop().map(drop)));
+        assert!(fake.is_advertising());
+        fake.set_synced(true);
+        assert_eq!(fake.advertising_stop(), Ok(true));
+        assert_eq!(fake.advertising_stop(), Ok(false));
+        assert_eq!(fake.terminate(1), Ok(()));
+        assert_eq!(fake.terminate(1), Ok(()), "already terminating");
+    }
+
+    #[test]
     fn a_hold_stops_only_the_next_call_of_its_operation() {
         let fake = FakeBackend::new();
+        fake.set_synced(true);
         let held = fake.hold(Operation::HostStop);
         let stopping = {
             let fake = fake.clone();
@@ -1186,7 +1440,7 @@ mod tests {
         };
         held.wait_entered();
         // Other operations proceed while HostStop is held.
-        assert_eq!(fake.advertising_stop(), Ok(()));
+        assert_eq!(fake.advertising_stop(), Ok(false));
         held.release();
         assert_eq!(stopping.join().unwrap(), Ok(()));
         // The hold was consumed; a second stop does not block.

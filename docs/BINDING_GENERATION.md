@@ -175,8 +175,9 @@ failure messages.
 Bindgen roots are closed exact-name lists in `bindings.rs`; recursive type
 selection follows only declarations referenced by those roots. The current
 surface covers NimBLE port lifecycle, GAP/GATT service initialization and
-registration, peripheral advertising, connection termination and MTU lookup,
-identity inference, custom notifications, and mbuf creation. Required C
+registration, the GAP device name, legacy advertising with raw payloads,
+host sync state, connection termination and MTU lookup, identity inference,
+custom notifications, and mbuf creation. Required C
 functions, types, and constants are checked in the parsed generated Rust so a
 missing SDK declaration cannot silently produce an incomplete file.
 
@@ -206,7 +207,16 @@ safety guarantees.
 
 The exact constants needed for open peripheral-server registration, advertising,
 ATT access results, connection termination, and ATT channel identification are
-also checked as bindgen roots. The SDK's remote-user-termination reason is a
+also checked as bindgen roots. The advertising payloads are encoded in Rust
+from the Bluetooth Assigned Numbers; their AD types, flags, the 31-byte
+payload limits, the default ATT MTU, the HCI status base, and the
+`BLE_HS_EALREADY`, `BLE_HS_EAGAIN`, and `BLE_HS_ENOTCONN` statuses are roots
+so that real target builds check those values against the consumer's SDK
+and fail compilation on a mismatch. `CONFIG_BT_NIMBLE_MAX_CONNECTIONS` is a
+root so the build can require at least two connections. The private C shim
+fails compilation with an `#error` when NimBLE's connection re-attempt
+(`MYNEWT_VAL(BLE_ENABLE_CONN_REATTEMPT)`) is enabled; a host test checks that
+preprocessor logic against the synthetic SDK. The SDK's remote-user-termination reason is a
 variant of a broad named error enum, so the private shim re-exports only that
 value through one anonymous enum constant; unrelated SDK error variants are
 not binding roots. The `BLE_HS_FOREVER` macro expands through `INT32_MAX`, so
