@@ -182,8 +182,9 @@
 //! [`ConnectionEvent`] on the host task.
 //!
 //! Events that do not belong to the connected client change nothing:
-//! events for a link that already ended or never connected, subscriptions to attributes without a notify endpoint, and MTU
-//! changes on channels other than ATT's. If a second client connects anyway
+//! events for a link that already ended or never connected, subscriptions
+//! to attributes without a notify endpoint, and MTU changes on channels
+//! other than ATT's. If a second client connects anyway
 //! (legacy advertising stops at the first connection, so this needs another
 //! route into the controller), the framework asks NimBLE to terminate the
 //! new link and reports [`ConnectionEvent::ConnectionRejected`]; the
@@ -191,10 +192,12 @@
 //! reports as failed is terminated too, since ESP-IDF can leave it open.
 //!
 //! GATT request handlers receive no connection context, and NimBLE serves
-//! ATT on every link it holds. A link the framework is terminating (a
-//! rejected second client, or a failed connection left open) can therefore
-//! still read and write attributes until it closes, and those requests reach
-//! the same handlers as the connected client's. Applications that keep
+//! ATT on every link it holds, from when the controller creates the link
+//! (before ESP-IDF reports the connection) until it closes. A link that is
+//! not the connected client, such as a second client before or after it is
+//! rejected, or a failed connection left open, can therefore read and write
+//! attributes, and those requests reach the same handlers as the connected
+//! client's. Applications that keep
 //! per-client state across several requests should allow for requests from
 //! such a link.
 //!
