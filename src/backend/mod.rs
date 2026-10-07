@@ -12,13 +12,13 @@
 //! - `unavailable` (non-ESP builds only): an uninhabited backend, so builds
 //!   without NimBLE cannot construct a running host.
 //!
-//! The public [`Ble`](crate::Ble) owner drives the host lifecycle through
-//! this boundary; GATT registration and the connection runtime build on it in
-//! later work. Generated bindings come from the consuming application's
-//! actual ESP-IDF build configuration and remain private.
+//! The public [`Ble`](crate::Ble) owner drives the host lifecycle, GATT
+//! registration, and the connection runtime through this boundary.
+//! Generated bindings come from the consuming application's actual ESP-IDF
+//! build configuration and remain private.
 
-// Consumed by the controller and GATT runtime in later tickets; host tests
-// exercise these modules today.
+// Host builds have no NimBLE, and notification sending is not implemented
+// yet, so some of this is reached only by ESP builds or host tests.
 #![cfg_attr(not(test), allow(dead_code))]
 
 pub(crate) mod dispatch;

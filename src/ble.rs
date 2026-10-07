@@ -730,6 +730,13 @@ impl<B: Backend> Started<B> {
         self.core().runtime.connection()
     }
 
+    /// The registered server, so tests can serve requests to it as NimBLE
+    /// would through the registered callback arguments.
+    #[cfg(test)]
+    pub(crate) fn server(&self) -> &GattServer {
+        &self.core().server
+    }
+
     pub(crate) fn start_advertising(&self) -> Result<(), Error> {
         self.core().runtime.start_advertising()
     }

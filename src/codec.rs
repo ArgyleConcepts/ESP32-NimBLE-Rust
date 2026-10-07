@@ -68,6 +68,80 @@
 //! assert_eq!(decode_value::<Reading>(&bytes)?, reading);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
+//!
+//! # Variable-length values
+//!
+//! Byte and text values take their length from the value itself, so they may
+//! be empty. Every limit is explicit, and nothing is silently truncated:
+//!
+//! - A [`ValueWriter`] appends at most its capacity. A write that does not
+//!   fit fails with [`EncodeError::CapacityExceeded`] and leaves the output
+//!   unchanged, and [`ValueWriter::write`] removes whatever a failing
+//!   [`Encode`] implementation wrote before it failed. Codecs reach the
+//!   output only through these methods.
+//! - A [`ValueReader`] never reads past its input, and a failed read
+//!   consumes nothing.
+//! - Text decodes only as complete, valid UTF-8; malformed or truncated
+//!   sequences fail with [`DecodeError::InvalidUtf8`].
+//! - A GATT attribute's `MAX_LEN` bounds its complete value; see
+//!   [`gatt`](crate::gatt#variable-length-values).
+//!
+//! To bound a variable-length field, or to follow it with another, give it
+//! an explicit length:
+//!
+//! ```
+//! use argyle_nimble::codec::{
+//!     decode_value, Decode, DecodeError, Encode, EncodeError, ValueReader, ValueWriter,
+//! };
+//!
+//! /// A name of at most 16 bytes, then a payload of any length.
+//! #[derive(Debug, PartialEq)]
+//! struct Labeled {
+//!     name: String,
+//!     payload: Vec<u8>,
+//! }
+//!
+//! impl Encode for Labeled {
+//!     fn encode(&self, writer: &mut ValueWriter<'_>) -> Result<(), EncodeError> {
+//!         let length = u8::try_from(self.name.len())
+//!             .ok()
+//!             .filter(|length| *length <= 16)
+//!             .ok_or(EncodeError::InvalidValue { reason: "name over 16 bytes" })?;
+//!         writer.write(&length)?;
+//!         writer.write(self.name.as_str())?;
+//!         writer.write(&self.payload)
+//!     }
+//! }
+//!
+//! impl Decode<'_> for Labeled {
+//!     fn decode(reader: &mut ValueReader<'_>) -> Result<Self, DecodeError> {
+//!         let length: u8 = reader.read()?;
+//!         if length > 16 {
+//!             return Err(DecodeError::InvalidLength { length: length.into() });
+//!         }
+//!         let name = reader.read_str(length.into())?.to_owned();
+//!         Ok(Self { name, payload: reader.read()? })
+//!     }
+//! }
+//!
+//! let value = Labeled { name: "fan".into(), payload: vec![1; 5] };
+//! assert_eq!(decode_value::<Labeled>(b"\x03fan\x01\x01\x01\x01\x01")?, value);
+//! assert_eq!(
+//!     decode_value::<Labeled>(b"\x03f\xffn"),
+//!     Err(DecodeError::InvalidUtf8 { valid_up_to: 1 })
+//! );
+//!
+//! // Eight bytes of capacity hold the name but not the payload: the write
+//! // fails, and the name already written is removed.
+//! let mut output = Vec::new();
+//! let mut writer = ValueWriter::new(&mut output, 8);
+//! assert_eq!(
+//!     writer.write(&value),
+//!     Err(EncodeError::CapacityExceeded { needed: 5, remaining: 4 })
+//! );
+//! assert!(output.is_empty());
+//! # Ok::<(), DecodeError>(())
+//! ```
 
 use std::fmt;
 

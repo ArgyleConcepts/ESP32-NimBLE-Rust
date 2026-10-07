@@ -156,13 +156,228 @@
 //!   locks and other application threads is the application's
 //!   responsibility.
 //! - [`Readable::read`] and [`ReadableDescriptor::read`] may be called more
-//!   than once for one client read:
-//!   NimBLE reads values longer than one ATT packet in pieces and calls the
-//!   handler for each piece. A value that changes between calls can reach the
-//!   client mixed; keep long values stable or keep them within one packet.
+//!   than once for one client read of a long value; see
+//!   [Long values and offsets](#long-values-and-offsets).
 //! - A panic in a handler or codec is not caught: native callbacks are
 //!   `extern "C"` and ESP targets build with `panic=abort`, so it aborts the
 //!   program instead of unwinding into NimBLE.
+//!
+//! # Variable-length values
+//!
+//! Text, bytes, and application codecs with variable-length fields use the
+//! same handlers, codecs, and request dispatch as fixed-size values. Each
+//! attribute's `MAX_LEN` bounds its values in both directions:
+//!
+//! - **Writes** of up to `MAX_LEN` bytes are accepted. Longer ones are
+//!   refused with [`AttError::INVALID_ATTRIBUTE_VALUE_LENGTH`] before any
+//!   byte is copied or decoded. NimBLE may hold a written value in several
+//!   chained buffers; all of them are copied into one owned buffer before
+//!   decoding, so a character or field split between buffers decodes like
+//!   any other.
+//! - **Empty values** are values: a zero-length write decodes as an empty
+//!   `String` or `Vec<u8>` (a fixed-size type refuses it with
+//!   [`AttError::INVALID_ATTRIBUTE_VALUE_LENGTH`]), and an empty read value
+//!   sends no bytes.
+//! - **Text** is validated as UTF-8 over the complete value. Malformed text
+//!   is refused with [`AttError::VALUE_NOT_ALLOWED`] and never reaches the
+//!   handler.
+//! - **Reads** encode the handler's value into a Rust buffer limited to
+//!   `MAX_LEN`. A value that does not fit, or a codec that fails part-way, is
+//!   reported to the client as [`AttError::UNLIKELY`]: the framework never
+//!   truncates a value, and bytes from a failed encoding never reach the
+//!   response. NimBLE's own copy of a Read Blob part is an exception; see
+//!   [long values](#long-values-and-offsets).
+//! - Handlers receive owned values and return values; they never see native
+//!   buffers, so they cannot keep a borrow of a request or add bytes of
+//!   their own to a response.
+//!
+//! Inside a value, codecs bound their own fields with explicit lengths; see
+//! [`codec`](crate::codec#variable-length-values).
+//!
+//! # Long values and offsets
+//!
+//! The ATT MTU, negotiated per connection, limits one packet, not one value.
+//! Reads of values up to `MAX_LEN` bytes (at most 512) work at every MTU.
+//! Writes longer than one packet need a GATT long write, whose capacity
+//! NimBLE's buffer pool limits, as below. This section is derived from
+//! ESP-IDF 6.1's NimBLE sources (`ble_att_svr.c`, `ble_gatts.c`, and
+//! `os_mbuf.c`); the framework's part has host tests against a model of
+//! them, and none of it is verified on hardware.
+//!
+//! | Client request | Value per request | Handler calls |
+//! | --- | --- | --- |
+//! | Read | the first MTU - 1 bytes | one |
+//! | Read Blob at an offset | up to MTU - 1 bytes from the offset | one per request |
+//! | Write Request, Write Command | at most MTU - 3 bytes | one |
+//! | Prepare Write, then Execute Write | at most MTU - 5 bytes per part; parts limited by NimBLE's buffers, 512 bytes in total | one, after Execute, with the whole value |
+//!
+//! - **Reading long values.** A client reads a value longer than MTU - 1
+//!   bytes with a Read and then Read Blob requests at increasing offsets.
+//!   NimBLE calls the read handler for every request and takes the requested
+//!   part of the complete value it returns, so one client read can call the
+//!   handler several times. A value that changes between calls reaches the
+//!   client mixed, and one that shrinks below the client's offset ends the
+//!   read with `INVALID_OFFSET`. Handlers do not see the offset; keeping a
+//!   long value stable while a client reads it is the application's
+//!   responsibility, for example by changing it only at defined points, or by
+//!   keeping values that change within MTU - 1 bytes (22 at the default MTU
+//!   of 23). For a nonzero offset NimBLE copies the requested part into the
+//!   response without checking that the copy succeeded
+//!   (`ble_gatts_val_access`), so when its buffers run out a Read Blob
+//!   response can come back short, which a client takes as the end of the
+//!   value. NimBLE also answers Read Using Characteristic UUID and Read
+//!   Multiple requests from the read handler, within one response. For Read
+//!   Using Characteristic UUID, the first matching value longer than 19
+//!   bytes ends the response (`ble_att_svr_build_read_type_rsp`): if it is
+//!   the first match the request fails with `UNLIKELY`, otherwise it and
+//!   every later match are left out. Read Multiple truncates its response
+//!   to the MTU. Clients read long values by handle.
+//! - **Writing long values.** Every write that reaches a handler is one
+//!   complete value. A client writes more than MTU - 3 bytes with a GATT
+//!   long write: Prepare Write requests of at most MTU - 5 bytes that NimBLE
+//!   queues without calling back, then an Execute Write request. On Execute,
+//!   NimBLE requires each attribute's parts to start at offset 0 and be
+//!   contiguous (otherwise `INVALID_OFFSET`) and to total at most 512 bytes
+//!   (otherwise `INVALID_ATTRIBUTE_VALUE_LENGTH`), and calls the handler once
+//!   with the whole value, which `MAX_LEN` and decoding then check as above.
+//!   A long write replaces the whole value; it cannot change part of one. A
+//!   cancelled, refused, or disconnected queue reaches no handler.
+//! - **Long-write capacity.** Each queued part holds at least one buffer
+//!   from NimBLE's MSYS_1 pool (`CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT`, 12
+//!   blocks by default on the ESP32-C3 and ESP32-S3, shared with all other
+//!   BLE traffic), and at most `CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES` parts
+//!   (64 by default) are queued across all connections. A part that finds
+//!   none free is refused with `INSUFFICIENT_RESOURCES` (or
+//!   `PREPARE_QUEUE_FULL`) and the long write fails. At the default MTU of
+//!   23, at most 12 parts of 18 bytes, 216 bytes, and usually fewer fit by
+//!   default. Negotiate a larger MTU, which needs fewer parts, raise the
+//!   block count, or keep written values within one Write Request. NimBLE
+//!   ends the whole connection if Execute Write does not arrive within 30
+//!   seconds of the last part (`BLE_ATT_SVR_QUEUED_WRITE_TMO`).
+//! - **Several attributes in one queue** are written in turn, and the first
+//!   failure ends the execution with earlier attributes already written. No
+//!   write is atomic across attributes; the Reliable Write property is not
+//!   declared.
+//! - **Unsupported.** A write at a nonzero offset would carry part of a
+//!   value, which this framework does not reassemble; it is refused with
+//!   [`AttError::REQUEST_NOT_SUPPORTED`] before the value is read. NimBLE
+//!   6.1 delivers every write at offset 0, as above. With
+//!   `CONFIG_BT_NIMBLE_BLE_GATT_BLOB_TRANSFER`, NimBLE accepts long writes
+//!   over 512 bytes, which `MAX_LEN` still refuses. Write Commands cannot be
+//!   long.
+//!
+//! # Chunked transfers
+//!
+//! Data larger than one attribute value, such as a file or an image, moves
+//! in several writes under an application protocol. The framework supplies
+//! bounded, validated values and their handlers; the protocol's framing,
+//! limits, retries, and session state, and what happens to the data, belong
+//! to the application. A GATT long write is a different layer: it moves one
+//! attribute value of at most 512 bytes that NimBLE reassembles, within its
+//! buffer limits, before the handler runs. Keep the two apart by sending
+//! each chunk in one Write Request, so a transfer never depends on NimBLE's
+//! long-write buffers: the client sends at most MTU - 7 data bytes per chunk
+//! (MTU - 3 for the Write Request, less the chunk's 4-byte offset), up to
+//! the data characteristic's limit.
+//!
+//! The example below keeps one session in application state shared by three
+//! characteristics: control commands begin a transfer of a known length,
+//! commit it, or abort it; each data write carries a chunk and its offset;
+//! a status read reports progress. Its rules:
+//!
+//! - Only the next chunk is accepted, and a refused write changes nothing.
+//!   After any error, whether an application error for a repeated or skipped
+//!   chunk or a framework one such as `UNLIKELY` or
+//!   `INSUFFICIENT_RESOURCES`, the client reads the status and resends from
+//!   the offset it reports.
+//! - Memory is bounded: the total is checked against a limit when the
+//!   transfer begins, and each chunk against the remaining length.
+//! - Commit succeeds only once every byte has arrived, and hands the bytes
+//!   to the application at once through a bounded channel the application
+//!   supplies. If the channel is full, Commit fails with an application
+//!   error and the transfer stays complete, so the client commits again
+//!   later. Nothing committed waits in the session to be discarded.
+//! - The session holds only an uncommitted transfer and is meant for the
+//!   served client's connection. The application registers
+//!   `reset_on_disconnect` with
+//!   [`Ble::connection_handler`](crate::Ble::connection_handler), so
+//!   [`ConnectionEvent::Disconnected`](crate::ConnectionEvent::Disconnected)
+//!   resets it. It also resets on `ConnectionFailed` and `HostReset`, which
+//!   end links that may have made requests before their connection was
+//!   reported and are reported only while no client is connected, and
+//!   ignores `ConnectionRejected`, which leaves the served client connected.
+//!   Reset and Abort never affect committed transfers.
+//! - Handlers do not see which link a request came from, and NimBLE serves
+//!   ATT on every link. A link the framework is terminating, such as a
+//!   rejected second client or one whose connection was reported as failed,
+//!   can still make requests until it closes; they share the session, and
+//!   that link's end is not reported, so a transfer it began can remain. A
+//!   client therefore aborts (which succeeds when nothing is in progress)
+//!   or reads the status before it begins, and a client that abandons a
+//!   transfer aborts it before beginning another.
+//! - The data characteristic accepts Write Requests and Write Commands.
+//!   Requests let the client see each result; commands are faster but carry
+//!   no response, so a client using them reads the status before
+//!   committing. (NimBLE grants both once either is declared; the example
+//!   declares both.)
+//! - To transfer in the other direction, a client can write the offset it
+//!   wants and then read one chunk of at most MTU - 1 bytes, so each chunk
+//!   arrives in a single read.
+//!
+//! ```
+// The example source is shared with the host tests in
+// `chunked_transfer_tests`, which serve it through the request dispatch.
+#![doc = include_str!("gatt/transfer_example.rs")]
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     use argyle_nimble::codec::decode_value;
+//!     use argyle_nimble::gatt::GattServer;
+//!
+//!     // At most one committed transfer waits for the application.
+//!     let (completed, committed) = std::sync::mpsc::sync_channel(1);
+//!     let transfer = Arc::new(Transfer::new(completed));
+//!     let server = GattServer::new([transfer_service(&transfer)])?;
+//!     // `server` goes to the BLE owner, with the reset registered:
+//!     //
+//!     //     let ble = Ble::take()?
+//!     //         .connection_handler(reset_on_disconnect(&transfer))
+//!     //         .start(server, Access::Open)?;
+//!     //
+//!     // Here the client is simulated by calling the handlers with the
+//!     // values the framework would decode.
+//!     # let _ = server;
+//!     let control = Control(transfer.clone());
+//!     let status = Status(transfer.clone());
+//!     let data = Data(transfer.clone());
+//!     assert_eq!(
+//!         decode_value::<Command>(&[0x01, 0x58, 0x02, 0x00, 0x00])?,
+//!         Command::Begin { total: 600 }
+//!     );
+//!
+//!     let image: Vec<u8> = (0..600_u32).map(|index| index as u8).collect();
+//!     control.write(Command::Begin { total: 600 })?;
+//!     for (index, bytes) in image.chunks(CHUNK_LEN).enumerate() {
+//!         let offset = (index * CHUNK_LEN) as u32;
+//!         data.write(Chunk { offset, bytes: bytes.to_vec() })?;
+//!         // Sending a chunk again is refused and changes nothing.
+//!         let repeated = Chunk { offset, bytes: bytes.to_vec() };
+//!         assert_eq!(data.write(repeated), Err(UNEXPECTED_OFFSET));
+//!     }
+//!     assert_eq!(status.read()?, Progress { received: 600, total: 600 });
+//!     control.write(Command::Commit)?;
+//!     assert_eq!(committed.try_recv()?, image);
+//!
+//!     // The connection ends part-way through the next transfer, and the
+//!     // registered handler resets the session.
+//!     control.write(Command::Begin { total: 10 })?;
+//!     data.write(Chunk { offset: 0, bytes: vec![1; 4] })?;
+//!     transfer.reset();
+//!     assert_eq!(status.read()?, Progress { received: 0, total: 0 });
+//!     let late = Chunk { offset: 4, bytes: vec![1; 6] };
+//!     assert_eq!(data.write(late), Err(NO_TRANSFER));
+//!     Ok(())
+//! }
+//! ```
 //!
 //! # Shared state
 //!
@@ -170,13 +385,19 @@
 //! `Arc<Mutex<_>>` or atomics. Handlers and application codec implementations
 //! ([`Encode`] and [`Decode`](crate::codec::Decode)) must not panic.
 //!
-//! Handlers receive no request context, such as the connection, yet. Phase 1
-//! serves one client with open access; if context is added, it will arrive
-//! as new provided trait methods so existing handlers keep compiling.
+//! Handlers receive no request context, such as the connection. The
+//! framework serves one client with open access; state tied to that client,
+//! such as a transfer session, is reset from a
+//! [`ConnectionHandler`](crate::ConnectionHandler) (see
+//! [Chunked transfers](#chunked-transfers)). If request context is added, it
+//! will arrive as new provided trait methods so existing handlers keep
+//! compiling.
 //!
 //! Sending notifications is not part of this module yet. Descriptor requests
 //! follow the same contract as characteristic requests.
 
+#[cfg(test)]
+mod chunked_transfer_tests;
 mod descriptor;
 pub(crate) mod registration;
 
@@ -204,6 +425,9 @@ pub trait Characteristic: Send + Sync + 'static {
 
     /// The largest encoded value, in bytes, this characteristic produces or
     /// accepts. It must not exceed [`MAX_ATTRIBUTE_VALUE_LEN`], the default.
+    /// Reads up to this length work at every ATT MTU; writes longer than one
+    /// packet need a GATT long write, which NimBLE's buffers limit. See
+    /// [long values](crate::gatt#long-values-and-offsets).
     const MAX_LEN: usize = MAX_ATTRIBUTE_VALUE_LEN;
 
     /// The characteristic UUID. It is read once, when the characteristic is
@@ -214,15 +438,16 @@ pub trait Characteristic: Send + Sync + 'static {
 /// Handles reads of a characteristic's value.
 pub trait Readable: Characteristic<Value: Encode> {
     /// Return the current value, or the ATT error to send to the client.
-    /// One client read of a long value may call this more than once; see the
-    /// [module documentation](crate::gatt#request-handling).
+    /// One client read of a long value may call this more than once; see
+    /// [long values](crate::gatt#long-values-and-offsets).
     fn read(&self) -> Result<Self::Value, AttError>;
 }
 
 /// Handles writes of a characteristic's value.
 pub trait Writable: Characteristic<Value: DecodeOwned> {
     /// Accept a written value, already decoded, or return the ATT error to
-    /// send to the client.
+    /// send to the client. The value is always complete: NimBLE reassembles
+    /// a long write before it reaches this handler.
     fn write(&self, value: Self::Value) -> Result<(), AttError>;
 }
 

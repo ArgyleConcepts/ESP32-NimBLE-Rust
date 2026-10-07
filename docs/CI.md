@@ -215,12 +215,18 @@ resynchronization, re-entrant handlers, overlapping advertising starts, and
 shutdown ordering. The fake also models ESP-IDF's late connection report
 (advertising ends at link creation, before the report), links left open or
 already freed after a failed connection, repeated terminations, and
-NimBLE refusing commands while the host is not synchronized. The ESP advertising calls and their constants are only
+NimBLE refusing commands while the host is not synchronized. Long-value
+tests drive the GATT request dispatch through a host model of ESP-IDF 6.1
+NimBLE's Read, Read Blob, Write, and Prepare/Execute Write handling and its
+prepare-write buffer limit, transcribed from the SDK sources, and the
+documented chunked-transfer example runs through that model and a started
+fake host whose GAP events reach its connection handler; this is evidence
+against the transcription, not NimBLE. The ESP advertising calls and their constants are only
 compiled for the targets. The tests show framework logic on the host only;
 they are not SDK, target, or hardware evidence. The firmware fixtures compile
 the real ESP backend for C3 and S3. `tests/compile_contracts.rs` uses
-[trybuild](https://docs.rs/trybuild) to compile the `tests/ui/gatt` and
-`tests/ui/ble` fixtures:
+[trybuild](https://docs.rs/trybuild) to compile the `tests/ui/gatt`,
+`tests/ui/ble`, and `tests/ui/codec` fixtures:
 `pass` fixtures must build, and each `compile_fail` fixture must fail with its
 recorded compiler error. Those messages come from the pinned host toolchain,
 so a toolchain update may require reviewing and regenerating them. The Python tests

@@ -1,0 +1,16 @@
+error[E0521]: borrowed data escapes outside of associated function
+  --> tests/ui/codec/fail/decode_retains_input.rs:13:9
+   |
+11 | impl<'a> Decode<'a> for Payload {
+   |      -- lifetime `'a` defined here
+12 |     fn decode(reader: &mut ValueReader<'a>) -> Result<Self, DecodeError> {
+   |               ------ `reader` is a reference that is only valid in the associated function body
+13 |         RETAINED.lock().unwrap().push(reader.read_remaining());
+   |         ^^^^^^^^^^^^^^^
+   |         |
+   |         `reader` escapes the associated function body here
+   |         argument requires that `'a` must outlive `'static`
+   |
+   = note: requirement occurs because of the type `std::sync::Mutex<Vec<&[u8]>>`, which makes the generic argument `Vec<&[u8]>` invariant
+   = note: the struct `std::sync::Mutex<T>` is invariant over the parameter `T`
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance

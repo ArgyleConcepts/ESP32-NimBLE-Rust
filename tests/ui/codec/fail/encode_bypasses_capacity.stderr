@@ -1,0 +1,5 @@
+error[E0616]: field `output` of struct `ValueWriter` is private
+  --> tests/ui/codec/fail/encode_bypasses_capacity.rs:10:16
+   |
+10 |         writer.output.extend_from_slice(&[0; 1024]);
+   |                ^^^^^^ private field

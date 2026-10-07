@@ -1,6 +1,7 @@
 //! A Rust framework for ESP-IDF NimBLE.
 //!
-//! The public API so far covers the values that cross the BLE boundary:
+//! The public API so far covers the values that cross the BLE boundary, the
+//! GATT server and its request handling, and the host that serves it:
 //!
 //! - [`Uuid`]: 16-, 32-, and 128-bit Bluetooth UUIDs with checked parsing and
 //!   explicit canonical and wire byte orders.
@@ -11,7 +12,10 @@
 //!   framework failures; the two are deliberately separate.
 //! - [`gatt`]: declarative services, characteristics, and custom descriptors
 //!   whose capabilities are checked at compile time, frozen into a
-//!   [`gatt::GattServer`] definition.
+//!   [`gatt::GattServer`] definition. Handlers serve fixed and
+//!   variable-length values within each attribute's `MAX_LEN`, and the module
+//!   documents NimBLE's long-value behavior and a generic, application-owned
+//!   chunked-transfer pattern.
 //! - [`Ble`]: the exclusive owner of the process's BLE host, whose type
 //!   tracks configuring and running states, with staged startup, structured
 //!   [`StartError`]s, and cleanup that never leaves native code pointing at

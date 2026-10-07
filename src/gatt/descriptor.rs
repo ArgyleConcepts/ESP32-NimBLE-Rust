@@ -30,6 +30,9 @@ pub trait Descriptor: Send + Sync + 'static {
 
     /// The largest encoded value, in bytes, this descriptor produces or
     /// accepts. It must not exceed [`MAX_ATTRIBUTE_VALUE_LEN`], the default.
+    /// Reads up to this length work at every ATT MTU; writes longer than one
+    /// packet need a GATT long write, which NimBLE's buffers limit. See
+    /// [long values](crate::gatt#long-values-and-offsets).
     const MAX_LEN: usize = MAX_ATTRIBUTE_VALUE_LEN;
 
     /// The descriptor UUID. It is read once, by [`DescriptorDef::new`], which
@@ -40,15 +43,16 @@ pub trait Descriptor: Send + Sync + 'static {
 /// Handles reads of a descriptor's value.
 pub trait ReadableDescriptor: Descriptor<Value: Encode> {
     /// Return the current value, or the ATT error to send to the client.
-    /// One client read of a long value may call this more than once; see the
-    /// [module documentation](crate::gatt#request-handling).
+    /// One client read of a long value may call this more than once; see
+    /// [long values](crate::gatt#long-values-and-offsets).
     fn read(&self) -> Result<Self::Value, AttError>;
 }
 
 /// Handles writes of a descriptor's value.
 pub trait WritableDescriptor: Descriptor<Value: DecodeOwned> {
     /// Accept a written value, already decoded, or return the ATT error to
-    /// send to the client.
+    /// send to the client. The value is always complete: NimBLE reassembles
+    /// a long write before it reaches this handler.
     fn write(&self, value: Self::Value) -> Result<(), AttError>;
 }
 

@@ -10,6 +10,7 @@
 #[test]
 fn compile_contracts() {
     let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/ui/codec/fail/*.rs");
     cases.pass("tests/ui/gatt/pass/*.rs");
     cases.compile_fail("tests/ui/gatt/fail/*.rs");
     cases.pass("tests/ui/ble/pass/*.rs");

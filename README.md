@@ -49,6 +49,15 @@ the BLE boundary and the declaration of a GATT server:
   client connects, the framework requests termination of its link without
   affecting the first. Access is open: no pairing or
   bonding is requested.
+- Variable-length values: text, bytes, and application codecs bounded by each
+  attribute's `MAX_LEN`, including empty values, writes NimBLE delivers in
+  chained buffers, long values clients read with Read Blob, and prepared
+  (long) writes that NimBLE reassembles within its buffer pool, which with
+  the ESP32-C3/S3 defaults holds at most 216 bytes of parts at the minimum
+  MTU. Partial writes at an offset are refused. The `gatt` documentation
+  states NimBLE's long-value behavior and a generic, application-managed
+  chunked-transfer pattern whose framing and session state stay with the
+  application.
 
 The firmware fixtures compile the startup, registration, advertising, and
 connection paths for ESP32-C3 and ESP32-S3, and host tests drive them against
@@ -125,8 +134,8 @@ milestones.
   and the single-client connection runtime.
 - `src/gatt.rs` and `src/gatt/descriptor.rs`: public GATT authoring API;
   `tests/compile_contracts.rs` checks its
-  compile-time contracts with the `tests/ui/gatt` and `tests/ui/ble` pass and compile-fail
-  fixtures.
+  compile-time contracts with the `tests/ui/gatt`, `tests/ui/ble`, and
+  `tests/ui/codec` pass and compile-fail fixtures.
 - `build_support/context.rs` and `cmake/`: private build-context validation and
   CMake export contract.
 - `build_support/bindings.rs`: private context-driven bindgen generator.
