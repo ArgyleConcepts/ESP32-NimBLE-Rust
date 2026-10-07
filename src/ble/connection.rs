@@ -266,6 +266,9 @@ pub enum ConnectionEvent {
 ///   such as [`Ble::connection`](crate::Ble::connection) and
 ///   [`Ble::start_advertising`](crate::Ble::start_advertising). It must not
 ///   shut the host down: from the host task that poisons it.
+/// - GATT request handlers have no connection context and may also be
+///   called for a link the framework is terminating; see the
+///   [module documentation](crate::ble#the-connected-client).
 /// - Disconnections caused by shutting the host down are delivered while
 ///   [`Ble::shutdown`](crate::Ble::shutdown) waits, so do not shut down while
 ///   holding a lock the handler takes.
@@ -736,7 +739,10 @@ impl<B: Backend> Runtime<B> {
         // requesting features, a failed feature exchange leaves it open, and
         // `ble_gap_conn_broken` reports before freeing it. So a failure
         // report for a link NimBLE does not hold is that duplicate, and
-        // changes nothing.
+        // changes nothing. This assumes the controller does not give the
+        // handle to a new link before delivering the late features-complete
+        // event for the previous one (HCI event ordering); if it did, NimBLE
+        // itself would apply that event to the new link.
         if let GapEvent::Connect { status, .. } = event {
             if status != 0 && status != HOST_EAGAIN && mtu.is_none() {
                 return;
@@ -2672,7 +2678,10 @@ mod tests {
         assert!(fixture.calls_since(mark).is_empty());
         fixture.fake.inject(NativeEvent::HostReset { reason: 19 });
         fixture.fake.inject(NativeEvent::HostSynced);
+        // Only the first sync after the reset restarts advertising.
+        let mark = fixture.mark();
         fixture.fake.inject(NativeEvent::HostSynced);
+        assert!(fixture.calls_since(mark).is_empty());
         assert_eq!(fixture.seen.take(), [Seen::HostReset(19), Seen::HostSynced]);
 
         // A reset while the host starts is not reported, nor is the sync that
@@ -2911,6 +2920,43 @@ mod tests {
         inferring.wait_entered();
         fake.inject(NativeEvent::HostReset { reason: 19 });
         (events, starting, inferring)
+    }
+
+    #[test]
+    fn startup_retries_when_nimble_is_unsynchronized_before_reporting_a_reset() {
+        // `ble_hs_reset` marks NimBLE unsynchronized and clears the identity
+        // addresses before it reports the reset, so a start can fail
+        // (BLE_HS_ENOADDR) while the host events still read synchronized;
+        // only NimBLE's own sync state shows the reset.
+        let fake = FakeBackend::new();
+        let mut configured = take(fake.clone(), slot()).unwrap();
+        configured.set_advertising(demo_advertising().build().unwrap());
+        configured.set_sync_timeout(std::time::Duration::from_secs(3600));
+        let events = configured.events.clone();
+        let (gatt, _, _) = server();
+        let started = fake.hold(Operation::HostStart);
+        let start = fake.hold(Operation::AdvertisingStart);
+        let starting = thread::spawn(move || configured.start(gatt));
+        started.wait_entered();
+        fake.inject(NativeEvent::HostSynced);
+        started.release();
+        start.wait_entered();
+        fake.set_synced(false);
+        start.release();
+        // Startup waits instead of failing; then the reset and the
+        // resynchronization are reported.
+        events.wait_until_parked(1);
+        fake.inject(NativeEvent::HostReset { reason: 19 });
+        fake.inject(NativeEvent::HostSynced);
+        let running = starting.join().unwrap().expect("startup completes");
+        let starts = fake
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, NativeCall::AdvertisingStart { .. }))
+            .count();
+        assert!(starts >= 2, "tried again");
+        assert!(fake.is_advertising());
+        drop(running);
     }
 
     #[test]

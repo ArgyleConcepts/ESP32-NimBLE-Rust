@@ -310,11 +310,11 @@
 //! - Handlers do not see which link a request came from, and NimBLE serves
 //!   ATT on every link. A link the framework is terminating, such as a
 //!   rejected second client or one whose connection was reported as failed,
-//!   can still make requests until it closes; they share the session, and
-//!   that link's end is not reported, so a transfer it began can remain. A
-//!   client therefore aborts (which succeeds when nothing is in progress)
-//!   or reads the status before it begins, and a client that abandons a
-//!   transfer aborts it before beginning another.
+//!   can make requests from when it is created until it closes; they share
+//!   the session, and that link's end is not reported, so a transfer it
+//!   began can remain. A client therefore aborts (which succeeds when
+//!   nothing is in progress) or reads the status before it begins, and a
+//!   client that abandons a transfer aborts it before beginning another.
 //! - The data characteristic accepts Write Requests and Write Commands.
 //!   Requests let the client see each result; commands are faster but carry
 //!   no response, so a client using them reads the status before
